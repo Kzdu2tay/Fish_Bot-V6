@@ -47,15 +47,18 @@ local function hum()  local c = chr(); return c and c:FindFirstChildOfClass("Hum
 local function tool() local c = chr(); return c and c:FindFirstChildOfClass("Tool") end
 
 -- ═══════════════════════════════════════
--- NOCLIP
+-- NOCLIP (FIX: PreSimulation antes da física rodar)
 -- ═══════════════════════════════════════
 local function setNoclip(v)
     noclipOn = v
     if v then
-        noclipConn = RunService.Stepped:Connect(function()
+        if noclipConn then noclipConn:Disconnect(); noclipConn = nil end
+        noclipConn = RunService.PreSimulation:Connect(function()
             local c = chr(); if not c then return end
             for _, p in ipairs(c:GetDescendants()) do
-                if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
+                if p:IsA("BasePart") then
+                    p.CanCollide = false
+                end
             end
         end)
     else
@@ -63,7 +66,9 @@ local function setNoclip(v)
         local c = chr()
         if c then
             for _, p in ipairs(c:GetDescendants()) do
-                if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then p.CanCollide = true end
+                if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+                    p.CanCollide = true
+                end
             end
         end
     end
@@ -248,7 +253,7 @@ vHint.Text = "V"; vHint.TextColor3 = DIM; vHint.Font = Enum.Font.GothamBold; vHi
 vHint.TextXAlignment = Enum.TextXAlignment.Center
 Instance.new("UICorner", vHint).CornerRadius = UDim.new(0, 4)
 
-local hdot = Instance.new("Frame", header)  -- reutilizado como status
+local hdot = Instance.new("Frame", header)
 hdot.Size = UDim2.new(0, 6, 0, 6); hdot.Position = UDim2.new(0, 10, 0.5, 4)
 hdot.BackgroundColor3 = DIM; hdot.BorderSizePixel = 0; hdot.Visible = false
 Instance.new("UICorner", hdot).CornerRadius = UDim.new(1, 0)
@@ -263,7 +268,6 @@ local function mkSection(cfg)
     local sl = Instance.new("UIListLayout", sec)
     sl.SortOrder = Enum.SortOrder.LayoutOrder; sl.Padding = UDim.new(0, 4)
 
-    -- Linha 1: icon+label | toggle
     local row1 = Instance.new("Frame", sec)
     row1.Size = UDim2.new(1, 0, 0, 18); row1.BackgroundTransparency = 1; row1.LayoutOrder = 1
 
@@ -288,7 +292,6 @@ local function mkSection(cfg)
     togHit.Size = UDim2.new(1, 0, 1, 0); togHit.BackgroundTransparency = 1
     togHit.Text = ""; togHit.AutoButtonColor = false; togHit.ZIndex = 5
 
-    -- Linha 2: Tecla + bind
     local row2 = Instance.new("Frame", sec)
     row2.Size = UDim2.new(1, 0, 0, 20); row2.BackgroundTransparency = 1; row2.LayoutOrder = 2
 
@@ -470,13 +473,11 @@ local guiVisible = true
 
 local function setVisible(v)
     guiVisible = v
-    -- esconde tudo menos o header (pra poder reabrir clicando também)
     for _, child in ipairs(frame:GetChildren()) do
         if child ~= header and child:IsA("Frame") then
             child.Visible = v
         end
     end
-    -- anima o tamanho
     if v then
         frame.AutomaticSize = Enum.AutomaticSize.Y
     else
@@ -527,8 +528,29 @@ sellBtn.MouseButton1Click:Connect(function()
 end)
 
 -- ═══════════════════════════════════════
--- REBIND
+-- REBIND (FIX: bloqueia teclas perigosas)
 -- ═══════════════════════════════════════
+
+-- Teclas proibidas: causam bugs, abrem menus ou saem do jogo
+local BLOCKED_KEYS = {
+    [Enum.KeyCode.Return]       = true,
+    [Enum.KeyCode.KeypadEnter]  = true,
+    [Enum.KeyCode.Backspace]    = true,
+    [Enum.KeyCode.Delete]       = true,
+    [Enum.KeyCode.Escape]       = true,
+    [Enum.KeyCode.Tab]          = true,
+    [Enum.KeyCode.CapsLock]     = true,
+    [Enum.KeyCode.LeftShift]    = true,
+    [Enum.KeyCode.RightShift]   = true,
+    [Enum.KeyCode.LeftControl]  = true,
+    [Enum.KeyCode.RightControl] = true,
+    [Enum.KeyCode.LeftAlt]      = true,
+    [Enum.KeyCode.RightAlt]     = true,
+    [Enum.KeyCode.LeftSuper]    = true,
+    [Enum.KeyCode.RightSuper]   = true,
+    [Enum.KeyCode.V]            = true, -- reservado para toggle GUI
+}
+
 local function setupBind(sec, id, getKey, setKey)
     sec.bindBtn.MouseButton1Click:Connect(function()
         if listening then return end
@@ -536,11 +558,29 @@ local function setupBind(sec, id, getKey, setKey)
         tw(sec.bindBtn, {TextColor3 = Color3.fromRGB(235,195,55)}):Play()
         local conn; conn = UIS.InputBegan:Connect(function(inp)
             if inp.UserInputType ~= Enum.UserInputType.Keyboard then return end
-            if inp.KeyCode ~= Enum.KeyCode.Escape then
-                setKey(inp.KeyCode); sec.bindBtn.Text = inp.KeyCode.Name
-            else
+
+            -- Cancela com Escape sem mudar a tecla
+            if inp.KeyCode == Enum.KeyCode.Escape then
                 sec.bindBtn.Text = getKey().Name
+                tw(sec.bindBtn, {TextColor3 = BLUE}):Play()
+                listening = nil; conn:Disconnect()
+                return
             end
+
+            -- Bloqueia teclas proibidas e avisa
+            if BLOCKED_KEYS[inp.KeyCode] then
+                sec.bindBtn.Text = "inválida!"
+                tw(sec.bindBtn, {TextColor3 = Color3.fromRGB(230,65,80)}):Play()
+                task.wait(0.8)
+                sec.bindBtn.Text = getKey().Name
+                tw(sec.bindBtn, {TextColor3 = BLUE}):Play()
+                listening = nil; conn:Disconnect()
+                return
+            end
+
+            -- Tecla válida: aplica
+            setKey(inp.KeyCode)
+            sec.bindBtn.Text = inp.KeyCode.Name
             tw(sec.bindBtn, {TextColor3 = BLUE}):Play()
             listening = nil; conn:Disconnect()
         end)
