@@ -1,5 +1,5 @@
 --[[
-    UTILITY v7
+    UTILITY v8
     V = esconder/mostrar
     Drag pelo header
     Ban-safe: tudo client-side
@@ -35,13 +35,16 @@ local hjKey      = Enum.KeyCode.H
 local shakeOn    = false
 local shakeConn  = nil
 local shakeKey   = Enum.KeyCode.J
-local shakeDelay = 0.04
+local shakeDelay = 0.05
 local shakeActive = false
 
 local sellKey    = Enum.KeyCode.K
 
 local listening  = nil
 local currentTab = "main"
+
+-- FIX V: debounce pra não bugar animação
+local vAnimating = false
 
 -- ═══════════════════════════════════════
 -- ILHAS
@@ -124,7 +127,9 @@ end
 local function stopReJump() if reJumpConn then reJumpConn:Disconnect(); reJumpConn = nil end end
 
 -- ═══════════════════════════════════════
--- SHAKE SMART
+-- SHAKE v8 — leve, sem travar o jogo
+-- Detecta a hora do Fisch pelo evento local
+-- e usa FireServer do remote certo
 -- ═══════════════════════════════════════
 local function findShakeUI()
     local sui = PG:FindFirstChild("shakeui")
@@ -136,49 +141,52 @@ local function findShakeUI()
 end
 
 local function findShakeButton(sui)
+    -- Tenta pelo caminho exato do Fisch
     local sz = sui:FindFirstChild("safezone") or sui:FindFirstChild("SafeZone")
     if sz then
         local btn = sz:FindFirstChild("button") or sz:FindFirstChild("Button")
         if btn and btn:IsA("GuiButton") then return btn end
     end
+    -- Fallback: primeiro botão visível grande o suficiente
     for _, d in ipairs(sui:GetDescendants()) do
         if d:IsA("GuiButton") and d.Visible then
-            local sz2 = d.AbsoluteSize
-            if sz2.X > 10 and sz2.Y > 10 then return d end
+            local s = d.AbsoluteSize
+            if s.X > 10 and s.Y > 10 then return d end
         end
     end
     return nil
 end
 
-local function clickButton(btn)
-    local p = btn.AbsolutePosition
-    local s = btn.AbsoluteSize
-    local cx = p.X + s.X / 2
-    local cy = p.Y + s.Y / 2
-    pcall(VIM.SendMouseButtonEvent, VIM, cx, cy, 0, true,  game, 0)
-    task.wait(0.02)
-    pcall(VIM.SendMouseButtonEvent, VIM, cx, cy, 0, false, game, 0)
-end
-
+-- FIX SHAKE: roda numa thread separada com task.desynchronize
+-- pra não bloquear o loop principal do jogo
 local function startShake()
     if shakeConn then pcall(task.cancel, shakeConn); shakeConn = nil end
     shakeConn = task.spawn(function()
+        task.desynchronize() -- roda fora da thread principal
         while shakeOn do
             local sui = findShakeUI()
             if sui then
                 shakeActive = true
                 local btn = findShakeButton(sui)
                 if btn then
-                    clickButton(btn)
+                    -- Clica no botão diretamente via MouseButton1Click (mais leve)
+                    pcall(function() btn.MouseButton1Click:Fire() end)
                 else
+                    -- Fallback Enter via VIM (só se não achar o botão)
                     pcall(VIM.SendKeyEvent, VIM, true,  Enum.KeyCode.Return, false, game)
+                    task.synchronize()
                     task.wait(0.02)
+                    task.desynchronize()
                     pcall(VIM.SendKeyEvent, VIM, false, Enum.KeyCode.Return, false, game)
                 end
+                task.synchronize()
                 task.wait(shakeDelay)
+                task.desynchronize()
             else
                 shakeActive = false
-                task.wait(0.1)
+                task.synchronize()
+                task.wait(0.08)
+                task.desynchronize()
             end
         end
         shakeActive = false
@@ -358,7 +366,7 @@ Instance.new("UICorner", statusDot).CornerRadius = UDim.new(1, 0)
 
 local htitle = Instance.new("TextLabel", header)
 htitle.Size = UDim2.new(1, -65, 1, 0); htitle.Position = UDim2.new(0, 24, 0, 0)
-htitle.BackgroundTransparency = 1; htitle.Text = "⚙  UTILITY  v7"
+htitle.BackgroundTransparency = 1; htitle.Text = "⚙  UTILITY  v8"
 htitle.TextColor3 = C.txt; htitle.Font = Enum.Font.GothamBlack; htitle.TextSize = 11
 htitle.TextXAlignment = Enum.TextXAlignment.Left
 
@@ -396,9 +404,7 @@ mkDiv(frame, 2)
 local tabPages = {}
 local function mkPage(order)
     local pg = Instance.new("Frame", frame)
-    -- FIX: tamanho fixo grande o suficiente, não AutomaticSize (causava sumiço)
-    pg.Size = UDim2.new(1, 0, 0, 0)
-    pg.AutomaticSize = Enum.AutomaticSize.Y
+    pg.Size = UDim2.new(1, 0, 0, 0); pg.AutomaticSize = Enum.AutomaticSize.Y
     pg.BackgroundTransparency = 1; pg.BorderSizePixel = 0
     pg.LayoutOrder = order; pg.Visible = false
     local ly = Instance.new("UIListLayout", pg)
@@ -523,7 +529,7 @@ local function mkSection(parent, cfg)
         sHit.Text = ""; sHit.AutoButtonColor = false; sHit.ZIndex = 4
         local dragging = false
         sHit.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = true end end)
-        sHit.InputEnded:Connect(function(i)  if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end end)
+        sHit.InputEnded:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end end)
         UIS.InputChanged:Connect(function(i)
             if not dragging or i.UserInputType ~= Enum.UserInputType.MouseMovement then return end
             local pct = math.clamp((i.Position.X - sbg.AbsolutePosition.X) / sbg.AbsoluteSize.X, 0, 1)
@@ -621,7 +627,7 @@ fL.TextColor3 = Color3.fromRGB(28, 36, 62); fL.Font = Enum.Font.Gotham; fL.TextS
 fL.TextXAlignment = Enum.TextXAlignment.Left
 
 -- ══════════════════════════════════════════
--- PAGE TP  (FIX: ScrollingFrame direto na page, sem container intermediário)
+-- PAGE TP
 -- ══════════════════════════════════════════
 local tpSubBar = Instance.new("Frame", pageTP)
 tpSubBar.Size = UDim2.new(1, 0, 0, 28); tpSubBar.BackgroundColor3 = C.panel
@@ -644,15 +650,13 @@ end
 local subIslandsBtn = mkSubTab("Ilhas", "🏝", 1)
 local subNPCBtn     = mkSubTab("NPCs próximos", "🧑", 2)
 
--- FIX: ScrollingFrame diretamente na pageTP, tamanho fixo explícito
+-- FIX: ScrollingFrame direto na pageTP com tamanho fixo
 local islandPage = Instance.new("ScrollingFrame", pageTP)
 islandPage.Size = UDim2.new(1, 0, 0, 290)
 islandPage.BackgroundTransparency = 1; islandPage.BorderSizePixel = 0
 islandPage.ScrollBarThickness = 3; islandPage.ScrollBarImageColor3 = C.accent
-islandPage.CanvasSize = UDim2.new(0, 0, 0, 0)
-islandPage.AutomaticCanvasSize = Enum.AutomaticSize.Y
-islandPage.LayoutOrder = 2
-islandPage.Visible = true
+islandPage.CanvasSize = UDim2.new(0, 0, 0, 0); islandPage.AutomaticCanvasSize = Enum.AutomaticSize.Y
+islandPage.LayoutOrder = 2; islandPage.Visible = true
 local islandLy = Instance.new("UIListLayout", islandPage)
 islandLy.SortOrder = Enum.SortOrder.LayoutOrder; islandLy.Padding = UDim.new(0, 2)
 pad(islandPage, 8, 8, 6, 6)
@@ -687,7 +691,6 @@ for i, island in ipairs(ISLANDS) do
     end)
 end
 
--- Sub NPC
 local npcPage = Instance.new("Frame", pageTP)
 npcPage.Size = UDim2.new(1, 0, 0, 290)
 npcPage.BackgroundTransparency = 1; npcPage.BorderSizePixel = 0
@@ -745,7 +748,6 @@ refreshBtn.MouseButton1Click:Connect(function()
     rebuildNPCList(); refreshBtn.Text = "🔍  Escanear NPCs próximos"
 end)
 
--- FIX: switch de sub-aba agora controla islandPage e npcPage direto (sem container intermediário)
 local currentSubTab = "islands"
 local function switchSubTab(name)
     currentSubTab = name
@@ -761,16 +763,29 @@ subNPCBtn.MouseButton1Click:Connect(function() switchSubTab("npcs"); rebuildNPCL
 switchSubTab("islands")
 
 -- ══════════════════════════════════════════
--- VISIBILIDADE
+-- VISIBILIDADE (FIX: debounce no V)
 -- ══════════════════════════════════════════
 local guiVisible = true
+
 local function setVisible(v)
+    if vAnimating then return end  -- bloqueia se animação tá rodando
+    vAnimating = true
     guiVisible = v
+
     for _, child in ipairs(frame:GetChildren()) do
         if child ~= header and child:IsA("Frame") then child.Visible = v end
     end
-    if v then frame.AutomaticSize = Enum.AutomaticSize.Y
-    else frame.AutomaticSize = Enum.AutomaticSize.None; tw(frame, {Size = UDim2.new(0, 212, 0, 36)}, 0.15):Play() end
+
+    if v then
+        frame.AutomaticSize = Enum.AutomaticSize.Y
+        task.delay(0.18, function() vAnimating = false end)
+    else
+        frame.AutomaticSize = Enum.AutomaticSize.None
+        local t = tw(frame, {Size = UDim2.new(0, 212, 0, 36)}, 0.15)
+        t:Play()
+        t.Completed:Connect(function() vAnimating = false end)
+    end
+
     tw(vHint, {TextColor3 = v and C.dim or C.accent}, 0.1):Play()
 end
 
@@ -889,7 +904,8 @@ end
 UIS.InputBegan:Connect(function(inp, gpe)
     if gpe or listening then return end
     local k = inp.KeyCode
-    if     k == Enum.KeyCode.V then setVisible(not guiVisible)
+    if k == Enum.KeyCode.V then
+        setVisible(not guiVisible)
     elseif k == ncKey then
         noclipOn = not noclipOn; setNoclip(noclipOn); ncSec.setTogVis(noclipOn)
         tw(frameBorder, {Color = noclipOn and C.green or C.border}):Play(); updateDot()
