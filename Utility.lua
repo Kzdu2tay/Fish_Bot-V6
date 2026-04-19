@@ -1,8 +1,14 @@
 --[[
-    UTILITY v8
+    UTILITY v7
     V = esconder/mostrar
     Drag pelo header
     Ban-safe: tudo client-side
+
+    NOVIDADES v7:
+    • Shake só dispara quando a UI aparece (não fica spammando à toa)
+    • Bind de venda na mão (padrão K, rebindável)
+    • 22 ilhas no TP (todas do wiki)
+    • Sell tenta Activate() primeiro (mais compatível)
 ]]
 
 local Players    = game:GetService("Players")
@@ -35,19 +41,16 @@ local hjKey      = Enum.KeyCode.H
 local shakeOn    = false
 local shakeConn  = nil
 local shakeKey   = Enum.KeyCode.J
-local shakeDelay = 0.05
-local shakeActive = false
+local shakeDelay = 0.04
+local shakeActive = false  -- NOVO: true quando ta clicando de verdade
 
-local sellKey    = Enum.KeyCode.K
+local sellKey    = Enum.KeyCode.K  -- NOVO
 
 local listening  = nil
 local currentTab = "main"
 
--- FIX V: debounce pra não bugar animação
-local vAnimating = false
-
 -- ═══════════════════════════════════════
--- ILHAS
+-- ILHAS (22 do wiki 2026)
 -- ═══════════════════════════════════════
 local ISLANDS = {
     { name = "Moosewood",             pos = Vector3.new(400,   135,  250)  },
@@ -69,8 +72,8 @@ local ISLANDS = {
     { name = "Roslit Volcano",        pos = Vector3.new(-1900, 165,   315), special = true },
     { name = "⭐ N. Exp. Portal",     pos = Vector3.new(-1750, 130,  3750), special = true },
     { name = "⭐ Northern Summit",    pos = Vector3.new(19500, 135,  5300), special = true },
-    { name = "⭐ Atlantis Central",   pos = Vector3.new(-4270, -600, 1830), special = true },
-    { name = "⭐ The Depths",         pos = Vector3.new(1060,  -635, 1315), special = true },
+    { name = "⭐ Atlantis Central",   pos = Vector3.new(-4270,-600,  1830), special = true },
+    { name = "⭐ The Depths",         pos = Vector3.new(1060, -635,  1315), special = true },
     { name = "⭐ Winter Village",     pos = Vector3.new(-75,   365,  9500), special = true },
 }
 
@@ -127,13 +130,13 @@ end
 local function stopReJump() if reJumpConn then reJumpConn:Disconnect(); reJumpConn = nil end end
 
 -- ═══════════════════════════════════════
--- SHAKE v8 — leve, sem travar o jogo
--- Detecta a hora do Fisch pelo evento local
--- e usa FireServer do remote certo
+-- SHAKE v7 — SÓ DISPARA QUANDO UI APARECE
 -- ═══════════════════════════════════════
 local function findShakeUI()
+    -- Procura a UI de shake do Fisch
     local sui = PG:FindFirstChild("shakeui")
     if sui and sui.Enabled ~= false then return sui end
+    -- Fallback: qualquer frame com "shake" no nome
     for _, d in ipairs(PG:GetDescendants()) do
         if d:IsA("ScreenGui") and d.Name:lower():find("shake") and d.Enabled then return d end
     end
@@ -141,52 +144,54 @@ local function findShakeUI()
 end
 
 local function findShakeButton(sui)
-    -- Tenta pelo caminho exato do Fisch
+    -- Tenta achar o botão do safezone
     local sz = sui:FindFirstChild("safezone") or sui:FindFirstChild("SafeZone")
     if sz then
         local btn = sz:FindFirstChild("button") or sz:FindFirstChild("Button")
         if btn and btn:IsA("GuiButton") then return btn end
     end
-    -- Fallback: primeiro botão visível grande o suficiente
+    -- Fallback: procura qualquer GuiButton visível dentro da shakeui
     for _, d in ipairs(sui:GetDescendants()) do
         if d:IsA("GuiButton") and d.Visible then
-            local s = d.AbsoluteSize
-            if s.X > 10 and s.Y > 10 then return d end
+            local sz2 = d.AbsoluteSize
+            if sz2.X > 10 and sz2.Y > 10 then return d end
         end
     end
     return nil
 end
 
--- FIX SHAKE: roda numa thread separada com task.desynchronize
--- pra não bloquear o loop principal do jogo
+local function clickButton(btn)
+    local p = btn.AbsolutePosition
+    local s = btn.AbsoluteSize
+    local cx = p.X + s.X / 2
+    local cy = p.Y + s.Y / 2
+    pcall(VIM.SendMouseButtonEvent, VIM, cx, cy, 0, true,  game, 0)
+    task.wait(0.02)
+    pcall(VIM.SendMouseButtonEvent, VIM, cx, cy, 0, false, game, 0)
+end
+
 local function startShake()
     if shakeConn then pcall(task.cancel, shakeConn); shakeConn = nil end
     shakeConn = task.spawn(function()
-        task.desynchronize() -- roda fora da thread principal
         while shakeOn do
             local sui = findShakeUI()
             if sui then
+                -- UI apareceu — spamma o botão
                 shakeActive = true
                 local btn = findShakeButton(sui)
                 if btn then
-                    -- Clica no botão diretamente via MouseButton1Click (mais leve)
-                    pcall(function() btn.MouseButton1Click:Fire() end)
+                    clickButton(btn)
                 else
-                    -- Fallback Enter via VIM (só se não achar o botão)
+                    -- Último fallback: Enter (caso não encontre o botão)
                     pcall(VIM.SendKeyEvent, VIM, true,  Enum.KeyCode.Return, false, game)
-                    task.synchronize()
                     task.wait(0.02)
-                    task.desynchronize()
                     pcall(VIM.SendKeyEvent, VIM, false, Enum.KeyCode.Return, false, game)
                 end
-                task.synchronize()
                 task.wait(shakeDelay)
-                task.desynchronize()
             else
+                -- UI não tá aparecendo, espera quieto (nada de spam)
                 shakeActive = false
-                task.synchronize()
-                task.wait(0.08)
-                task.desynchronize()
+                task.wait(0.1)
             end
         end
         shakeActive = false
@@ -194,16 +199,21 @@ local function startShake()
 end
 
 local function stopShake()
-    shakeOn = false; shakeActive = false
+    shakeOn = false
+    shakeActive = false
     if shakeConn then pcall(task.cancel, shakeConn); shakeConn = nil end
 end
 
 -- ═══════════════════════════════════════
--- SELL
+-- SELL v7 — Activate() primeiro
 -- ═══════════════════════════════════════
 local function sellFromHand()
     local t = tool(); if not t then return false, "Sem item na mão" end
+
+    -- 1: Activate (maioria dos jogos Fisch-style)
     pcall(function() t:Activate() end)
+
+    -- 2: Busca NPC appraiser/merchant perto
     local WS = game:GetService("Workspace")
     for _, m in ipairs(WS:GetDescendants()) do
         local nm = m.Name:lower()
@@ -214,6 +224,8 @@ local function sellFromHand()
             if re then pcall(function() re:FireServer(t) end); return true, "OK" end
         end
     end
+
+    -- 3: Remotes comuns em ReplicatedStorage.events
     local rsEv = RS:FindFirstChild("events") or RS:FindFirstChild("Events")
     if rsEv then
         for _, n in ipairs({"sell","Sell","appraise","Appraise","sellfish","SellFish","sellhand","SellHand","appraiseFish","SellItem"}) do
@@ -230,6 +242,8 @@ local function sellFromHand()
             end
         end
     end
+
+    -- 4: GUI button (fallback)
     for _, obj in ipairs(PG:GetDescendants()) do
         if obj:IsA("GuiButton") and obj.Visible then
             local on2 = obj.Name:lower()
@@ -239,11 +253,12 @@ local function sellFromHand()
             end
         end
     end
+
     return false, "Nenhum método encontrado"
 end
 
 -- ═══════════════════════════════════════
--- TP
+-- TP ILHA (client-side)
 -- ═══════════════════════════════════════
 local function tpToIsland(pos)
     local root = hrp(); if not root then return false, "Sem personagem" end
@@ -251,6 +266,9 @@ local function tpToIsland(pos)
     return true, "OK"
 end
 
+-- ═══════════════════════════════════════
+-- NPCs próximos
+-- ═══════════════════════════════════════
 local function getNearbyNPCs()
     local root = hrp(); if not root then return {} end
     local found = {}
@@ -352,6 +370,7 @@ end
 local header = Instance.new("Frame", frame)
 header.Size = UDim2.new(1, 0, 0, 36); header.BackgroundColor3 = C.panel
 header.BorderSizePixel = 0; header.LayoutOrder = 0
+
 local hGrad = Instance.new("UIGradient", header)
 hGrad.Color = ColorSequence.new({
     ColorSequenceKeypoint.new(0, Color3.fromRGB(16, 22, 52)),
@@ -366,7 +385,7 @@ Instance.new("UICorner", statusDot).CornerRadius = UDim.new(1, 0)
 
 local htitle = Instance.new("TextLabel", header)
 htitle.Size = UDim2.new(1, -65, 1, 0); htitle.Position = UDim2.new(0, 24, 0, 0)
-htitle.BackgroundTransparency = 1; htitle.Text = "⚙  UTILITY  v8"
+htitle.BackgroundTransparency = 1; htitle.Text = "⚙  UTILITY  v7"
 htitle.TextColor3 = C.txt; htitle.Font = Enum.Font.GothamBlack; htitle.TextSize = 11
 htitle.TextXAlignment = Enum.TextXAlignment.Left
 
@@ -387,6 +406,7 @@ tabLy.FillDirection = Enum.FillDirection.Horizontal
 tabLy.SortOrder = Enum.SortOrder.LayoutOrder; tabLy.Padding = UDim.new(0, 4)
 
 local tabBtns = {}
+
 local function mkTab(name, icon, order)
     local btn = Instance.new("TextButton", tabBar)
     btn.Size = UDim2.new(0.5, -2, 1, 0); btn.BackgroundColor3 = C.card
@@ -396,12 +416,14 @@ local function mkTab(name, icon, order)
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
     tabBtns[name] = btn; return btn
 end
+
 local tabMainBtn = mkTab("Cheats",   "🎮", 1)
 local tabTPBtn   = mkTab("Teleport", "🗺",  2)
 
 mkDiv(frame, 2)
 
 local tabPages = {}
+
 local function mkPage(order)
     local pg = Instance.new("Frame", frame)
     pg.Size = UDim2.new(1, 0, 0, 0); pg.AutomaticSize = Enum.AutomaticSize.Y
@@ -459,6 +481,7 @@ local function mkSection(parent, cfg)
 
     local row1 = Instance.new("Frame", sec)
     row1.Size = UDim2.new(1, 0, 0, 20); row1.BackgroundTransparency = 1; row1.LayoutOrder = 1
+
     local lbl = Instance.new("TextLabel", row1)
     lbl.Size = UDim2.new(1, -52, 1, 0); lbl.BackgroundTransparency = 1
     lbl.Text = cfg.icon .. "  " .. cfg.label; lbl.TextColor3 = C.txtSub
@@ -469,20 +492,24 @@ local function mkSection(parent, cfg)
     tr.BackgroundColor3 = Color3.fromRGB(22, 28, 50); tr.BorderSizePixel = 0
     Instance.new("UICorner", tr).CornerRadius = UDim.new(0, 9)
     Instance.new("UIStroke", tr).Color = C.border
+
     local kn = Instance.new("Frame", tr)
     kn.Size = UDim2.new(0, 14, 0, 14); kn.Position = UDim2.new(0, 2, 0.5, -7)
     kn.BackgroundColor3 = Color3.fromRGB(195, 205, 235); kn.BorderSizePixel = 0
     Instance.new("UICorner", kn).CornerRadius = UDim.new(0, 7)
+
     local togHit = Instance.new("TextButton", tr)
     togHit.Size = UDim2.new(1, 0, 1, 0); togHit.BackgroundTransparency = 1
     togHit.Text = ""; togHit.AutoButtonColor = false; togHit.ZIndex = 5
 
     local row2 = Instance.new("Frame", sec)
     row2.Size = UDim2.new(1, 0, 0, 20); row2.BackgroundTransparency = 1; row2.LayoutOrder = 2
+
     local tLbl = Instance.new("TextLabel", row2)
     tLbl.Size = UDim2.new(0, 38, 1, 0); tLbl.BackgroundTransparency = 1
     tLbl.Text = "Tecla:"; tLbl.TextColor3 = C.dim; tLbl.Font = Enum.Font.Gotham; tLbl.TextSize = 8
     tLbl.TextXAlignment = Enum.TextXAlignment.Left
+
     local bindB = Instance.new("TextButton", row2)
     bindB.Size = UDim2.new(0, 64, 0, 18); bindB.Position = UDim2.new(0, 40, 0.5, -9)
     bindB.BackgroundColor3 = Color3.fromRGB(18, 22, 44); bindB.BorderSizePixel = 0
@@ -496,7 +523,7 @@ local function mkSection(parent, cfg)
     local statusLbl = nil
     if cfg.showStatus then
         local rowSt = Instance.new("Frame", sec); rowSt.Size = UDim2.new(1, 0, 0, 12)
-        rowSt.BackgroundTransparency = 1; rowSt.LayoutOrder = 25
+        rowSt.BackgroundTransparency = 1; rowSt.LayoutOrder = 2.5
         statusLbl = Instance.new("TextLabel", rowSt); statusLbl.Size = UDim2.new(1, 0, 1, 0)
         statusLbl.BackgroundTransparency = 1; statusLbl.Text = ""
         statusLbl.TextColor3 = C.dim; statusLbl.Font = Enum.Font.Code; statusLbl.TextSize = 8
@@ -511,6 +538,7 @@ local function mkSection(parent, cfg)
         valLbl.BackgroundTransparency = 1; valLbl.Text = s.label .. ": " .. s.def
         valLbl.TextColor3 = C.accent; valLbl.Font = Enum.Font.GothamBold; valLbl.TextSize = 8
         valLbl.TextXAlignment = Enum.TextXAlignment.Left
+
         local rowS2 = Instance.new("Frame", sec); rowS2.Size = UDim2.new(1, 0, 0, 14)
         rowS2.BackgroundTransparency = 1; rowS2.LayoutOrder = 4
         local sbg = Instance.new("Frame", rowS2); sbg.Size = UDim2.new(1, 0, 0, 4)
@@ -529,7 +557,7 @@ local function mkSection(parent, cfg)
         sHit.Text = ""; sHit.AutoButtonColor = false; sHit.ZIndex = 4
         local dragging = false
         sHit.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = true end end)
-        sHit.InputEnded:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end end)
+        sHit.InputEnded:Connect(function(i)  if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end end)
         UIS.InputChanged:Connect(function(i)
             if not dragging or i.UserInputType ~= Enum.UserInputType.MouseMovement then return end
             local pct = math.clamp((i.Position.X - sbg.AbsolutePosition.X) / sbg.AbsoluteSize.X, 0, 1)
@@ -567,39 +595,44 @@ local function mkSection(parent, cfg)
             twBack(rjKn, {Position = on and UDim2.new(0, 20, 0.5, -7) or UDim2.new(0, 2, 0.5, -7)}):Play()
         end
     end
-    return {togHit=togHit, bindBtn=bindB, rjTogHit=rjTogHit, setTogVis=setTogVis, setRjVis=setRjVis, statusLbl=statusLbl}
+    return {togHit = togHit, bindBtn = bindB, rjTogHit = rjTogHit, setTogVis = setTogVis, setRjVis = setRjVis, statusLbl = statusLbl}
 end
 
 mkDiv(pageMain, 1)
-local ncSec = mkSection(pageMain, {id="nc", order=2, icon="👻", label="Noclip", keyName=ncKey.Name})
+local ncSec = mkSection(pageMain, {id = "nc", order = 2, icon = "👻", label = "Noclip", keyName = ncKey.Name})
 mkDiv(pageMain, 3)
-local spSec = mkSection(pageMain, {id="sp", order=4, icon="💨", label="Speed", keyName=spKey.Name,
-    slider={min=16, max=300, def=speedVal, label="Speed", onChange=function(v) speedVal=v; if speedOn then local h=hum(); if h then h.WalkSpeed=v end end end}})
+local spSec = mkSection(pageMain, {id = "sp", order = 4, icon = "💨", label = "Speed", keyName = spKey.Name,
+    slider = {min = 16, max = 300, def = speedVal, label = "Speed", onChange = function(v) speedVal = v; if speedOn then local h = hum(); if h then h.WalkSpeed = v end end end}})
 mkDiv(pageMain, 5)
-local hjSec = mkSection(pageMain, {id="hj", order=6, icon="🦘", label="High Jump", keyName=hjKey.Name,
-    slider={min=50, max=500, def=jumpVal, label="Força", onChange=function(v) jumpVal=v; if jumpOn then local h=hum(); if h then h.JumpPower=v end end end}, rejump=true})
+local hjSec = mkSection(pageMain, {id = "hj", order = 6, icon = "🦘", label = "High Jump", keyName = hjKey.Name,
+    slider = {min = 50, max = 500, def = jumpVal, label = "Força", onChange = function(v) jumpVal = v; if jumpOn then local h = hum(); if h then h.JumpPower = v end end end}, rejump = true})
 mkDiv(pageMain, 7)
-local shSec = mkSection(pageMain, {id="sh", order=8, icon="🔄", label="Shake (smart)", keyName=shakeKey.Name, showStatus=true})
+local shSec = mkSection(pageMain, {id = "sh", order = 8, icon = "🔄", label = "Shake (smart)", keyName = shakeKey.Name, showStatus = true})
 mkDiv(pageMain, 9)
 
--- SELL
+-- SELL v7 — com bind K
 local sellSec = Instance.new("Frame", pageMain); sellSec.Size = UDim2.new(1, 0, 0, 0)
 sellSec.AutomaticSize = Enum.AutomaticSize.Y; sellSec.BackgroundColor3 = C.card
 sellSec.BorderSizePixel = 0; sellSec.LayoutOrder = 10; addPadSec(sellSec, 7, 9)
 local sellLy = Instance.new("UIListLayout", sellSec); sellLy.SortOrder = Enum.SortOrder.LayoutOrder; sellLy.Padding = UDim.new(0, 5)
+
 local sTitleRow = Instance.new("Frame", sellSec); sTitleRow.Size = UDim2.new(1, 0, 0, 16)
 sTitleRow.BackgroundTransparency = 1; sTitleRow.LayoutOrder = 1
 local sTL = Instance.new("TextLabel", sTitleRow); sTL.Size = UDim2.new(1, 0, 1, 0)
 sTL.BackgroundTransparency = 1; sTL.Text = "💰  Sell from Hand"; sTL.TextColor3 = C.txtSub
 sTL.Font = Enum.Font.GothamBold; sTL.TextSize = 10; sTL.TextXAlignment = Enum.TextXAlignment.Left
+
 local sellStatus = Instance.new("TextLabel", sellSec); sellStatus.Size = UDim2.new(1, 0, 0, 10)
 sellStatus.BackgroundTransparency = 1; sellStatus.Text = "Aguardando..."; sellStatus.TextColor3 = C.dim
 sellStatus.Font = Enum.Font.Gotham; sellStatus.TextSize = 8; sellStatus.TextXAlignment = Enum.TextXAlignment.Left; sellStatus.LayoutOrder = 2
+
+-- Bind row
 local sellBindRow = Instance.new("Frame", sellSec); sellBindRow.Size = UDim2.new(1, 0, 0, 20)
 sellBindRow.BackgroundTransparency = 1; sellBindRow.LayoutOrder = 3
 local sellTLbl = Instance.new("TextLabel", sellBindRow); sellTLbl.Size = UDim2.new(0, 38, 1, 0)
 sellTLbl.BackgroundTransparency = 1; sellTLbl.Text = "Tecla:"; sellTLbl.TextColor3 = C.dim
 sellTLbl.Font = Enum.Font.Gotham; sellTLbl.TextSize = 8; sellTLbl.TextXAlignment = Enum.TextXAlignment.Left
+
 local sellBindB = Instance.new("TextButton", sellBindRow)
 sellBindB.Size = UDim2.new(0, 64, 0, 18); sellBindB.Position = UDim2.new(0, 40, 0.5, -9)
 sellBindB.BackgroundColor3 = Color3.fromRGB(18, 22, 44); sellBindB.BorderSizePixel = 0
@@ -609,6 +642,7 @@ Instance.new("UICorner", sellBindB).CornerRadius = UDim.new(0, 5)
 Instance.new("UIStroke", sellBindB).Color = C.accentD
 sellBindB.MouseEnter:Connect(function() if listening ~= "sell" then tw(sellBindB, {BackgroundColor3 = Color3.fromRGB(25, 30, 58)}):Play() end end)
 sellBindB.MouseLeave:Connect(function() if listening ~= "sell" then tw(sellBindB, {BackgroundColor3 = Color3.fromRGB(18, 22, 44)}):Play() end end)
+
 local sellBtn = Instance.new("TextButton", sellSec); sellBtn.Size = UDim2.new(1, 0, 0, 28); sellBtn.LayoutOrder = 4
 sellBtn.BackgroundColor3 = Color3.fromRGB(16, 58, 36); sellBtn.BorderSizePixel = 0
 sellBtn.Text = "💰  Vender Item da Mão"; sellBtn.TextColor3 = C.green
@@ -629,47 +663,43 @@ fL.TextXAlignment = Enum.TextXAlignment.Left
 -- ══════════════════════════════════════════
 -- PAGE TP
 -- ══════════════════════════════════════════
-local tpSubBar = Instance.new("Frame", pageTP)
-tpSubBar.Size = UDim2.new(1, 0, 0, 28); tpSubBar.BackgroundColor3 = C.panel
-tpSubBar.BorderSizePixel = 0; tpSubBar.LayoutOrder = 1
+local tpSubBar = Instance.new("Frame", pageTP); tpSubBar.Size = UDim2.new(1, 0, 0, 28)
+tpSubBar.BackgroundColor3 = C.panel; tpSubBar.BorderSizePixel = 0; tpSubBar.LayoutOrder = 1
 pad(tpSubBar, 6, 6, 5, 5)
 local tpSubLy = Instance.new("UIListLayout", tpSubBar)
-tpSubLy.FillDirection = Enum.FillDirection.Horizontal
-tpSubLy.SortOrder = Enum.SortOrder.LayoutOrder; tpSubLy.Padding = UDim.new(0, 4)
+tpSubLy.FillDirection = Enum.FillDirection.Horizontal; tpSubLy.SortOrder = Enum.SortOrder.LayoutOrder; tpSubLy.Padding = UDim.new(0, 4)
 
 local subBtns = {}
 local function mkSubTab(name, icon, order)
-    local btn = Instance.new("TextButton", tpSubBar)
-    btn.Size = UDim2.new(0.5, -2, 1, 0); btn.BackgroundColor3 = C.card
-    btn.BorderSizePixel = 0; btn.Text = icon .. "  " .. name
-    btn.TextColor3 = C.dim; btn.Font = Enum.Font.GothamBold; btn.TextSize = 8
-    btn.AutoButtonColor = false; btn.LayoutOrder = order
+    local btn = Instance.new("TextButton", tpSubBar); btn.Size = UDim2.new(0.5, -2, 1, 0)
+    btn.BackgroundColor3 = C.card; btn.BorderSizePixel = 0
+    btn.Text = icon .. "  " .. name; btn.TextColor3 = C.dim
+    btn.Font = Enum.Font.GothamBold; btn.TextSize = 8; btn.AutoButtonColor = false; btn.LayoutOrder = order
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 5)
     subBtns[name] = btn; return btn
 end
 local subIslandsBtn = mkSubTab("Ilhas", "🏝", 1)
-local subNPCBtn     = mkSubTab("NPCs próximos", "🧑", 2)
+local subNPCBtn = mkSubTab("NPCs próximos", "🧑", 2)
 
--- FIX: ScrollingFrame direto na pageTP com tamanho fixo
-local islandPage = Instance.new("ScrollingFrame", pageTP)
-islandPage.Size = UDim2.new(1, 0, 0, 290)
+local tpContent = Instance.new("Frame", pageTP); tpContent.Size = UDim2.new(1, 0, 0, 0)
+tpContent.AutomaticSize = Enum.AutomaticSize.Y; tpContent.BackgroundTransparency = 1; tpContent.LayoutOrder = 2
+
+-- Sub: Ilhas
+local islandPage = Instance.new("ScrollingFrame", tpContent); islandPage.Size = UDim2.new(1, 0, 0, 280)
 islandPage.BackgroundTransparency = 1; islandPage.BorderSizePixel = 0
 islandPage.ScrollBarThickness = 3; islandPage.ScrollBarImageColor3 = C.accent
 islandPage.CanvasSize = UDim2.new(0, 0, 0, 0); islandPage.AutomaticCanvasSize = Enum.AutomaticSize.Y
-islandPage.LayoutOrder = 2; islandPage.Visible = true
+islandPage.Visible = true
 local islandLy = Instance.new("UIListLayout", islandPage)
 islandLy.SortOrder = Enum.SortOrder.LayoutOrder; islandLy.Padding = UDim.new(0, 2)
 pad(islandPage, 8, 8, 6, 6)
 
-local tpStatus = Instance.new("TextLabel", islandPage)
-tpStatus.Size = UDim2.new(1, 0, 0, 14); tpStatus.BackgroundTransparency = 1
-tpStatus.Text = ""; tpStatus.TextColor3 = C.green
-tpStatus.Font = Enum.Font.GothamBold; tpStatus.TextSize = 8
-tpStatus.TextXAlignment = Enum.TextXAlignment.Left; tpStatus.LayoutOrder = 0
+local tpStatus = Instance.new("TextLabel", islandPage); tpStatus.Size = UDim2.new(1, 0, 0, 14)
+tpStatus.BackgroundTransparency = 1; tpStatus.Text = ""; tpStatus.TextColor3 = C.green
+tpStatus.Font = Enum.Font.GothamBold; tpStatus.TextSize = 8; tpStatus.TextXAlignment = Enum.TextXAlignment.Left; tpStatus.LayoutOrder = 0
 
 for i, island in ipairs(ISLANDS) do
-    local btn = Instance.new("TextButton", islandPage)
-    btn.Size = UDim2.new(1, 0, 0, 27)
+    local btn = Instance.new("TextButton", islandPage); btn.Size = UDim2.new(1, 0, 0, 27)
     btn.BackgroundColor3 = island.special and Color3.fromRGB(40, 16, 42) or C.card
     btn.BorderSizePixel = 0
     btn.Text = "📍  " .. island.name
@@ -677,11 +707,11 @@ for i, island in ipairs(ISLANDS) do
     btn.Font = Enum.Font.GothamBold; btn.TextSize = 9; btn.TextXAlignment = Enum.TextXAlignment.Left
     btn.AutoButtonColor = false; btn.LayoutOrder = i
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6); pad(btn, 8, 8, 0, 0)
+
     local hoverCol = island.special and Color3.fromRGB(60, 26, 62) or C.cardHov
-    local baseCol  = island.special and Color3.fromRGB(40, 16, 42) or C.card
-    local baseTxt  = island.special and C.pink or C.txtSub
+    local baseCol = island.special and Color3.fromRGB(40, 16, 42) or C.card
     btn.MouseEnter:Connect(function() tw(btn, {BackgroundColor3 = hoverCol, TextColor3 = C.txt}):Play() end)
-    btn.MouseLeave:Connect(function() tw(btn, {BackgroundColor3 = baseCol, TextColor3 = baseTxt}):Play() end)
+    btn.MouseLeave:Connect(function() tw(btn, {BackgroundColor3 = baseCol, TextColor3 = island.special and C.pink or C.txtSub}):Play() end)
     btn.MouseButton1Click:Connect(function()
         tw(btn, {BackgroundColor3 = C.accentD}):Play(); task.wait(0.12); tw(btn, {BackgroundColor3 = baseCol}):Play()
         local ok, msg = tpToIsland(island.pos)
@@ -691,13 +721,11 @@ for i, island in ipairs(ISLANDS) do
     end)
 end
 
-local npcPage = Instance.new("Frame", pageTP)
-npcPage.Size = UDim2.new(1, 0, 0, 290)
-npcPage.BackgroundTransparency = 1; npcPage.BorderSizePixel = 0
-npcPage.LayoutOrder = 2; npcPage.Visible = false
+-- Sub: NPCs
+local npcPage = Instance.new("Frame", tpContent); npcPage.Size = UDim2.new(1, 0, 0, 280)
+npcPage.BackgroundTransparency = 1; npcPage.BorderSizePixel = 0; npcPage.Visible = false
 
-local refreshBtn = Instance.new("TextButton", npcPage)
-refreshBtn.Size = UDim2.new(1, 0, 0, 28)
+local refreshBtn = Instance.new("TextButton", npcPage); refreshBtn.Size = UDim2.new(1, 0, 0, 28)
 refreshBtn.BackgroundColor3 = Color3.fromRGB(16, 28, 60); refreshBtn.BorderSizePixel = 0
 refreshBtn.Text = "🔍  Escanear NPCs próximos"; refreshBtn.TextColor3 = C.accent
 refreshBtn.Font = Enum.Font.GothamBold; refreshBtn.TextSize = 9; refreshBtn.AutoButtonColor = false
@@ -706,9 +734,8 @@ Instance.new("UIStroke", refreshBtn).Color = C.accentD; pad(refreshBtn, 8, 8, 0,
 refreshBtn.MouseEnter:Connect(function() tw(refreshBtn, {BackgroundColor3 = Color3.fromRGB(20, 36, 78)}):Play() end)
 refreshBtn.MouseLeave:Connect(function() tw(refreshBtn, {BackgroundColor3 = Color3.fromRGB(16, 28, 60)}):Play() end)
 
-local npcScroll = Instance.new("ScrollingFrame", npcPage)
-npcScroll.Size = UDim2.new(1, 0, 0, 258); npcScroll.Position = UDim2.new(0, 0, 0, 32)
-npcScroll.BackgroundTransparency = 1; npcScroll.BorderSizePixel = 0
+local npcScroll = Instance.new("ScrollingFrame", npcPage); npcScroll.Size = UDim2.new(1, 0, 0, 248)
+npcScroll.Position = UDim2.new(0, 0, 0, 32); npcScroll.BackgroundTransparency = 1; npcScroll.BorderSizePixel = 0
 npcScroll.ScrollBarThickness = 3; npcScroll.ScrollBarImageColor3 = C.accent
 npcScroll.CanvasSize = UDim2.new(0, 0, 0, 0); npcScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 local npcScrollLy = Instance.new("UIListLayout", npcScroll)
@@ -750,9 +777,7 @@ end)
 
 local currentSubTab = "islands"
 local function switchSubTab(name)
-    currentSubTab = name
-    islandPage.Visible = (name == "islands")
-    npcPage.Visible    = (name == "npcs")
+    currentSubTab = name; islandPage.Visible = (name == "islands"); npcPage.Visible = (name == "npcs")
     for n, btn in pairs(subBtns) do
         local on = (n == name)
         tw(btn, {BackgroundColor3 = on and C.accent or C.card, TextColor3 = on and C.bg or C.dim}):Play()
@@ -763,34 +788,21 @@ subNPCBtn.MouseButton1Click:Connect(function() switchSubTab("npcs"); rebuildNPCL
 switchSubTab("islands")
 
 -- ══════════════════════════════════════════
--- VISIBILIDADE (FIX: debounce no V)
+-- VISIBILIDADE
 -- ══════════════════════════════════════════
 local guiVisible = true
-
 local function setVisible(v)
-    if vAnimating then return end  -- bloqueia se animação tá rodando
-    vAnimating = true
     guiVisible = v
-
     for _, child in ipairs(frame:GetChildren()) do
         if child ~= header and child:IsA("Frame") then child.Visible = v end
     end
-
-    if v then
-        frame.AutomaticSize = Enum.AutomaticSize.Y
-        task.delay(0.18, function() vAnimating = false end)
-    else
-        frame.AutomaticSize = Enum.AutomaticSize.None
-        local t = tw(frame, {Size = UDim2.new(0, 212, 0, 36)}, 0.15)
-        t:Play()
-        t.Completed:Connect(function() vAnimating = false end)
-    end
-
+    if v then frame.AutomaticSize = Enum.AutomaticSize.Y
+    else frame.AutomaticSize = Enum.AutomaticSize.None; tw(frame, {Size = UDim2.new(0, 212, 0, 36)}, 0.15):Play() end
     tw(vHint, {TextColor3 = v and C.dim or C.accent}, 0.1):Play()
 end
 
 -- ══════════════════════════════════════════
--- TOGGLES
+-- TOGGLES LÓGICA
 -- ══════════════════════════════════════════
 local function updateDot()
     local anyOn = noclipOn or speedOn or jumpOn or shakeOn
@@ -837,9 +849,11 @@ task.spawn(function()
         if shSec.statusLbl then
             if shakeOn then
                 if shakeActive then
-                    shSec.statusLbl.Text = "● clicando..."; shSec.statusLbl.TextColor3 = C.green
+                    shSec.statusLbl.Text = "● clicando..."
+                    shSec.statusLbl.TextColor3 = C.green
                 else
-                    shSec.statusLbl.Text = "○ aguardando UI..."; shSec.statusLbl.TextColor3 = C.yellow
+                    shSec.statusLbl.Text = "○ aguardando UI..."
+                    shSec.statusLbl.TextColor3 = C.yellow
                 end
             else
                 shSec.statusLbl.Text = ""
@@ -887,13 +901,13 @@ do
     dh.Size = UDim2.new(1, -20, 0, 36); dh.Position = UDim2.new(0, 0, 0, 0)
     dh.BackgroundTransparency = 1; dh.Text = ""; dh.AutoButtonColor = false; dh.ZIndex = 20
     dh.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 then dr=true; ds=i.Position; sp=frame.Position end
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then dr = true; ds = i.Position; sp = frame.Position end
     end)
-    UIS.InputEnded:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dr=false end end)
+    UIS.InputEnded:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dr = false end end)
     UIS.InputChanged:Connect(function(i)
         if dr and i.UserInputType == Enum.UserInputType.MouseMovement then
             local d = i.Position - ds
-            frame.Position = UDim2.new(sp.X.Scale, sp.X.Offset+d.X, sp.Y.Scale, sp.Y.Offset+d.Y)
+            frame.Position = UDim2.new(sp.X.Scale, sp.X.Offset + d.X, sp.Y.Scale, sp.Y.Offset + d.Y)
         end
     end)
 end
@@ -904,8 +918,7 @@ end
 UIS.InputBegan:Connect(function(inp, gpe)
     if gpe or listening then return end
     local k = inp.KeyCode
-    if k == Enum.KeyCode.V then
-        setVisible(not guiVisible)
+    if     k == Enum.KeyCode.V  then setVisible(not guiVisible)
     elseif k == ncKey then
         noclipOn = not noclipOn; setNoclip(noclipOn); ncSec.setTogVis(noclipOn)
         tw(frameBorder, {Color = noclipOn and C.green or C.border}):Play(); updateDot()
@@ -913,18 +926,19 @@ UIS.InputBegan:Connect(function(inp, gpe)
         speedOn = not speedOn; spSec.setTogVis(speedOn); applySpeed(); updateDot()
     elseif k == hjKey then
         jumpOn = not jumpOn; hjSec.setTogVis(jumpOn); applyJump()
-        if not jumpOn then reJumpOn=false; hjSec.setRjVis(false); stopReJump() end; updateDot()
+        if not jumpOn then reJumpOn = false; hjSec.setRjVis(false); stopReJump() end; updateDot()
     elseif k == shakeKey then
         shakeOn = not shakeOn; shSec.setTogVis(shakeOn)
         if shakeOn then startShake() else stopShake() end; updateDot()
     elseif k == sellKey then
         task.spawn(function()
             local ok, msg = sellFromHand()
-            if ok then sellStatus.Text="✅ "..msg; tw(sellStatus,{TextColor3=C.green}):Play()
-            else       sellStatus.Text="❌ "..msg; tw(sellStatus,{TextColor3=C.red}):Play() end
-            task.wait(3); tw(sellStatus,{TextColor3=C.dim}):Play(); sellStatus.Text="Aguardando..."
+            if ok then sellStatus.Text = "✅ " .. msg; tw(sellStatus, {TextColor3 = C.green}):Play()
+            else       sellStatus.Text = "❌ " .. msg; tw(sellStatus, {TextColor3 = C.red}):Play() end
+            task.wait(3); tw(sellStatus, {TextColor3 = C.dim}):Play(); sellStatus.Text = "Aguardando..."
         end)
     end
 end)
 
 switchTab("Cheats")
+print("✅ Utility v7 carregado! Shake agora é smart (só dispara quando UI aparece)")
