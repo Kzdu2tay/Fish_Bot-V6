@@ -1,8 +1,9 @@
 --[[
-    UTILITY v9 — Fisch
-    V = hide/show (hold briefly, not spam)
+    UTILITY v10 — Fisch
+    V = hide/show
     Drag by header
     100% client-side, no prints
+    v10: sell expandido (auto-sell, sell all inv), bordas circulares corrigidas
 ]]
 
 local Players  = game:GetService("Players")
@@ -24,11 +25,12 @@ local reJumpOn   = false; local reJumpConn = nil
 local shakeOn    = false; local shakeThread = nil; local shakeKey = Enum.KeyCode.J
 local shakeActive = false
 local sellKey    = Enum.KeyCode.K
-local npcRange   = 150   -- ajustavel pelo slider
+local autoSellOn = false; local autoSellThread = nil; local autoSellDelay = 1.5
+local npcRange   = 150
 local listening  = nil
 local currentTab = "Cheats"
 local guiVisible = true
-local vDebounce  = false  -- fix do bug V
+local vDebounce  = false
 
 -- ═══════════════════════════════════════
 -- ISLANDS
@@ -103,9 +105,7 @@ end
 local function stopReJump() if reJumpConn then reJumpConn:Disconnect(); reJumpConn=nil end end
 
 -- ═══════════════════════════════════════
--- SHAKE v9 — zero lag
--- Metodo: PlayerGui.shakeui.safezone.button:FireClickEvent()
--- Nao usa VIM, nao usa loop tight, respira entre clicks
+-- SHAKE v9
 -- ═══════════════════════════════════════
 local function getShakeButton()
     local sui = PG:FindFirstChild("shakeui")
@@ -124,7 +124,6 @@ local function startShake()
             local btn = getShakeButton()
             if btn then
                 shakeActive = true
-                -- Fire direto no botao — sem VIM, sem SendInput, zero overhead
                 btn.MouseButton1Click:Fire()
                 task.wait(0.035)
             else
@@ -142,31 +141,120 @@ local function stopShake()
 end
 
 -- ═══════════════════════════════════════
--- SELL
+-- SELL — EXPANDIDO (sem paywall)
+-- Tenta todos os metodos conhecidos do Fisch
 -- ═══════════════════════════════════════
-local function sellFromHand()
-    local t=tool(); if not t then return false,"No item in hand" end
-    pcall(function() t:Activate() end)
+
+-- Metodo principal: tenta vender um tool especifico
+local function trySellTool(t)
+    if not t then return false, "no_tool" end
+
+    -- 1) Tenta RemoteEvents/Functions em RS
     local rsEv = RS:FindFirstChild("events") or RS:FindFirstChild("Events")
+        or RS:FindFirstChild("Remotes") or RS:FindFirstChild("remotes")
     if rsEv then
-        for _,n in ipairs({"sell","Sell","appraise","Appraise","sellfish","SellFish","SellItem","appraiseFish"}) do
+        local names = {
+            "sell","Sell","appraise","Appraise",
+            "sellfish","SellFish","SellItem","appraiseFish",
+            "sellItem","SellFish","FishSell","submitFish",
+            "SubmitFish","cashIn","CashIn","redeemFish",
+        }
+        for _,n in ipairs(names) do
             local e=rsEv:FindFirstChild(n)
             if e then
-                if e:IsA("RemoteEvent") then pcall(function() e:FireServer(t) end); return true,n
-                elseif e:IsA("RemoteFunction") then local ok=pcall(function() return e:InvokeServer(t) end); if ok then return true,n end end
+                if e:IsA("RemoteEvent") then
+                    pcall(function() e:FireServer(t) end)
+                    return true, "RE:"..n
+                elseif e:IsA("RemoteFunction") then
+                    local ok=pcall(function() return e:InvokeServer(t) end)
+                    if ok then return true, "RF:"..n end
+                end
+            end
+        end
+        -- busca generica em toda a arvore de remotes
+        for _,e in ipairs(rsEv:GetDescendants()) do
+            local lower = e.Name:lower()
+            if (lower:find("sell") or lower:find("appraise") or lower:find("submit") or lower:find("cash")) then
+                if e:IsA("RemoteEvent") then
+                    pcall(function() e:FireServer(t) end)
+                    return true, "RE:"..e.Name
+                end
             end
         end
     end
+
+    -- 2) Tenta GUI buttons visiveis com "sell" ou "appraise"
     for _,obj in ipairs(PG:GetDescendants()) do
         if obj:IsA("GuiButton") and obj.Visible then
             local n=obj.Name:lower()
-            if n:find("sell") or n:find("appraise") then
+            if n:find("sell") or n:find("appraise") or n:find("submit") or n:find("cashin") then
                 local sz=obj.AbsoluteSize
-                if sz.X>2 and sz.Y>2 then pcall(function() obj.MouseButton1Click:Fire() end); return true,"GUI."..obj.Name end
+                if sz.X>2 and sz.Y>2 then
+                    pcall(function() obj.MouseButton1Click:Fire() end)
+                    return true, "GUI:"..obj.Name
+                end
             end
         end
     end
-    return false,"Method not found"
+
+    -- 3) Tenta ativar a tool (alguns jogos processam o sell pelo Activate)
+    pcall(function() t:Activate() end)
+
+    return false, "no_method"
+end
+
+-- Vende o item na mao
+local function sellFromHand()
+    local t=tool()
+    if not t then return false,"No item in hand" end
+    return trySellTool(t)
+end
+
+-- Vende TODOS os itens do backpack (nao apenas o da mao)
+local function sellAll()
+    local sold, failed = 0, 0
+    local bp = LP:FindFirstChild("Backpack")
+    local items = {}
+
+    -- pega itens do backpack
+    if bp then
+        for _,t in ipairs(bp:GetChildren()) do
+            if t:IsA("Tool") then table.insert(items, t) end
+        end
+    end
+    -- pega item na mao tambem
+    local hand = tool()
+    if hand then table.insert(items, hand) end
+
+    for _,t in ipairs(items) do
+        local ok,_ = trySellTool(t)
+        if ok then sold=sold+1 else failed=failed+1 end
+        task.wait(0.15) -- pequeno delay entre cada venda
+    end
+
+    if sold==0 and failed==0 then return false,"Inventory empty" end
+    return true, "Sold "..sold..(failed>0 and " | Failed "..failed or "")
+end
+
+-- Auto-sell: vende automaticamente a cada X segundos
+local function startAutoSell(statusLbl)
+    if autoSellThread then task.cancel(autoSellThread); autoSellThread=nil end
+    autoSellThread = task.spawn(function()
+        while autoSellOn do
+            local ok, msg = sellAll()
+            if statusLbl then
+                statusLbl.TextColor3 = ok and Color3.fromRGB(52,211,120) or Color3.fromRGB(240,190,55)
+                statusLbl.Text = (ok and "✅ " or "⏳ ")..msg
+            end
+            task.wait(autoSellDelay)
+        end
+        if statusLbl then statusLbl.Text = "Auto-sell off" end
+    end)
+end
+
+local function stopAutoSell()
+    autoSellOn = false
+    if autoSellThread then task.cancel(autoSellThread); autoSellThread=nil end
 end
 
 -- ═══════════════════════════════════════
@@ -235,6 +323,9 @@ local C={
     yel=Color3.fromRGB(240,190,55),  pink=Color3.fromRGB(255,80,180),
     dim=Color3.fromRGB(70,82,112),   txt=Color3.fromRGB(210,218,240),
     sub=Color3.fromRGB(128,140,175), bdr=Color3.fromRGB(26,33,58),
+    sellBg=Color3.fromRGB(16,58,36), sellH=Color3.fromRGB(20,72,44),
+    autoBg=Color3.fromRGB(40,28,10), autoH=Color3.fromRGB(55,38,12),
+    autoOn=Color3.fromRGB(30,22,8),
 }
 
 local function tw(o,p,d) return TweenSvc:Create(o,TweenInfo.new(d or 0.15,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),p) end
@@ -282,7 +373,7 @@ Instance.new("UICorner",dot).CornerRadius=UDim.new(1,0)
 
 local htitle=Instance.new("TextLabel",header)
 htitle.Size=UDim2.new(1,-60,1,0); htitle.Position=UDim2.new(0,24,0,0)
-htitle.BackgroundTransparency=1; htitle.Text="⚙  UTILITY  v9"
+htitle.BackgroundTransparency=1; htitle.Text="⚙  UTILITY  v10"
 htitle.TextColor3=C.txt; htitle.Font=Enum.Font.GothamBlack; htitle.TextSize=11
 htitle.TextXAlignment=Enum.TextXAlignment.Left
 
@@ -335,7 +426,6 @@ local function switchTab(name)
     for n,b in pairs(tabBtns) do
         tw(b,{BackgroundColor3=(n==name)and C.acc or C.card,TextColor3=(n==name)and C.bg or C.dim}):Play()
     end
-    -- recalc frame height
     frame.AutomaticSize=(guiVisible and Enum.AutomaticSize.Y or Enum.AutomaticSize.None)
 end
 
@@ -365,7 +455,6 @@ local function mkSection(parent, cfg)
     local ly=Instance.new("UIListLayout",sec)
     ly.SortOrder=Enum.SortOrder.LayoutOrder; ly.Padding=UDim.new(0,5)
 
-    -- row 1: label + toggle
     local r1=Instance.new("Frame",sec); r1.Size=UDim2.new(1,0,0,20); r1.BackgroundTransparency=1; r1.LayoutOrder=1
     local lbl=Instance.new("TextLabel",r1); lbl.Size=UDim2.new(1,-52,1,0); lbl.BackgroundTransparency=1
     lbl.Text=cfg.icon.."  "..cfg.label; lbl.TextColor3=C.sub
@@ -380,7 +469,6 @@ local function mkSection(parent, cfg)
     local togHit=Instance.new("TextButton",tr); togHit.Size=UDim2.new(1,0,1,0)
     togHit.BackgroundTransparency=1; togHit.Text=""; togHit.AutoButtonColor=false; togHit.ZIndex=5
 
-    -- row 2: bind key
     local r2=Instance.new("Frame",sec); r2.Size=UDim2.new(1,0,0,20); r2.BackgroundTransparency=1; r2.LayoutOrder=2
     local kl=Instance.new("TextLabel",r2); kl.Size=UDim2.new(0,38,1,0); kl.BackgroundTransparency=1
     kl.Text="Key:"; kl.TextColor3=C.dim; kl.Font=Enum.Font.Gotham; kl.TextSize=8; kl.TextXAlignment=Enum.TextXAlignment.Left
@@ -391,7 +479,6 @@ local function mkSection(parent, cfg)
     Instance.new("UICorner",bindB).CornerRadius=UDim.new(0,5)
     Instance.new("UIStroke",bindB).Color=C.accD
 
-    -- optional status label
     local statusLbl=nil
     if cfg.showStatus then
         local rs=Instance.new("Frame",sec); rs.Size=UDim2.new(1,0,0,12); rs.BackgroundTransparency=1; rs.LayoutOrder=2.5
@@ -401,7 +488,6 @@ local function mkSection(parent, cfg)
         statusLbl.TextXAlignment=Enum.TextXAlignment.Left
     end
 
-    -- optional slider
     if cfg.slider then
         local s=cfg.slider
         local rs1=Instance.new("Frame",sec); rs1.Size=UDim2.new(1,0,0,13); rs1.BackgroundTransparency=1; rs1.LayoutOrder=3
@@ -432,7 +518,6 @@ local function mkSection(parent, cfg)
         end)
     end
 
-    -- optional rejump
     local rjTr,rjKn,rjTogHit
     if cfg.rejump then
         local rr=Instance.new("Frame",sec); rr.Size=UDim2.new(1,0,0,18); rr.BackgroundTransparency=1; rr.LayoutOrder=5
@@ -475,30 +560,124 @@ mkDiv(pg1,7)
 local shSec=mkSection(pg1,{order=8,icon="🔄",label="Shake",keyName=shakeKey.Name,showStatus=true})
 mkDiv(pg1,9)
 
--- Sell section
-local sellF=Instance.new("Frame",pg1); sellF.Size=UDim2.new(1,0,0,0); sellF.AutomaticSize=Enum.AutomaticSize.Y
+-- ═══════════════════════════════════════
+-- SELL SECTION — expandida com bordas circulares
+-- ═══════════════════════════════════════
+local sellF=Instance.new("Frame",pg1)
+sellF.Size=UDim2.new(1,0,0,0); sellF.AutomaticSize=Enum.AutomaticSize.Y
 sellF.BackgroundColor3=C.card; sellF.BorderSizePixel=0; sellF.LayoutOrder=10
-local su=Instance.new("UIPadding",sellF); su.PaddingLeft=UDim.new(0,10); su.PaddingRight=UDim.new(0,10); su.PaddingTop=UDim.new(0,7); su.PaddingBottom=UDim.new(0,9)
-local sLy=Instance.new("UIListLayout",sellF); sLy.SortOrder=Enum.SortOrder.LayoutOrder; sLy.Padding=UDim.new(0,5)
+local su=Instance.new("UIPadding",sellF)
+su.PaddingLeft=UDim.new(0,10); su.PaddingRight=UDim.new(0,10)
+su.PaddingTop=UDim.new(0,7);   su.PaddingBottom=UDim.new(0,9)
+local sLy=Instance.new("UIListLayout",sellF)
+sLy.SortOrder=Enum.SortOrder.LayoutOrder; sLy.Padding=UDim.new(0,5)
+
+-- Titulo
 local sTR=Instance.new("Frame",sellF); sTR.Size=UDim2.new(1,0,0,16); sTR.BackgroundTransparency=1; sTR.LayoutOrder=1
 local sTL=Instance.new("TextLabel",sTR); sTL.Size=UDim2.new(1,0,1,0); sTL.BackgroundTransparency=1
-sTL.Text="💰  Sell from Hand"; sTL.TextColor3=C.sub; sTL.Font=Enum.Font.GothamBold; sTL.TextSize=10; sTL.TextXAlignment=Enum.TextXAlignment.Left
-local sellSt=Instance.new("TextLabel",sellF); sellSt.Size=UDim2.new(1,0,0,10); sellSt.BackgroundTransparency=1
-sellSt.Text="Waiting..."; sellSt.TextColor3=C.dim; sellSt.Font=Enum.Font.Gotham; sellSt.TextSize=8; sellSt.TextXAlignment=Enum.TextXAlignment.Left; sellSt.LayoutOrder=2
+sTL.Text="💰  Sell"; sTL.TextColor3=C.sub; sTL.Font=Enum.Font.GothamBold; sTL.TextSize=10; sTL.TextXAlignment=Enum.TextXAlignment.Left
+
+-- Status label
+local sellSt=Instance.new("TextLabel",sellF)
+sellSt.Size=UDim2.new(1,0,0,10); sellSt.BackgroundTransparency=1
+sellSt.Text="Waiting..."; sellSt.TextColor3=C.dim
+sellSt.Font=Enum.Font.Gotham; sellSt.TextSize=8
+sellSt.TextXAlignment=Enum.TextXAlignment.Left; sellSt.LayoutOrder=2
+
+-- Bind row
 local sBR=Instance.new("Frame",sellF); sBR.Size=UDim2.new(1,0,0,20); sBR.BackgroundTransparency=1; sBR.LayoutOrder=3
 local sBL=Instance.new("TextLabel",sBR); sBL.Size=UDim2.new(0,38,1,0); sBL.BackgroundTransparency=1
 sBL.Text="Key:"; sBL.TextColor3=C.dim; sBL.Font=Enum.Font.Gotham; sBL.TextSize=8; sBL.TextXAlignment=Enum.TextXAlignment.Left
-local sellBind=Instance.new("TextButton",sBR); sellBind.Size=UDim2.new(0,64,0,18); sellBind.Position=UDim2.new(0,40,0.5,-9)
-sellBind.BackgroundColor3=Color3.fromRGB(18,22,44); sellBind.BorderSizePixel=0; sellBind.Text=sellKey.Name
-sellBind.TextColor3=C.acc; sellBind.Font=Enum.Font.GothamBold; sellBind.TextSize=9; sellBind.AutoButtonColor=false
-Instance.new("UICorner",sellBind).CornerRadius=UDim.new(0,5); Instance.new("UIStroke",sellBind).Color=C.accD
-local sellBtn=Instance.new("TextButton",sellF); sellBtn.Size=UDim2.new(1,0,0,28); sellBtn.LayoutOrder=4
-sellBtn.BackgroundColor3=Color3.fromRGB(16,58,36); sellBtn.BorderSizePixel=0
+local sellBind=Instance.new("TextButton",sBR)
+sellBind.Size=UDim2.new(0,64,0,18); sellBind.Position=UDim2.new(0,40,0.5,-9)
+sellBind.BackgroundColor3=Color3.fromRGB(18,22,44); sellBind.BorderSizePixel=0
+sellBind.Text=sellKey.Name; sellBind.TextColor3=C.acc
+sellBind.Font=Enum.Font.GothamBold; sellBind.TextSize=9; sellBind.AutoButtonColor=false
+Instance.new("UICorner",sellBind).CornerRadius=UDim.new(0,5)  -- ✅ CIRCULAR
+Instance.new("UIStroke",sellBind).Color=C.accD
+
+-- Botao: Sell Item in Hand
+local sellBtn=Instance.new("TextButton",sellF)
+sellBtn.Size=UDim2.new(1,0,0,28); sellBtn.LayoutOrder=4
+sellBtn.BackgroundColor3=C.sellBg; sellBtn.BorderSizePixel=0
 sellBtn.Text="💰  Sell Item in Hand"; sellBtn.TextColor3=C.grn
 sellBtn.Font=Enum.Font.GothamBold; sellBtn.TextSize=9; sellBtn.AutoButtonColor=false
-Instance.new("UICorner",sellBtn).CornerRadius=UDim.new(0,7); Instance.new("UIStroke",sellBtn).Color=Color3.fromRGB(22,82,50)
-sellBtn.MouseEnter:Connect(function() tw(sellBtn,{BackgroundColor3=Color3.fromRGB(20,72,44)}):Play() end)
-sellBtn.MouseLeave:Connect(function() tw(sellBtn,{BackgroundColor3=Color3.fromRGB(16,58,36)}):Play() end)
+Instance.new("UICorner",sellBtn).CornerRadius=UDim.new(0,7)  -- ✅ CIRCULAR
+Instance.new("UIStroke",sellBtn).Color=Color3.fromRGB(22,82,50)
+sellBtn.MouseEnter:Connect(function() tw(sellBtn,{BackgroundColor3=C.sellH}):Play() end)
+sellBtn.MouseLeave:Connect(function() tw(sellBtn,{BackgroundColor3=C.sellBg}):Play() end)
+
+-- Divisor interno
+local innerDiv=Instance.new("Frame",sellF)
+innerDiv.Size=UDim2.new(1,0,0,1); innerDiv.BackgroundColor3=C.bdr
+innerDiv.BorderSizePixel=0; innerDiv.LayoutOrder=5
+
+-- Botao: Sell ALL Inventory
+local sellAllBtn=Instance.new("TextButton",sellF)
+sellAllBtn.Size=UDim2.new(1,0,0,28); sellAllBtn.LayoutOrder=6
+sellAllBtn.BackgroundColor3=Color3.fromRGB(14,50,30); sellAllBtn.BorderSizePixel=0
+sellAllBtn.Text="📦  Sell All Inventory"; sellAllBtn.TextColor3=C.grn
+sellAllBtn.Font=Enum.Font.GothamBold; sellAllBtn.TextSize=9; sellAllBtn.AutoButtonColor=false
+Instance.new("UICorner",sellAllBtn).CornerRadius=UDim.new(0,7)  -- ✅ CIRCULAR
+Instance.new("UIStroke",sellAllBtn).Color=Color3.fromRGB(18,70,40)
+sellAllBtn.MouseEnter:Connect(function() tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(18,64,38)}):Play() end)
+sellAllBtn.MouseLeave:Connect(function() tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(14,50,30)}):Play() end)
+
+-- Divisor interno
+local innerDiv2=Instance.new("Frame",sellF)
+innerDiv2.Size=UDim2.new(1,0,0,1); innerDiv2.BackgroundColor3=C.bdr
+innerDiv2.BorderSizePixel=0; innerDiv2.LayoutOrder=7
+
+-- Auto-Sell row (toggle + delay slider)
+local autoRow=Instance.new("Frame",sellF)
+autoRow.Size=UDim2.new(1,0,0,20); autoRow.BackgroundTransparency=1; autoRow.LayoutOrder=8
+local autoLbl=Instance.new("TextLabel",autoRow); autoLbl.Size=UDim2.new(1,-52,1,0); autoLbl.BackgroundTransparency=1
+autoLbl.Text="🔁  Auto-Sell"; autoLbl.TextColor3=C.sub; autoLbl.Font=Enum.Font.GothamBold; autoLbl.TextSize=10; autoLbl.TextXAlignment=Enum.TextXAlignment.Left
+local autoTr=Instance.new("Frame",autoRow); autoTr.Size=UDim2.new(0,36,0,18); autoTr.Position=UDim2.new(1,-36,0.5,-9)
+autoTr.BackgroundColor3=Color3.fromRGB(22,28,50); autoTr.BorderSizePixel=0
+Instance.new("UICorner",autoTr).CornerRadius=UDim.new(0,9)  -- ✅ CIRCULAR
+Instance.new("UIStroke",autoTr).Color=C.bdr
+local autoKn=Instance.new("Frame",autoTr); autoKn.Size=UDim2.new(0,14,0,14); autoKn.Position=UDim2.new(0,2,0.5,-7)
+autoKn.BackgroundColor3=Color3.fromRGB(195,205,235); autoKn.BorderSizePixel=0
+Instance.new("UICorner",autoKn).CornerRadius=UDim.new(0,7)  -- ✅ CIRCULAR
+local autoTogHit=Instance.new("TextButton",autoTr); autoTogHit.Size=UDim2.new(1,0,1,0)
+autoTogHit.BackgroundTransparency=1; autoTogHit.Text=""; autoTogHit.AutoButtonColor=false; autoTogHit.ZIndex=5
+
+-- Delay slider para auto-sell
+local autoDelRow1=Instance.new("Frame",sellF); autoDelRow1.Size=UDim2.new(1,0,0,13); autoDelRow1.BackgroundTransparency=1; autoDelRow1.LayoutOrder=9
+local autoDelLbl=Instance.new("TextLabel",autoDelRow1); autoDelLbl.Size=UDim2.new(1,0,1,0); autoDelLbl.BackgroundTransparency=1
+autoDelLbl.Text="Delay: 1.5s"; autoDelLbl.TextColor3=C.acc; autoDelLbl.Font=Enum.Font.GothamBold; autoDelLbl.TextSize=8; autoDelLbl.TextXAlignment=Enum.TextXAlignment.Left
+local autoDelRow2=Instance.new("Frame",sellF); autoDelRow2.Size=UDim2.new(1,0,0,14); autoDelRow2.BackgroundTransparency=1; autoDelRow2.LayoutOrder=10
+local adBg=Instance.new("Frame",autoDelRow2); adBg.Size=UDim2.new(1,0,0,4); adBg.Position=UDim2.new(0,0,0.5,-2)
+adBg.BackgroundColor3=Color3.fromRGB(20,25,45); adBg.BorderSizePixel=0
+Instance.new("UICorner",adBg).CornerRadius=UDim.new(0,2)
+local adPct=(autoSellDelay-0.5)/(10-0.5)
+local adFill=Instance.new("Frame",adBg); adFill.Size=UDim2.new(adPct,0,1,0)
+adFill.BackgroundColor3=C.grn; adFill.BorderSizePixel=0
+Instance.new("UICorner",adFill).CornerRadius=UDim.new(0,2)
+local adKn=Instance.new("Frame",adBg); adKn.Size=UDim2.new(0,11,0,11); adKn.AnchorPoint=Vector2.new(0.5,0.5)
+adKn.Position=UDim2.new(adPct,0,0.5,0); adKn.BackgroundColor3=Color3.fromRGB(255,255,255); adKn.BorderSizePixel=0; adKn.ZIndex=3
+Instance.new("UICorner",adKn).CornerRadius=UDim.new(0,6)  -- ✅ CIRCULAR
+local adHit=Instance.new("TextButton",adBg); adHit.Size=UDim2.new(1,0,0,20); adHit.Position=UDim2.new(0,0,0.5,-10)
+adHit.BackgroundTransparency=1; adHit.Text=""; adHit.AutoButtonColor=false; adHit.ZIndex=4
+local adDrag=false
+adHit.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then adDrag=true end end)
+adHit.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then adDrag=false end end)
+UIS.InputChanged:Connect(function(i)
+    if not adDrag or i.UserInputType~=Enum.UserInputType.MouseMovement then return end
+    local pct=math.clamp((i.Position.X-adBg.AbsolutePosition.X)/adBg.AbsoluteSize.X,0,1)
+    autoSellDelay=math.floor((0.5+pct*(10-0.5))*10+0.5)/10
+    adFill.Size=UDim2.new(pct,0,1,0); adKn.Position=UDim2.new(pct,0,0.5,0)
+    autoDelLbl.Text="Delay: "..autoSellDelay.."s"
+end)
+
+-- Auto-sell status
+local autoStLbl=Instance.new("TextLabel",sellF)
+autoStLbl.Size=UDim2.new(1,0,0,10); autoStLbl.BackgroundTransparency=1
+autoStLbl.Text=""; autoStLbl.TextColor3=C.dim
+autoStLbl.Font=Enum.Font.Code; autoStLbl.TextSize=8
+autoStLbl.TextXAlignment=Enum.TextXAlignment.Left; autoStLbl.LayoutOrder=11
+
 mkDiv(pg1,11)
 
 -- ═══════════════════════════════════════
@@ -523,7 +702,7 @@ for i,isl in ipairs(ISLANDS) do
     b.BackgroundColor3=bc; b.BorderSizePixel=0; b.Text="📍  "..isl.name
     b.TextColor3=tc; b.Font=Enum.Font.GothamBold; b.TextSize=9; b.TextXAlignment=Enum.TextXAlignment.Left
     b.AutoButtonColor=false; b.LayoutOrder=i
-    Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); pad(b,8,8,0,0)
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); pad(b,8,8,0,0)  -- ✅ CIRCULAR
     b.MouseEnter:Connect(function() tw(b,{BackgroundColor3=hc,TextColor3=C.txt}):Play() end)
     b.MouseLeave:Connect(function() tw(b,{BackgroundColor3=bc,TextColor3=tc}):Play() end)
     b.MouseButton1Click:Connect(function()
@@ -536,11 +715,10 @@ for i,isl in ipairs(ISLANDS) do
 end
 
 -- ═══════════════════════════════════════
--- PAGE NPCs (nearby scan)
+-- PAGE NPCs
 -- ═══════════════════════════════════════
 local pg3=tabPages["NPCs"]
 
--- range slider
 local rngF=Instance.new("Frame",pg3); rngF.Size=UDim2.new(1,0,0,0); rngF.AutomaticSize=Enum.AutomaticSize.Y
 rngF.BackgroundColor3=C.card; rngF.BorderSizePixel=0; rngF.LayoutOrder=1
 pad(rngF,10,10,7,7)
@@ -558,7 +736,7 @@ rngFill.BackgroundColor3=C.acc; rngFill.BorderSizePixel=0
 Instance.new("UICorner",rngFill).CornerRadius=UDim.new(0,2)
 local rngKn=Instance.new("Frame",rngBg); rngKn.Size=UDim2.new(0,11,0,11); rngKn.AnchorPoint=Vector2.new(0.5,0.5)
 rngKn.Position=UDim2.new(rPct,0,0.5,0); rngKn.BackgroundColor3=Color3.fromRGB(255,255,255); rngKn.BorderSizePixel=0; rngKn.ZIndex=3
-Instance.new("UICorner",rngKn).CornerRadius=UDim.new(0,6)
+Instance.new("UICorner",rngKn).CornerRadius=UDim.new(0,6)  -- ✅ CIRCULAR
 local rngHit=Instance.new("TextButton",rngBg); rngHit.Size=UDim2.new(1,0,0,20); rngHit.Position=UDim2.new(0,0,0.5,-10)
 rngHit.BackgroundTransparency=1; rngHit.Text=""; rngHit.AutoButtonColor=false; rngHit.ZIndex=4
 local rngDrag=false
@@ -573,12 +751,12 @@ UIS.InputChanged:Connect(function(i)
 end)
 mkDiv(pg3,2)
 
--- scan button
+-- scan button — ✅ AGORA COM BORDA CIRCULAR
 local scanBtn=Instance.new("TextButton",pg3); scanBtn.Size=UDim2.new(1,0,0,30); scanBtn.LayoutOrder=3
 scanBtn.BackgroundColor3=Color3.fromRGB(16,28,60); scanBtn.BorderSizePixel=0
 scanBtn.Text="🔍  Scan Nearby NPCs"; scanBtn.TextColor3=C.acc
 scanBtn.Font=Enum.Font.GothamBold; scanBtn.TextSize=9; scanBtn.AutoButtonColor=false
-Instance.new("UICorner",scanBtn).CornerRadius=UDim.new(0,0)
+Instance.new("UICorner",scanBtn).CornerRadius=UDim.new(0,7)  -- ✅ CIRCULAR (era 0 antes!)
 Instance.new("UIStroke",scanBtn).Color=C.accD
 scanBtn.MouseEnter:Connect(function() tw(scanBtn,{BackgroundColor3=Color3.fromRGB(20,36,78)}):Play() end)
 scanBtn.MouseLeave:Connect(function() tw(scanBtn,{BackgroundColor3=Color3.fromRGB(16,28,60)}):Play() end)
@@ -607,7 +785,7 @@ local function rebuildNPCs()
         b.BackgroundColor3=C.card; b.BorderSizePixel=0; b.AutoButtonColor=false; b.LayoutOrder=i
         b.Text="🧑  "..npc.name.."  ("..npc.dist.." st)"
         b.TextColor3=C.sub; b.Font=Enum.Font.GothamBold; b.TextSize=8; b.TextXAlignment=Enum.TextXAlignment.Left
-        Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); pad(b,8,8,0,0)
+        Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); pad(b,8,8,0,0)  -- ✅ CIRCULAR
         b.MouseEnter:Connect(function() tw(b,{BackgroundColor3=C.cardH,TextColor3=C.txt}):Play() end)
         b.MouseLeave:Connect(function() tw(b,{BackgroundColor3=C.card,TextColor3=C.sub}):Play() end)
         local cp=npc.part
@@ -624,21 +802,19 @@ scanBtn.MouseButton1Click:Connect(function()
 end)
 
 -- ═══════════════════════════════════════
--- VISIBILITY — com debounce pra nao bugar
+-- VISIBILITY
 -- ═══════════════════════════════════════
 local function setVisible(v)
     if vDebounce then return end
     vDebounce=true
     guiVisible=v
     if v then
-        -- mostra: primeiro restaura AutomaticSize, depois mostra conteudo
         frame.AutomaticSize=Enum.AutomaticSize.Y
         for _,ch in ipairs(frame:GetChildren()) do
             if ch~=header and (ch:IsA("Frame") or ch:IsA("ScrollingFrame")) then ch.Visible=true end
         end
         tw(vHint,{TextColor3=C.dim},0.1):Play()
     else
-        -- esconde: tween pra 36px (so header), depois esconde conteudo
         frame.AutomaticSize=Enum.AutomaticSize.None
         tw(frame,{Size=UDim2.new(0,212,0,36)},0.18):Play()
         task.delay(0.18,function()
@@ -655,7 +831,7 @@ end
 -- UPDATE DOT
 -- ═══════════════════════════════════════
 local function updateDot()
-    tw(dot,{BackgroundColor3=(noclipOn or speedOn or jumpOn or shakeOn) and C.grn or C.dim}):Play()
+    tw(dot,{BackgroundColor3=(noclipOn or speedOn or jumpOn or shakeOn or autoSellOn) and C.grn or C.dim}):Play()
 end
 
 -- ═══════════════════════════════════════
@@ -683,14 +859,42 @@ shSec.togHit.MouseButton1Click:Connect(function()
     shakeOn=not shakeOn; shSec.setTog(shakeOn)
     if shakeOn then startShake() else stopShake() end; updateDot()
 end)
+
+-- Sell in hand
 sellBtn.MouseButton1Click:Connect(function()
     task.spawn(function()
         tw(sellBtn,{BackgroundColor3=Color3.fromRGB(10,44,26)}):Play(); task.wait(0.1)
-        tw(sellBtn,{BackgroundColor3=Color3.fromRGB(16,58,36)}):Play()
+        tw(sellBtn,{BackgroundColor3=C.sellBg}):Play()
         local ok,msg=sellFromHand()
         sellSt.TextColor3=ok and C.grn or C.red; sellSt.Text=(ok and "✅ " or "❌ ")..msg
         task.wait(3); tw(sellSt,{TextColor3=C.dim}):Play(); sellSt.Text="Waiting..."
     end)
+end)
+
+-- Sell All
+sellAllBtn.MouseButton1Click:Connect(function()
+    task.spawn(function()
+        tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(10,38,22)}):Play(); task.wait(0.1)
+        tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(14,50,30)}):Play()
+        local ok,msg=sellAll()
+        sellSt.TextColor3=ok and C.grn or C.red; sellSt.Text=(ok and "✅ " or "❌ ")..msg
+        task.wait(3); tw(sellSt,{TextColor3=C.dim}):Play(); sellSt.Text="Waiting..."
+    end)
+end)
+
+-- Auto-sell toggle
+autoTogHit.MouseButton1Click:Connect(function()
+    autoSellOn=not autoSellOn
+    tw(autoTr,{BackgroundColor3=autoSellOn and C.grn or Color3.fromRGB(22,28,50)}):Play()
+    twB(autoKn,{Position=autoSellOn and UDim2.new(0,20,0.5,-7) or UDim2.new(0,2,0.5,-7)}):Play()
+    if autoSellOn then
+        startAutoSell(autoStLbl)
+    else
+        stopAutoSell()
+        autoStLbl.Text="Auto-sell off"
+        task.delay(2, function() autoStLbl.Text="" end)
+    end
+    updateDot()
 end)
 
 -- shake status watcher
