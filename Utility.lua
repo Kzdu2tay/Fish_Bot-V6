@@ -1,7 +1,8 @@
 --[[
-    UTILITY v13 — PATCH
-    • Shake: detecta shakeui e spamma Enter (sem FireServer, sem click simulado)
-    • GUI: cantos totalmente arredondados (header não corta mais)
+    UTILITY v14 — PATCH + FISHING AUTO
+    • Shake: detecta shakeui e spamma Enter
+    • Fishing: detecta minigame de pesca, controla via VIM (hold/release)
+    • Mesmo estilo seguro: ZERO FireServer, apenas input real
     V = hide/show | Drag pelo header
 ]]
 
@@ -24,6 +25,8 @@ local jumpOn     = false; local jumpVal    = 80;  local hjKey    = Enum.KeyCode.
 local reJumpOn   = false; local reJumpConn = nil
 local shakeOn    = false; local shakeThread = nil; local shakeKey = Enum.KeyCode.J
 local shakeActive = false
+local fishOn     = false; local fishThread  = nil; local fishKey  = Enum.KeyCode.L
+local fishStatus = "idle" -- idle, holding, releasing, active
 local sellKey    = Enum.KeyCode.K
 local autoSellOn = false; local autoSellThread = nil; local autoSellDelay = 1.5
 local npcRange   = 150
@@ -127,14 +130,7 @@ end
 local function stopReJump() if reJumpConn then reJumpConn:Disconnect(); reJumpConn=nil end end
 
 -- ═══════════════════════════════════════
--- ✅ SHAKE v13 PATCH — APENAS ENTER SPAM
---
--- MÉTODO SEGURO:
--- 1. Detecta se shakeui está visível na tela
--- 2. Se sim: spamma Enter via VIM.SendKeyEvent
--- 3. ZERO FireServer, ZERO clicks simulados
--- 4. Enter é exatamente o que um jogador no teclado
---    faria — indetectável
+-- SHAKE v13
 -- ═══════════════════════════════════════
 local function shakeUiVisible()
     local sui = PG:FindFirstChild("shakeui")
@@ -142,13 +138,9 @@ local function shakeUiVisible()
 end
 
 local function pressEnter()
-    pcall(function()
-        VIM:SendKeyEvent(true,  Enum.KeyCode.Return, false, game)
-    end)
+    pcall(function() VIM:SendKeyEvent(true,  Enum.KeyCode.Return, false, game) end)
     task.wait(0.02)
-    pcall(function()
-        VIM:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
-    end)
+    pcall(function() VIM:SendKeyEvent(false, Enum.KeyCode.Return, false, game) end)
 end
 
 local function startShake()
@@ -158,11 +150,10 @@ local function startShake()
             if shakeUiVisible() then
                 shakeActive = true
                 pressEnter()
-                -- delay com variação humana (não spamma idêntico)
                 task.wait(0.05 + math.random() * 0.03)
             else
                 shakeActive = false
-                task.wait(0.08)  -- aguarda aparecer
+                task.wait(0.08)
             end
         end
         shakeActive = false
@@ -170,9 +161,170 @@ local function startShake()
 end
 
 local function stopShake()
-    shakeOn = false
-    shakeActive = false
+    shakeOn = false; shakeActive = false
     if shakeThread then task.cancel(shakeThread); shakeThread=nil end
+end
+
+-- ═══════════════════════════════════════
+-- 🎣 FISHING AUTO v14
+--
+-- MÉTODO SEGURO:
+-- 1. Detecta GUI de pesca por padrões visuais (Frame branco largo)
+-- 2. Lê posição do indicador (frame cinza escuro dentro da barra)
+-- 3. Controla via VIM MouseButton1 (hold = direita, release = esquerda)
+-- 4. ZERO FireServer — apenas input de mouse real
+-- 5. Lógica: segura quando indicador está pra esquerda do centro,
+--    solta quando está pra direita (evita overshooting)
+-- ═══════════════════════════════════════
+
+-- Detecta a barra branca do minigame de pesca
+-- Procura por Frame branco largo e fino (a barra horizontal)
+local function findFishBar()
+    for _, obj in ipairs(PG:GetDescendants()) do
+        if obj:IsA("Frame") and obj.Visible then
+            local sz = obj.AbsoluteSize
+            local bc = obj.BackgroundColor3
+            -- barra branca: larga (>100px), baixa altura (<60px), cor branca/clara
+            local isWhite = bc.R > 0.85 and bc.G > 0.85 and bc.B > 0.85
+            local isWide  = sz.X > 100 and sz.Y > 10 and sz.Y < 80
+            if isWhite and isWide then
+                -- procura indicador cinza escuro dentro dela
+                for _, child in ipairs(obj:GetDescendants()) do
+                    if child:IsA("Frame") and child.Visible then
+                        local cc = child.BackgroundColor3
+                        local cs = child.AbsoluteSize
+                        -- indicador: estreito, cinza escuro
+                        local isDark = cc.R < 0.5 and cc.G < 0.5 and cc.B < 0.5
+                        local isThin = cs.X < 30 and cs.Y > 10
+                        if isDark and isThin then
+                            return obj, child
+                        end
+                    end
+                end
+                -- fallback: procura qualquer filho estreito
+                for _, child in ipairs(obj:GetChildren()) do
+                    if child:IsA("Frame") and child.Visible then
+                        local cs = child.AbsoluteSize
+                        if cs.X < 40 and cs.Y > 8 then
+                            return obj, child
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return nil, nil
+end
+
+-- Detecta se a GUI de pesca está ativa (qualquer sinal)
+local function fishingUiActive()
+    -- Método 1: nome direto
+    for _, name in ipairs({"fishingui","FishingUI","fishUI","FishUI","fishing","Fishing","fishMinigame","FishMinigame","reelUI","ReelUI"}) do
+        local f = PG:FindFirstChild(name)
+        if f and f.Enabled ~= false then return true end
+    end
+    -- Método 2: detecta barra branca na tela
+    local bar = findFishBar()
+    return bar ~= nil
+end
+
+-- Simula segurar o botão (MouseButton1 hold)
+local holdingMouse = false
+local function holdMouse()
+    if holdingMouse then return end
+    holdingMouse = true
+    pcall(function()
+        VIM:SendMouseButtonEvent(0, 0, 0, true, game, 1)
+    end)
+end
+
+local function releaseMouse()
+    if not holdingMouse then return end
+    holdingMouse = false
+    pcall(function()
+        VIM:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+    end)
+end
+
+-- Lógica de controle da barra de pesca
+-- O indicador cai pra esquerda sozinho, vai pra direita quando segura
+-- Estratégia: manter indicador no centro com margem de 20% pra cada lado
+local function getFishIndicatorPos(bar, indicator)
+    if not bar or not indicator then return 0.5 end
+    local barLeft  = bar.AbsolutePosition.X
+    local barWidth = bar.AbsoluteSize.X
+    local indCenter = indicator.AbsolutePosition.X + indicator.AbsoluteSize.X / 2
+    if barWidth <= 0 then return 0.5 end
+    return math.clamp((indCenter - barLeft) / barWidth, 0, 1)
+end
+
+local function startFishing(statusLbl)
+    if fishThread then task.cancel(fishThread); fishThread=nil end
+    fishStatus = "active"
+    fishThread = task.spawn(function()
+        local wasHolding = false
+        local HOLD_ZONE  = 0.65  -- segura enquanto indicador < 65%
+        local RELEASE_ZONE = 0.75 -- solta quando indicador >= 75%
+        -- zona alvo: 30% ~ 70% da barra = seguro
+        -- se <30%: segura (vai pra direita)
+        -- se >70%: solta (cai pra esquerda)
+        -- entre 30-70%: mantém decisão anterior (evita flicker)
+
+        while fishOn do
+            if fishingUiActive() then
+                fishStatus = "active"
+                local bar, ind = findFishBar()
+                local pos = getFishIndicatorPos(bar, ind)
+
+                if pos < 0.35 then
+                    -- muito à esquerda: segura (push right)
+                    if not wasHolding then
+                        holdMouse(); wasHolding = true
+                    end
+                elseif pos > 0.70 then
+                    -- muito à direita: solta (fall left)
+                    if wasHolding then
+                        releaseMouse(); wasHolding = false
+                    end
+                end
+                -- entre 35-70%: mantém estado atual
+
+                if statusLbl then
+                    local pct = math.floor(pos * 100)
+                    if wasHolding then
+                        statusLbl.Text = "● holding → ("..pct.."%)"
+                        statusLbl.TextColor3 = Color3.fromRGB(82,148,255)
+                    else
+                        statusLbl.Text = "○ releasing ← ("..pct.."%)"
+                        statusLbl.TextColor3 = Color3.fromRGB(240,190,55)
+                    end
+                end
+
+                task.wait(0.04 + math.random() * 0.02) -- 40-60ms, parece humano
+            else
+                -- UI sumiu: solta o botão, aguarda
+                if wasHolding then releaseMouse(); wasHolding = false end
+                fishStatus = "waiting"
+                if statusLbl then
+                    statusLbl.Text = "○ waiting cast..."
+                    statusLbl.TextColor3 = Color3.fromRGB(70,82,112)
+                end
+                task.wait(0.1)
+            end
+        end
+
+        -- cleanup
+        if wasHolding then releaseMouse() end
+        fishStatus = "idle"
+        if statusLbl then statusLbl.Text = "" end
+    end)
+end
+
+local function stopFishing()
+    fishOn = false
+    releaseMouse()
+    if fishThread then task.cancel(fishThread); fishThread=nil end
+    fishStatus = "idle"
 end
 
 -- ═══════════════════════════════════════
@@ -280,32 +432,25 @@ local C={
     dim=Color3.fromRGB(70,82,112),   txt=Color3.fromRGB(210,218,240),
     sub=Color3.fromRGB(128,140,175), bdr=Color3.fromRGB(26,33,58),
     sellBg=Color3.fromRGB(16,58,36), sellH=Color3.fromRGB(20,72,44),
+    fishBg=Color3.fromRGB(16,38,68), fishH=Color3.fromRGB(20,52,90),
 }
 
 local function tw(o,p,d)  return TweenSvc:Create(o,TweenInfo.new(d or 0.15,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),p) end
 local function twB(o,p)   return TweenSvc:Create(o,TweenInfo.new(0.22,Enum.EasingStyle.Back,Enum.EasingDirection.Out),p) end
 local function twE(o,p,d) return TweenSvc:Create(o,TweenInfo.new(d or 0.3,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut),p) end
 
--- ═══════════════════════════════════════
--- FRAME PRINCIPAL
--- ✅ FIX CANTOS: frame usa ClipsDescendants=true
--- O header NÃO tem UICorner próprio — os cantos vêm
--- só do frame pai. Header tem mesmo bg que o frame
--- nos 12px superiores pra não vazar cor errada.
--- ═══════════════════════════════════════
 local FRAME_W = 212
 local HEADER_H = 36
 local CORNER_R = 12
 
 local frame = Instance.new("Frame", gui)
 frame.Size = UDim2.new(0, FRAME_W, 0, HEADER_H)
-frame.Position = UDim2.new(0, -FRAME_W, 0.5, -160)  -- começa fora pra animar
+frame.Position = UDim2.new(0, -FRAME_W, 0.5, -160)
 frame.BackgroundColor3 = C.bg
 frame.BorderSizePixel = 0
-frame.ClipsDescendants = true   -- ✅ clips o header nos cantos do frame pai
+frame.ClipsDescendants = true
 frame.BackgroundTransparency = 1
 
--- ✅ UICorner no frame PAI — é o único corner do script inteiro
 local mainCorner = Instance.new("UICorner", frame)
 mainCorner.CornerRadius = UDim.new(0, CORNER_R)
 
@@ -313,7 +458,6 @@ local fBdr = Instance.new("UIStroke", frame)
 fBdr.Color = C.bdr; fBdr.Thickness = 1.5
 fBdr.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 
--- Content holder (tudo abaixo do header)
 local contentHolder = Instance.new("Frame", frame)
 contentHolder.Size = UDim2.new(1,0,0,9999)
 contentHolder.Position = UDim2.new(0,0,0,HEADER_H)
@@ -335,10 +479,6 @@ local function pad(p,l,r,t,b)
     u.PaddingTop=UDim.new(0,t or 6);   u.PaddingBottom=UDim.new(0,b or 6)
 end
 
--- ═══════════════════════════════════════
--- HEADER — sem UICorner, ocupa top do frame
--- ClipsDescendants=true no frame já arredonda
--- ═══════════════════════════════════════
 local header = Instance.new("Frame", frame)
 header.Size = UDim2.new(1,0,0,HEADER_H)
 header.Position = UDim2.new(0,0,0,0)
@@ -346,7 +486,6 @@ header.BackgroundColor3 = C.panel
 header.BorderSizePixel = 0
 header.ZIndex = 2
 
--- Gradiente animado no header
 local hGrad = Instance.new("UIGradient", header)
 hGrad.Color = ColorSequence.new({
     ColorSequenceKeypoint.new(0, Color3.fromRGB(16,22,52)),
@@ -375,7 +514,6 @@ headerLine.BackgroundColor3 = C.bdr
 headerLine.BorderSizePixel = 0
 headerLine.ZIndex = 3
 
--- Dot de status
 local dot = Instance.new("Frame", header)
 dot.Size = UDim2.new(0,7,0,7); dot.Position = UDim2.new(0,11,0.5,-3)
 dot.BackgroundColor3 = C.dim; dot.BorderSizePixel = 0; dot.ZIndex = 4
@@ -383,7 +521,7 @@ Instance.new("UICorner",dot).CornerRadius = UDim.new(1,0)
 
 local htitle = Instance.new("TextLabel", header)
 htitle.Size = UDim2.new(1,-60,1,0); htitle.Position = UDim2.new(0,24,0,0)
-htitle.BackgroundTransparency = 1; htitle.Text = "⚙  UTILITY  v13"
+htitle.BackgroundTransparency = 1; htitle.Text = "⚙  UTILITY  v14"
 htitle.TextColor3 = C.txt; htitle.Font = Enum.Font.GothamBlack; htitle.TextSize = 11
 htitle.TextXAlignment = Enum.TextXAlignment.Left; htitle.ZIndex = 4
 
@@ -598,11 +736,14 @@ local hjSec=mkSection(pg1,{order=6,icon="🦘",label="High Jump",keyName=hjKey.N
 mkDiv(pg1,7)
 local shSec=mkSection(pg1,{order=8,icon="🔄",label="Shake",keyName=shakeKey.Name,showStatus=true})
 mkDiv(pg1,9)
+-- 🎣 FISHING SECTION
+local fishSec=mkSection(pg1,{order=10,icon="🎣",label="Auto Fish",keyName=fishKey.Name,showStatus=true})
+mkDiv(pg1,11)
 
 -- SELL
 local sellF=Instance.new("Frame",pg1)
 sellF.Size=UDim2.new(1,0,0,0); sellF.AutomaticSize=Enum.AutomaticSize.Y
-sellF.BackgroundColor3=C.card; sellF.BorderSizePixel=0; sellF.LayoutOrder=10
+sellF.BackgroundColor3=C.card; sellF.BorderSizePixel=0; sellF.LayoutOrder=12
 local su=Instance.new("UIPadding",sellF)
 su.PaddingLeft=UDim.new(0,10); su.PaddingRight=UDim.new(0,10)
 su.PaddingTop=UDim.new(0,7);   su.PaddingBottom=UDim.new(0,9)
@@ -694,7 +835,7 @@ autoStLbl.Size=UDim2.new(1,0,0,10); autoStLbl.BackgroundTransparency=1
 autoStLbl.Text=""; autoStLbl.TextColor3=C.dim
 autoStLbl.Font=Enum.Font.Code; autoStLbl.TextSize=8
 autoStLbl.TextXAlignment=Enum.TextXAlignment.Left; autoStLbl.LayoutOrder=11
-mkDiv(pg1,11)
+mkDiv(pg1,13)
 
 -- ═══════════════════════════════════════
 -- PAGE TP
@@ -814,11 +955,11 @@ end)
 -- TOGGLES
 -- ═══════════════════════════════════════
 local function updateDot()
-    local anyOn=noclipOn or speedOn or jumpOn or shakeOn or autoSellOn
+    local anyOn=noclipOn or speedOn or jumpOn or shakeOn or fishOn or autoSellOn
     tw(dot,{BackgroundColor3=anyOn and C.grn or C.dim}):Play()
     if anyOn then
         task.spawn(function()
-            while (noclipOn or speedOn or jumpOn or shakeOn or autoSellOn) do
+            while (noclipOn or speedOn or jumpOn or shakeOn or fishOn or autoSellOn) do
                 twE(dot,{Size=UDim2.new(0,9,0,9),Position=UDim2.new(0,10,0.5,-4)},0.5):Play(); task.wait(0.55)
                 twE(dot,{Size=UDim2.new(0,7,0,7),Position=UDim2.new(0,11,0.5,-3)},0.5):Play(); task.wait(0.55)
             end
@@ -849,6 +990,18 @@ end
 shSec.togHit.MouseButton1Click:Connect(function()
     shakeOn=not shakeOn; shSec.setTog(shakeOn)
     if shakeOn then startShake() else stopShake() end; updateDot()
+end)
+
+-- 🎣 FISHING TOGGLE
+fishSec.togHit.MouseButton1Click:Connect(function()
+    fishOn=not fishOn; fishSec.setTog(fishOn)
+    if fishOn then
+        startFishing(fishSec.statusLbl)
+    else
+        stopFishing()
+        if fishSec.statusLbl then fishSec.statusLbl.Text="" end
+    end
+    updateDot()
 end)
 
 sellBtn.MouseButton1Click:Connect(function()
@@ -916,11 +1069,12 @@ local function setupBind(bindBtn,id,getKey,setKey)
         end)
     end)
 end
-setupBind(ncSec.bindBtn,"nc",  function() return ncKey    end,function(k) ncKey=k    end)
-setupBind(spSec.bindBtn,"sp",  function() return spKey    end,function(k) spKey=k    end)
-setupBind(hjSec.bindBtn,"hj",  function() return hjKey    end,function(k) hjKey=k    end)
-setupBind(shSec.bindBtn,"sh",  function() return shakeKey end,function(k) shakeKey=k end)
-setupBind(sellBind,"sell",     function() return sellKey  end,function(k) sellKey=k  end)
+setupBind(ncSec.bindBtn,"nc",    function() return ncKey    end,function(k) ncKey=k    end)
+setupBind(spSec.bindBtn,"sp",    function() return spKey    end,function(k) spKey=k    end)
+setupBind(hjSec.bindBtn,"hj",    function() return hjKey    end,function(k) hjKey=k    end)
+setupBind(shSec.bindBtn,"sh",    function() return shakeKey end,function(k) shakeKey=k end)
+setupBind(fishSec.bindBtn,"fish",function() return fishKey  end,function(k) fishKey=k  end)
+setupBind(sellBind,"sell",       function() return sellKey  end,function(k) sellKey=k  end)
 
 -- ═══════════════════════════════════════
 -- DRAG
@@ -956,6 +1110,10 @@ UIS.InputBegan:Connect(function(inp,gpe)
     elseif k==spKey    then speedOn=not speedOn;spSec.setTog(speedOn);if speedOn then applySpeedOnce();startSpeedLoop() else stopSpeedLoop() end;updateDot()
     elseif k==hjKey    then jumpOn=not jumpOn;hjSec.setTog(jumpOn);if jumpOn then startJumpLoop() else stopJumpLoop();reJumpOn=false;hjSec.setRj(false);stopReJump() end;updateDot()
     elseif k==shakeKey then shakeOn=not shakeOn;shSec.setTog(shakeOn);if shakeOn then startShake() else stopShake() end;updateDot()
+    elseif k==fishKey  then
+        fishOn=not fishOn; fishSec.setTog(fishOn)
+        if fishOn then startFishing(fishSec.statusLbl) else stopFishing(); if fishSec.statusLbl then fishSec.statusLbl.Text="" end end
+        updateDot()
     elseif k==sellKey  then
         task.spawn(function()
             local ok,msg=sellFromHand()
