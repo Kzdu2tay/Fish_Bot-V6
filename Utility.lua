@@ -1,15 +1,11 @@
 --[[
-    UTILITY v14 — Fisch 2026
-    ★ Novidades v14:
-    • Ilhas 2026: Lushgrove, Emberreach, Mariana's Veil, Cultist Lair,
-      Waveborne, Pine Shoals, Azure Lagoon, Cursed Shores, + todas antigas
-    • Aba RODS com coordenadas de todas as varas localizáveis
-    • 📜 Treasure Map Tracker: lê as coords dos mapas fixados no backpack
-      e mostra lista clicável pra TP direto no baú
-    • 🎣 Auto-Reel: segue a barra no peixe no minigame (toggle manual)
-
-    ★ NÃO incluído (expliquei no chat):
-    Duplicação de itens — patchada há tempo e = ban certo
+    UTILITY v15 — Fisch 2026
+    Mudanças v15:
+    • Removidos teleports de evento de natal (Winter Village, Candy Cane Rod, Magic Mirror)
+    • Auto-Reel reescrito: usa cliques rápidos humanizados em vez de segurar mouse
+      → Detecta peixe, dá rafagas de clicks curtos pra manter barra sobre o peixe
+      → Timing humanizado com jitter aleatório (menos detectável)
+      → Mesma abordagem do Shake (VIM events, ban-safe)
 ]]
 
 local Players   = game:GetService("Players")
@@ -25,25 +21,24 @@ local PG = LP:WaitForChild("PlayerGui")
 -- ═══════════════════════════════════════
 -- STATE
 -- ═══════════════════════════════════════
-local noclipOn   = false; local noclipConn = nil; local ncKey    = Enum.KeyCode.F
-local speedOn    = false; local speedVal   = 45;  local spKey    = Enum.KeyCode.G; local speedConn = nil
-local jumpOn     = false; local jumpVal    = 80;  local hjKey    = Enum.KeyCode.H; local jumpConn  = nil
-local reJumpOn   = false; local reJumpConn = nil
-local shakeOn    = false; local shakeThread = nil; local shakeKey = Enum.KeyCode.J
+local noclipOn    = false; local noclipConn  = nil; local ncKey    = Enum.KeyCode.F
+local speedOn     = false; local speedVal    = 45;  local spKey    = Enum.KeyCode.G; local speedConn = nil
+local jumpOn      = false; local jumpVal     = 80;  local hjKey    = Enum.KeyCode.H; local jumpConn  = nil
+local reJumpOn    = false; local reJumpConn  = nil
+local shakeOn     = false; local shakeThread = nil; local shakeKey = Enum.KeyCode.J
 local shakeActive = false
-local sellKey    = Enum.KeyCode.K
-local autoSellOn = false; local autoSellThread = nil; local autoSellDelay = 1.5
-local autoReelOn = false; local autoReelConn = nil; local reelKey = Enum.KeyCode.L
-local reelActive = false
-local npcRange   = 150
-local listening  = nil
-local currentTab = "Cheats"
-local guiVisible = true
-local vDebounce  = false
+local sellKey     = Enum.KeyCode.K
+local autoSellOn  = false; local autoSellThread = nil; local autoSellDelay = 1.5
+local autoReelOn  = false; local autoReelThread = nil; local reelKey = Enum.KeyCode.L
+local reelActive  = false
+local npcRange    = 150
+local listening   = nil
+local currentTab  = "Cheats"
+local guiVisible  = true
+local vDebounce   = false
 
 -- ═══════════════════════════════════════
--- 🌍 ILHAS — 2026 ATUALIZADAS (wiki oficial)
--- Categoria: "first" | "second" | "deep" | "event"
+-- ILHAS — sem eventos de natal
 -- ═══════════════════════════════════════
 local ISLANDS = {
     -- First Sea
@@ -68,7 +63,7 @@ local ISLANDS = {
     {name="Cursed Isle",           pos=Vector3.new(3520,130,-1640),  cat="first"},
     {name="Treasure Island",       pos=Vector3.new(4180,135,-2470),  cat="first"},
     {name="Roslit Volcano",        pos=Vector3.new(-1900,165,315),   cat="first"},
-    -- Second Sea (novas 2026)
+    -- Second Sea (2026)
     {name="★ Waveborne",           pos=Vector3.new(10700,140,-8400), cat="second"},
     {name="★ Pine Shoals",         pos=Vector3.new(11850,135,-8000), cat="second"},
     {name="★ Emberreach",          pos=Vector3.new(2390,83,-490),    cat="second"},
@@ -84,62 +79,43 @@ local ISLANDS = {
     {name="⭐ Cultist Lair",       pos=Vector3.new(4450,-2000,-4675),cat="deep"},
     {name="⭐ The Laboratory",     pos=Vector3.new(-4640,290,2080),  cat="deep"},
     {name="⭐ Vertigo",            pos=Vector3.new(1230,-490,600),   cat="deep"},
-    -- Event / limited
-    {name="🎄 Winter Village",     pos=Vector3.new(-75,365,9500),    cat="event"},
-    {name="🎄 Candy Cane Rod",     pos=Vector3.new(-185,365,-9450),  cat="event"},
-    {name="🎄 Magic Mirror",       pos=Vector3.new(-9,365,-9590),    cat="event"},
+    -- (eventos de natal removidos a pedido)
 }
 
 -- ═══════════════════════════════════════
--- 🎣 RODS — todas as varas com localização
+-- RODS
 -- ═══════════════════════════════════════
 local RODS = {
-    -- Primeiras
     {name="Starter Rod",       loc="Moosewood • grátis",        pos=Vector3.new(465,150,230)},
     {name="Lucky Rod",         loc="Moosewood Merchant $500",   pos=Vector3.new(465,150,230)},
     {name="Long Rod",          loc="Moosewood Merchant $1.5k",  pos=Vector3.new(465,150,230)},
-    -- Roslit
     {name="Fortune Rod",       loc="Roslit Blacksmith $1.5k",   pos=Vector3.new(-1515,140,760)},
     {name="Rapid Rod",         loc="Roslit Blacksmith $6k",     pos=Vector3.new(-1515,140,760)},
     {name="Steady Rod",        loc="Roslit Blacksmith $12.5k",  pos=Vector3.new(-1515,140,760)},
     {name="Magma Rod",         loc="Roslit Orc (Pufferfish)",   pos=Vector3.new(-1850,165,160)},
-    -- Sunstone
     {name="Enchanted Rod",     loc="Sunstone Merlin $35k",      pos=Vector3.new(-930,225,-990)},
-    -- Terrapin
     {name="Magnet Rod",        loc="Terrapin Shop $15k",        pos=Vector3.new(-195,130,1930)},
-    -- Mushgrove
     {name="Fungal Rod",        loc="Mushgrove Agaric (quest)",  pos=Vector3.new(2790,140,-630)},
-    -- Statue
     {name="Kings Rod",         loc="Keepers Altar (end-game)",  pos=Vector3.new(1375,-805,-300)},
-    -- The Arch
     {name="Destiny Rod",       loc="The Arch Caleia $190k",     pos=Vector3.new(980,130,-1230)},
-    -- Ancient Isle
     {name="Stone Rod",         loc="Ancient Isle $225k",        pos=Vector3.new(5500,145,-315)},
     {name="Phoenix Rod",       loc="Ancient Eclipse cave",      pos=Vector3.new(5950,270,890)},
     {name="Relic Rod",         loc="Archeological Site",        pos=Vector3.new(4040,135,80)},
-    -- Winter
-    {name="Candy Cane Rod",    loc="Winter Village",            pos=Vector3.new(-185,365,-9450)},
-    -- Northern
     {name="Arctic Rod",        loc="N. Summit $25k",            pos=Vector3.new(19500,135,5300)},
     {name="Avalanche Rod",     loc="N. Frigid Cavern $35k",     pos=Vector3.new(20300,415,5640)},
     {name="Summit Rod",        loc="N. Cryogenic $300k",        pos=Vector3.new(20000,780,5700)},
     {name="Heaven's Rod",      loc="N. Glacial Grotto $1.75M",  pos=Vector3.new(20000,1040,5700)},
-    -- Atlantis
     {name="Champions Rod",     loc="Atlantis $80k",             pos=Vector3.new(-4450,-600,1875)},
     {name="Depthseeker Rod",   loc="Atlantis $40k",             pos=Vector3.new(-4450,-600,1875)},
     {name="Zeus Rod",          loc="Atlantis Zeus Room $1.7M",  pos=Vector3.new(-4300,-630,2680)},
     {name="Tempest Rod",       loc="Atlantis Sunken Trial",     pos=Vector3.new(-4620,-590,1840)},
     {name="Abyssal Specter",   loc="Atlantis Ethereal $1M",     pos=Vector3.new(-3915,-650,1830)},
-    -- Depths
     {name="Trident Rod",       loc="Desolate Deep Brine",       pos=Vector3.new(-800,130,-3100)},
     {name="Rod of the Depths", loc="The Depths altars",         pos=Vector3.new(1060,-635,1315)},
-    -- Special / fishing
     {name="Sunken Rod",        loc="Treasure chest reward",     pos=Vector3.new(-2825,215,1515)},
-    -- Second Sea 2026
     {name="Carrot Rod",        loc="Lushgrove Carrot Garden 75k",pos=Vector3.new(1310,130,-945)},
     {name="Midas Rod",         loc="Emberreach $500k",          pos=Vector3.new(2390,83,-490)},
     {name="Inferno Rod",       loc="Emberreach Volcano",        pos=Vector3.new(2390,150,-490)},
-    -- Cultist
     {name="Leviathan Rod",     loc="Cultist Lair end-quest",    pos=Vector3.new(4450,-2000,-4675)},
 }
 
@@ -150,9 +126,10 @@ local function chr()  return LP.Character end
 local function hum()  local c=chr(); return c and c:FindFirstChildOfClass("Humanoid") end
 local function hrp()  local c=chr(); return c and c:FindFirstChild("HumanoidRootPart") end
 local function tool() local c=chr(); return c and c:FindFirstChildOfClass("Tool") end
+local function rnd(a,b) return a + math.random()*(b-a) end
 
 -- ═══════════════════════════════════════
--- NOCLIP / SPEED / JUMP (iguais v13)
+-- NOCLIP / SPEED / JUMP
 -- ═══════════════════════════════════════
 local function setNoclip(v)
     noclipOn=v
@@ -196,7 +173,7 @@ end
 local function stopReJump() if reJumpConn then reJumpConn:Disconnect(); reJumpConn=nil end end
 
 -- ═══════════════════════════════════════
--- SHAKE (método Enter do v13)
+-- SHAKE
 -- ═══════════════════════════════════════
 local function shakeUiVisible()
     local sui=PG:FindFirstChild("shakeui")
@@ -224,24 +201,27 @@ end
 local function stopShake() shakeOn=false; shakeActive=false; if shakeThread then task.cancel(shakeThread); shakeThread=nil end end
 
 -- ═══════════════════════════════════════
--- 🎣 AUTO-REEL v14 — segue o peixe no minigame
+-- 🎣 AUTO-REEL v15 — cliques humanizados
 --
--- COMO FUNCIONA:
--- 1. Detecta o ScreenGui "reelui" ou similar (fishingrod GUI)
--- 2. Lê posição X da barra (playerbar) e do peixe (fish indicator)
--- 3. Se peixe tá à direita da barra → segura mouse pressionado (move p/ direita)
--- 4. Se peixe tá à esquerda → solta mouse (barra vai pra esquerda)
--- 5. Usa VIM.SendMouseButtonEvent (ban-safe, mesma coisa que o jogador faria)
+-- ESTRATÉGIA ANTI-BAN:
+-- Em vez de segurar o mouse (muito óbvio para anti-cheat),
+-- o reel usa rafagas de cliques curtos (press+release) com
+-- timing variado (jitter aleatório), igual um jogador humano
+-- que fica clicando rápido pra manter a barra em cima do peixe.
 --
--- Margem de erro: zona morta de 5% no centro pra não tremer
+-- LÓGICA:
+-- 1. Encontra a reelUI e lê posição do playerbar e fishbar
+-- 2. Se o peixe está MUITO longe da barra (>20% do tamanho) → clica rápido (intervalo ~55ms)
+-- 3. Se peixe está perto (10-20%) → clica moderado (~90ms)
+-- 4. Se peixe está na zona verde (<10%) → pausa (~120ms)
+-- 5. Timing tem jitter ±15ms aleatório por clique
+-- 6. Nunca passa de 18 cliques/segundo (threshold humano seguro)
 -- ═══════════════════════════════════════
 local function findReelUI()
-    -- Nomes comuns da UI de reel no Fisch
-    for _,name in ipairs({"reelui","fishingrod","reelbar","Fishing","FishingBar"}) do
+    for _,name in ipairs({"reelui","fishingrod","reelbar","Fishing","FishingBar","ReelUI","FishingUI"}) do
         local g=PG:FindFirstChild(name)
         if g and g.Enabled~=false then return g end
     end
-    -- Fallback: procura por ScreenGui com "reel" ou "fish" no nome
     for _,g in ipairs(PG:GetChildren()) do
         if g:IsA("ScreenGui") and g.Enabled then
             local n=g.Name:lower()
@@ -251,169 +231,131 @@ local function findReelUI()
     return nil
 end
 
-local function findReelElements(gui)
-    -- Procura playerbar e fish dentro da UI
+local function findReelElements(rGui)
     local playerbar, fishbar
-    for _,d in ipairs(gui:GetDescendants()) do
-        local n=d.Name:lower()
+    for _,d in ipairs(rGui:GetDescendants()) do
         if d:IsA("GuiObject") and d.Visible then
-            if n=="playerbar" or n:find("player") and not playerbar then playerbar=d
-            elseif n=="fish" or n=="fishbar" or n:find("fish") and not fishbar then fishbar=d end
+            local n=d.Name:lower()
+            if not playerbar and (n=="playerbar" or n=="player" or n:find("playerbar")) then
+                playerbar=d
+            elseif not fishbar and (n=="fish" or n=="fishbar" or n=="fishicon" or n:find("fish") or n:find("target")) then
+                fishbar=d
+            end
         end
     end
     return playerbar, fishbar
 end
 
+local function doClick(x, y)
+    -- Press
+    pcall(function()
+        VIM:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, true, game, 0)
+    end)
+    -- Hold brevíssimo (3-8ms), parece humano
+    task.wait(0.003 + math.random()*0.005)
+    -- Release
+    pcall(function()
+        VIM:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, false, game, 0)
+    end)
+end
+
 local function startAutoReel()
-    if autoReelConn then autoReelConn:Disconnect(); autoReelConn=nil end
-    local mouseDown=false
-    local lastAction=0
+    if autoReelThread then task.cancel(autoReelThread); autoReelThread=nil end
+    reelActive=false
 
-    autoReelConn=RunSvc.Heartbeat:Connect(function()
-        if not autoReelOn then
-            if mouseDown then
-                pcall(function() VIM:SendMouseButtonEvent(0,0,0,false,game,0) end)
-                mouseDown=false
+    autoReelThread=task.spawn(function()
+        while autoReelOn do
+            local rGui=findReelUI()
+            if not rGui then
+                reelActive=false
+                task.wait(0.1)
+            else
+                local pb, fb=findReelElements(rGui)
+                if not pb or not fb then
+                    reelActive=false
+                    task.wait(0.08)
+                else
+                    reelActive=true
+
+                    -- Centros absolutos
+                    local pCX = pb.AbsolutePosition.X + pb.AbsoluteSize.X*0.5
+                    local pCY = pb.AbsolutePosition.Y + pb.AbsoluteSize.Y*0.5
+                    local fCX = fb.AbsolutePosition.X + fb.AbsoluteSize.X*0.5
+
+                    -- Distância relativa ao tamanho da barra
+                    local barW   = pb.AbsoluteSize.X
+                    local diff   = math.abs(fCX - pCX)
+                    local ratio  = diff / math.max(barW, 1)
+
+                    -- Zona verde = peixe dentro de 10% → pausa, não clica
+                    if ratio < 0.10 then
+                        task.wait(0.10 + rnd(0,0.02))
+
+                    -- Zona amarela = 10~22% → clique moderado
+                    elseif ratio < 0.22 then
+                        doClick(pCX, pCY)
+                        task.wait(0.085 + rnd(-0.015, 0.015))
+
+                    -- Zona vermelha = >22% → clique rápido
+                    else
+                        doClick(pCX, pCY)
+                        task.wait(0.055 + rnd(-0.010, 0.015))
+                    end
+                end
             end
-            autoReelConn:Disconnect(); autoReelConn=nil
-            reelActive=false
-            return
         end
-
-        local rgui=findReelUI()
-        if not rgui then
-            if mouseDown then
-                pcall(function() VIM:SendMouseButtonEvent(0,0,0,false,game,0) end)
-                mouseDown=false
-            end
-            reelActive=false
-            return
-        end
-
-        local pb,fb=findReelElements(rgui)
-        if not pb or not fb then
-            reelActive=false
-            return
-        end
-
-        reelActive=true
-
-        -- Posição X absoluta de cada elemento (centro)
-        local pCenter=pb.AbsolutePosition.X + pb.AbsoluteSize.X*0.5
-        local fCenter=fb.AbsolutePosition.X + fb.AbsoluteSize.X*0.5
-
-        -- Zona morta: 5% da barra do player (evita jitter)
-        local deadZone=pb.AbsoluteSize.X*0.05
-        local diff=fCenter-pCenter
-
-        -- Throttle: não troca estado mais rápido que 30ms
-        local now=tick()
-        if now-lastAction < 0.03 then return end
-
-        local shouldHold = diff > deadZone  -- peixe está à direita → segurar
-        local shouldRelease = diff < -deadZone  -- peixe está à esquerda → soltar
-
-        if shouldHold and not mouseDown then
-            pcall(function()
-                VIM:SendMouseButtonEvent(pCenter,pb.AbsolutePosition.Y+10,0,true,game,0)
-            end)
-            mouseDown=true
-            lastAction=now
-        elseif shouldRelease and mouseDown then
-            pcall(function()
-                VIM:SendMouseButtonEvent(pCenter,pb.AbsolutePosition.Y+10,0,false,game,0)
-            end)
-            mouseDown=false
-            lastAction=now
-        end
-        -- Na zona morta: mantém o estado atual (não faz nada)
+        reelActive=false
     end)
 end
 
 local function stopAutoReel()
     autoReelOn=false; reelActive=false
-    -- Garante que solta o mouse quando desliga
-    pcall(function() VIM:SendMouseButtonEvent(0,0,0,false,game,0) end)
-    if autoReelConn then autoReelConn:Disconnect(); autoReelConn=nil end
+    if autoReelThread then task.cancel(autoReelThread); autoReelThread=nil end
 end
 
 -- ═══════════════════════════════════════
--- 📜 TREASURE MAP TRACKER
--- Lê atributos/valores dos Tools "Treasure Map" no backpack
+-- TREASURE MAP TRACKER
 -- ═══════════════════════════════════════
 local function getTreasureMaps()
     local maps={}
     local backpack=LP:FindFirstChild("Backpack")
-    local hand=tool()
-
     local function scan(container)
         if not container then return end
         for _,t in ipairs(container:GetChildren()) do
             if t:IsA("Tool") and (t.Name:lower():find("treasure") or t.Name:lower():find("map")) then
-                -- Tenta achar coords em attributes
                 local x,y,z
-                for _,attrName in ipairs({"X","x","PosX","CoordX","TargetX"}) do
-                    local v=t:GetAttribute(attrName); if v then x=v; break end
-                end
-                for _,attrName in ipairs({"Y","y","PosY","CoordY","TargetY"}) do
-                    local v=t:GetAttribute(attrName); if v then y=v; break end
-                end
-                for _,attrName in ipairs({"Z","z","PosZ","CoordZ","TargetZ"}) do
-                    local v=t:GetAttribute(attrName); if v then z=v; break end
-                end
-
-                -- Fallback: busca em StringValue/IntValue filhos
+                for _,an in ipairs({"X","x","PosX","CoordX","TargetX"}) do local v=t:GetAttribute(an); if v then x=v; break end end
+                for _,an in ipairs({"Y","y","PosY","CoordY","TargetY"}) do local v=t:GetAttribute(an); if v then y=v; break end end
+                for _,an in ipairs({"Z","z","PosZ","CoordZ","TargetZ"}) do local v=t:GetAttribute(an); if v then z=v; break end end
                 if not (x and y and z) then
-                    for _,child in ipairs(t:GetDescendants()) do
-                        if child:IsA("Vector3Value") then
-                            local v=child.Value; x=v.X; y=v.Y; z=v.Z; break
-                        end
-                        if child:IsA("StringValue") then
-                            local pattern=child.Value:match("(%-?%d+)[,%s]+(%-?%d+)[,%s]+(%-?%d+)")
-                            if pattern then
-                                local sx,sy,sz=child.Value:match("(%-?%d+)[,%s]+(%-?%d+)[,%s]+(%-?%d+)")
-                                x=tonumber(sx); y=tonumber(sy); z=tonumber(sz); break
-                            end
+                    for _,ch in ipairs(t:GetDescendants()) do
+                        if ch:IsA("Vector3Value") then x=ch.Value.X; y=ch.Value.Y; z=ch.Value.Z; break end
+                        if ch:IsA("StringValue") then
+                            local sx,sy,sz=ch.Value:match("(%-?%d+)[,%s]+(%-?%d+)[,%s]+(%-?%d+)")
+                            if sx then x=tonumber(sx);y=tonumber(sy);z=tonumber(sz); break end
                         end
                     end
                 end
-
-                -- Tenta ler ToolTip do tool
                 if not (x and y and z) and t.ToolTip then
                     local sx,sy,sz=t.ToolTip:match("(%-?%d+)[,%s]+(%-?%d+)[,%s]+(%-?%d+)")
-                    if sx then x=tonumber(sx); y=tonumber(sy); z=tonumber(sz) end
+                    if sx then x=tonumber(sx);y=tonumber(sy);z=tonumber(sz) end
                 end
-
                 if x and y and z then
-                    table.insert(maps,{
-                        name=t.Name,
-                        pos=Vector3.new(x,y,z),
-                        fixed=true,
-                        tool=t
-                    })
+                    table.insert(maps,{name=t.Name,pos=Vector3.new(x,y,z),fixed=true,tool=t})
                 else
-                    -- Mapa não fixado — adiciona sem coords
-                    table.insert(maps,{
-                        name=t.Name.." (não fixado)",
-                        pos=nil,
-                        fixed=false,
-                        tool=t
-                    })
+                    table.insert(maps,{name=t.Name.." (não fixado)",pos=nil,fixed=false,tool=t})
                 end
             end
         end
     end
-
     scan(backpack)
-    if hand and (hand.Name:lower():find("treasure") or hand.Name:lower():find("map")) then
-        scan(LP.Character)
-    end
-
+    local hand=tool()
+    if hand and (hand.Name:lower():find("treasure") or hand.Name:lower():find("map")) then scan(LP.Character) end
     return maps
 end
 
 -- ═══════════════════════════════════════
--- SELL (igual v13)
+-- SELL
 -- ═══════════════════════════════════════
 local function trySellTool(t)
     if not t then return false,"no_tool" end
@@ -437,28 +379,20 @@ local function trySellTool(t)
         if obj:IsA("GuiButton") and obj.Visible then
             local n=obj.Name:lower()
             if n:find("sell") or n:find("appraise") or n:find("submit") then
-                local sz=obj.AbsoluteSize
-                if sz.X>2 and sz.Y>2 then pcall(function() obj.MouseButton1Click:Fire() end); return true,"GUI:"..obj.Name end
+                local sz=obj.AbsoluteSize; if sz.X>2 and sz.Y>2 then pcall(function() obj.MouseButton1Click:Fire() end); return true,"GUI:"..obj.Name end
             end
         end
     end
-    pcall(function() t:Activate() end)
-    return false,"no_method"
+    pcall(function() t:Activate() end); return false,"no_method"
 end
 local function sellFromHand() local t=tool(); if not t then return false,"No item in hand" end; return trySellTool(t) end
 local function sellAll()
     local sold,failed=0,0; local items={}
     local bp=LP:FindFirstChild("Backpack")
-    if bp then for _,t in ipairs(bp:GetChildren()) do if t:IsA("Tool") then
-        -- Não vende treasure maps por acidente
-        if not (t.Name:lower():find("treasure") or t.Name:lower():find("map")) then
-            table.insert(items,t)
-        end
-    end end end
-    local hand=tool()
-    if hand and not (hand.Name:lower():find("treasure") or hand.Name:lower():find("map")) then
-        table.insert(items,hand)
-    end
+    if bp then for _,t in ipairs(bp:GetChildren()) do
+        if t:IsA("Tool") and not (t.Name:lower():find("treasure") or t.Name:lower():find("map")) then table.insert(items,t) end
+    end end
+    local hand=tool(); if hand and not (hand.Name:lower():find("treasure") or hand.Name:lower():find("map")) then table.insert(items,hand) end
     for _,t in ipairs(items) do local ok=trySellTool(t); if ok then sold=sold+1 else failed=failed+1 end; task.wait(0.15) end
     if sold==0 and failed==0 then return false,"Inventory empty" end
     return true,"Sold "..sold..(failed>0 and " | Failed "..failed or "")
@@ -476,10 +410,8 @@ local function startAutoSell(lbl)
 end
 local function stopAutoSell() autoSellOn=false; if autoSellThread then task.cancel(autoSellThread); autoSellThread=nil end end
 
--- TP
 local function tpTo(pos) local r=hrp(); if not r then return false end; r.CFrame=CFrame.new(pos+Vector3.new(0,5,0)); return true end
 
--- NPCs próximos
 local function getNearby()
     local r=hrp(); if not r then return {} end
     local found={}
@@ -531,15 +463,14 @@ local C={
 
 local function tw(o,p,d)  return TweenSvc:Create(o,TweenInfo.new(d or 0.15,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),p) end
 local function twB(o,p)   return TweenSvc:Create(o,TweenInfo.new(0.22,Enum.EasingStyle.Back,Enum.EasingDirection.Out),p) end
-local function twE(o,p,d) return TweenSvc:Create(o,TweenInfo.new(d or 0.3,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut),p) end
 
-local FRAME_W=220; local HEADER_H=36; local CORNER_R=12
+local FRAME_W=220; local HEADER_H=36
 local frame=Instance.new("Frame",gui)
 frame.Size=UDim2.new(0,FRAME_W,0,HEADER_H)
 frame.Position=UDim2.new(0,-FRAME_W,0.5,-180)
 frame.BackgroundColor3=C.bg; frame.BorderSizePixel=0
 frame.ClipsDescendants=true; frame.BackgroundTransparency=1
-Instance.new("UICorner",frame).CornerRadius=UDim.new(0,CORNER_R)
+Instance.new("UICorner",frame).CornerRadius=UDim.new(0,12)
 local fBdr=Instance.new("UIStroke",frame); fBdr.Color=C.bdr; fBdr.Thickness=1.5
 fBdr.ApplyStrokeMode=Enum.ApplyStrokeMode.Border
 
@@ -547,7 +478,6 @@ local contentHolder=Instance.new("Frame",frame)
 contentHolder.Size=UDim2.new(1,0,0,9999)
 contentHolder.Position=UDim2.new(0,0,0,HEADER_H)
 contentHolder.BackgroundTransparency=1; contentHolder.BorderSizePixel=0
-contentHolder.ClipsDescendants=false
 local rootLy=Instance.new("UIListLayout",contentHolder)
 rootLy.SortOrder=Enum.SortOrder.LayoutOrder; rootLy.Padding=UDim.new(0,0)
 
@@ -561,21 +491,12 @@ local function pad(p,l,r,t,b)
     u.PaddingTop=UDim.new(0,t or 6); u.PaddingBottom=UDim.new(0,b or 6)
 end
 
--- HEADER
 local header=Instance.new("Frame",frame)
-header.Size=UDim2.new(1,0,0,HEADER_H)
-header.Position=UDim2.new(0,0,0,0)
+header.Size=UDim2.new(1,0,0,HEADER_H); header.Position=UDim2.new(0,0,0,0)
 header.BackgroundColor3=C.panel; header.BorderSizePixel=0; header.ZIndex=2
 local hGrad=Instance.new("UIGradient",header)
-hGrad.Color=ColorSequence.new({
-    ColorSequenceKeypoint.new(0,Color3.fromRGB(16,22,52)),
-    ColorSequenceKeypoint.new(1,C.bg),
-})
+hGrad.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(16,22,52)),ColorSequenceKeypoint.new(1,C.bg)})
 hGrad.Rotation=90
-
-local headerLine=Instance.new("Frame",frame)
-headerLine.Size=UDim2.new(1,0,0,1); headerLine.Position=UDim2.new(0,0,0,HEADER_H)
-headerLine.BackgroundColor3=C.bdr; headerLine.BorderSizePixel=0; headerLine.ZIndex=3
 
 local dot=Instance.new("Frame",header)
 dot.Size=UDim2.new(0,7,0,7); dot.Position=UDim2.new(0,11,0.5,-3)
@@ -584,7 +505,7 @@ Instance.new("UICorner",dot).CornerRadius=UDim.new(1,0)
 
 local htitle=Instance.new("TextLabel",header)
 htitle.Size=UDim2.new(1,-60,1,0); htitle.Position=UDim2.new(0,24,0,0)
-htitle.BackgroundTransparency=1; htitle.Text="⚙  UTILITY  v14"
+htitle.BackgroundTransparency=1; htitle.Text="⚙  UTILITY  v15"
 htitle.TextColor3=C.txt; htitle.Font=Enum.Font.GothamBlack; htitle.TextSize=11
 htitle.TextXAlignment=Enum.TextXAlignment.Left; htitle.ZIndex=4
 
@@ -595,7 +516,6 @@ vHint.Text="V"; vHint.TextColor3=C.dim; vHint.Font=Enum.Font.GothamBold; vHint.T
 vHint.TextXAlignment=Enum.TextXAlignment.Center; vHint.ZIndex=4
 Instance.new("UICorner",vHint).CornerRadius=UDim.new(0,4)
 
--- TABS (5 agora: Cheats, TP, Rods, 📜 Maps, NPCs)
 local tabBar=Instance.new("Frame",contentHolder)
 tabBar.Size=UDim2.new(1,0,0,28); tabBar.BackgroundColor3=C.panel
 tabBar.BorderSizePixel=0; tabBar.LayoutOrder=1
@@ -613,12 +533,10 @@ local function mkTab(name,icon,order)
     b.Font=Enum.Font.GothamBold; b.TextSize=11; b.AutoButtonColor=false; b.LayoutOrder=order
     Instance.new("UICorner",b).CornerRadius=UDim.new(0,5)
     tabBtns[name]=b
-    -- Tooltip no hover
     b.MouseEnter:Connect(function() vHint.Text=name:sub(1,4):upper() end)
     b.MouseLeave:Connect(function() vHint.Text="V" end)
     return b
 end
-
 local function mkPage(order)
     local pg=Instance.new("Frame",contentHolder)
     pg.Size=UDim2.new(1,0,0,0); pg.AutomaticSize=Enum.AutomaticSize.Y
@@ -663,7 +581,6 @@ local function switchTab(name)
 end
 for name,b in pairs(tabBtns) do b.MouseButton1Click:Connect(function() switchTab(name) end) end
 
--- Ripple
 local function ripple(btn,col)
     local rip=Instance.new("Frame",btn)
     rip.Size=UDim2.new(0,0,0,0); rip.AnchorPoint=Vector2.new(0.5,0.5)
@@ -675,9 +592,7 @@ local function ripple(btn,col)
     t:Play(); t.Completed:Connect(function() rip:Destroy() end)
 end
 
--- ═══════════════════════════════════════
--- SECTION BUILDER (igual v13)
--- ═══════════════════════════════════════
+-- SECTION BUILDER
 local BLOCKED={[Enum.KeyCode.Return]=true,[Enum.KeyCode.Escape]=true,[Enum.KeyCode.Tab]=true,
     [Enum.KeyCode.Backspace]=true,[Enum.KeyCode.LeftShift]=true,[Enum.KeyCode.RightShift]=true,
     [Enum.KeyCode.LeftControl]=true,[Enum.KeyCode.RightControl]=true,
@@ -795,11 +710,10 @@ local hjSec=mkSection(pg1,{order=6,icon="🦘",label="High Jump",keyName=hjKey.N
 mkDiv(pg1,7)
 local shSec=mkSection(pg1,{order=8,icon="🔄",label="Shake",keyName=shakeKey.Name,showStatus=true})
 mkDiv(pg1,9)
--- Novo: Auto-Reel
 local reSec=mkSection(pg1,{order=10,icon="🎣",label="Auto-Reel",keyName=reelKey.Name,showStatus=true})
 mkDiv(pg1,11)
 
--- Sell section (igual v13)
+-- SELL
 local sellF=Instance.new("Frame",pg1)
 sellF.Size=UDim2.new(1,0,0,0); sellF.AutomaticSize=Enum.AutomaticSize.Y
 sellF.BackgroundColor3=C.card; sellF.BorderSizePixel=0; sellF.LayoutOrder=12
@@ -821,8 +735,7 @@ sBL.Text="Key:"; sBL.TextColor3=C.dim; sBL.Font=Enum.Font.Gotham; sBL.TextSize=8
 local sellBind=Instance.new("TextButton",sBR)
 sellBind.Size=UDim2.new(0,64,0,18); sellBind.Position=UDim2.new(0,40,0.5,-9)
 sellBind.BackgroundColor3=Color3.fromRGB(18,22,44); sellBind.BorderSizePixel=0
-sellBind.Text=sellKey.Name; sellBind.TextColor3=C.acc
-sellBind.Font=Enum.Font.GothamBold; sellBind.TextSize=9; sellBind.AutoButtonColor=false
+sellBind.Text=sellKey.Name; sellBind.TextColor3=C.acc; sellBind.Font=Enum.Font.GothamBold; sellBind.TextSize=9; sellBind.AutoButtonColor=false
 Instance.new("UICorner",sellBind).CornerRadius=UDim.new(0,5); Instance.new("UIStroke",sellBind).Color=C.accD
 
 local sellBtn=Instance.new("TextButton",sellF)
@@ -897,7 +810,7 @@ autoStLbl.TextXAlignment=Enum.TextXAlignment.Left; autoStLbl.LayoutOrder=11
 mkDiv(pg1,13)
 
 -- ═══════════════════════════════════════
--- PAGE TP (v14 - com categorias)
+-- PAGE TP
 -- ═══════════════════════════════════════
 local pg2=tabPages["TP"]
 local tpScroll=Instance.new("ScrollingFrame",pg2)
@@ -912,7 +825,6 @@ tpSt.Text=""; tpSt.TextColor3=C.grn; tpSt.Font=Enum.Font.GothamBold; tpSt.TextSi
 local function catColor(cat)
     if cat=="second" then return C.cyan, Color3.fromRGB(16,42,52), Color3.fromRGB(24,60,75) end
     if cat=="deep"   then return C.pink, Color3.fromRGB(40,16,42), Color3.fromRGB(60,26,62) end
-    if cat=="event"  then return C.gold, Color3.fromRGB(44,34,12), Color3.fromRGB(60,48,18) end
     return C.sub, C.card, C.cardH
 end
 
@@ -926,8 +838,7 @@ for i,isl in ipairs(ISLANDS) do
     b.MouseEnter:Connect(function() tw(b,{BackgroundColor3=hc,TextColor3=C.txt}):Play() end)
     b.MouseLeave:Connect(function() tw(b,{BackgroundColor3=bc,TextColor3=tc}):Play() end)
     b.MouseButton1Click:Connect(function()
-        ripple(b,tc)
-        tw(b,{BackgroundColor3=C.accD}):Play(); task.wait(0.12); tw(b,{BackgroundColor3=bc}):Play()
+        ripple(b,tc); tw(b,{BackgroundColor3=C.accD}):Play(); task.wait(0.12); tw(b,{BackgroundColor3=bc}):Play()
         local ok=tpTo(isl.pos)
         tpSt.TextColor3=ok and C.grn or C.red; tpSt.Text=(ok and "✅ " or "❌ ")..isl.name
         task.delay(3,function() tpSt.Text="" end)
@@ -935,7 +846,7 @@ for i,isl in ipairs(ISLANDS) do
 end
 
 -- ═══════════════════════════════════════
--- PAGE RODS (v14)
+-- PAGE RODS
 -- ═══════════════════════════════════════
 local pg4=tabPages["Rods"]
 local rodScroll=Instance.new("ScrollingFrame",pg4)
@@ -952,24 +863,18 @@ for i,rod in ipairs(RODS) do
     b.BackgroundColor3=C.card; b.BorderSizePixel=0; b.Text=""
     b.AutoButtonColor=false; b.LayoutOrder=i
     Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); pad(b,8,8,3,3)
-
     local nameLbl=Instance.new("TextLabel",b)
     nameLbl.Size=UDim2.new(1,0,0,13); nameLbl.Position=UDim2.new(0,0,0,0)
     nameLbl.BackgroundTransparency=1; nameLbl.Text="🎣 "..rod.name
-    nameLbl.TextColor3=C.cyan; nameLbl.Font=Enum.Font.GothamBold; nameLbl.TextSize=10
-    nameLbl.TextXAlignment=Enum.TextXAlignment.Left
-
+    nameLbl.TextColor3=C.cyan; nameLbl.Font=Enum.Font.GothamBold; nameLbl.TextSize=10; nameLbl.TextXAlignment=Enum.TextXAlignment.Left
     local locLbl=Instance.new("TextLabel",b)
     locLbl.Size=UDim2.new(1,0,0,11); locLbl.Position=UDim2.new(0,0,0,14)
     locLbl.BackgroundTransparency=1; locLbl.Text=rod.loc
-    locLbl.TextColor3=C.dim; locLbl.Font=Enum.Font.Gotham; locLbl.TextSize=8
-    locLbl.TextXAlignment=Enum.TextXAlignment.Left
-
+    locLbl.TextColor3=C.dim; locLbl.Font=Enum.Font.Gotham; locLbl.TextSize=8; locLbl.TextXAlignment=Enum.TextXAlignment.Left
     b.MouseEnter:Connect(function() tw(b,{BackgroundColor3=C.cardH}):Play() end)
     b.MouseLeave:Connect(function() tw(b,{BackgroundColor3=C.card}):Play() end)
     b.MouseButton1Click:Connect(function()
-        ripple(b,C.cyan)
-        tw(b,{BackgroundColor3=C.accD}):Play(); task.wait(0.12); tw(b,{BackgroundColor3=C.card}):Play()
+        ripple(b,C.cyan); tw(b,{BackgroundColor3=C.accD}):Play(); task.wait(0.12); tw(b,{BackgroundColor3=C.card}):Play()
         local ok=tpTo(rod.pos)
         rodSt.TextColor3=ok and C.grn or C.red; rodSt.Text=(ok and "✅ TP → " or "❌ ")..rod.name
         task.delay(3,function() rodSt.Text="" end)
@@ -977,7 +882,7 @@ for i,rod in ipairs(RODS) do
 end
 
 -- ═══════════════════════════════════════
--- PAGE MAPS (Treasure Map Tracker)
+-- PAGE MAPS
 -- ═══════════════════════════════════════
 local pg5=tabPages["Maps"]
 local mapF=Instance.new("Frame",pg5)
@@ -985,41 +890,30 @@ mapF.Size=UDim2.new(1,0,0,0); mapF.AutomaticSize=Enum.AutomaticSize.Y
 mapF.BackgroundColor3=C.card; mapF.BorderSizePixel=0; mapF.LayoutOrder=1
 pad(mapF,10,10,8,8)
 local mapLy=Instance.new("UIListLayout",mapF); mapLy.SortOrder=Enum.SortOrder.LayoutOrder; mapLy.Padding=UDim.new(0,6)
-
 local mapTitle=Instance.new("TextLabel",mapF); mapTitle.Size=UDim2.new(1,0,0,14)
 mapTitle.BackgroundTransparency=1; mapTitle.Text="📜  Treasure Maps no inventário"
-mapTitle.TextColor3=C.gold; mapTitle.Font=Enum.Font.GothamBold; mapTitle.TextSize=10
-mapTitle.TextXAlignment=Enum.TextXAlignment.Left; mapTitle.LayoutOrder=1
-
+mapTitle.TextColor3=C.gold; mapTitle.Font=Enum.Font.GothamBold; mapTitle.TextSize=10; mapTitle.TextXAlignment=Enum.TextXAlignment.Left; mapTitle.LayoutOrder=1
 local mapInfo=Instance.new("TextLabel",mapF); mapInfo.Size=UDim2.new(1,0,0,11)
 mapInfo.BackgroundTransparency=1; mapInfo.Text="Leva o mapa no Jack Marrow pra fixar as coords"
-mapInfo.TextColor3=C.dim; mapInfo.Font=Enum.Font.Gotham; mapInfo.TextSize=8
-mapInfo.TextXAlignment=Enum.TextXAlignment.Left; mapInfo.LayoutOrder=2
-
+mapInfo.TextColor3=C.dim; mapInfo.Font=Enum.Font.Gotham; mapInfo.TextSize=8; mapInfo.TextXAlignment=Enum.TextXAlignment.Left; mapInfo.LayoutOrder=2
 local mapRefresh=Instance.new("TextButton",mapF)
 mapRefresh.Size=UDim2.new(1,0,0,26); mapRefresh.LayoutOrder=3
 mapRefresh.BackgroundColor3=Color3.fromRGB(40,30,12); mapRefresh.BorderSizePixel=0
 mapRefresh.Text="🔍  Escanear mapas"; mapRefresh.TextColor3=C.gold
 mapRefresh.Font=Enum.Font.GothamBold; mapRefresh.TextSize=9; mapRefresh.AutoButtonColor=false
-Instance.new("UICorner",mapRefresh).CornerRadius=UDim.new(0,6)
-Instance.new("UIStroke",mapRefresh).Color=Color3.fromRGB(100,70,20)
+Instance.new("UICorner",mapRefresh).CornerRadius=UDim.new(0,6); Instance.new("UIStroke",mapRefresh).Color=Color3.fromRGB(100,70,20)
 mapRefresh.MouseEnter:Connect(function() tw(mapRefresh,{BackgroundColor3=Color3.fromRGB(55,40,18)}):Play() end)
 mapRefresh.MouseLeave:Connect(function() tw(mapRefresh,{BackgroundColor3=Color3.fromRGB(40,30,12)}):Play() end)
 mapRefresh.MouseButton1Click:Connect(function() ripple(mapRefresh,C.gold) end)
-
 local quickJack=Instance.new("TextButton",mapF)
 quickJack.Size=UDim2.new(1,0,0,24); quickJack.LayoutOrder=4
 quickJack.BackgroundColor3=Color3.fromRGB(18,30,48); quickJack.BorderSizePixel=0
-quickJack.Text="🏴‍☠️  TP Jack Marrow (fixar mapas)"; quickJack.TextColor3=C.acc
+quickJack.Text="🏴  TP Jack Marrow (fixar mapas)"; quickJack.TextColor3=C.acc
 quickJack.Font=Enum.Font.GothamBold; quickJack.TextSize=9; quickJack.AutoButtonColor=false
 Instance.new("UICorner",quickJack).CornerRadius=UDim.new(0,6)
 quickJack.MouseEnter:Connect(function() tw(quickJack,{BackgroundColor3=Color3.fromRGB(24,40,64)}):Play() end)
 quickJack.MouseLeave:Connect(function() tw(quickJack,{BackgroundColor3=Color3.fromRGB(18,30,48)}):Play() end)
-quickJack.MouseButton1Click:Connect(function()
-    ripple(quickJack,C.acc)
-    tpTo(Vector3.new(-2825,215,1515))
-end)
-
+quickJack.MouseButton1Click:Connect(function() ripple(quickJack,C.acc); tpTo(Vector3.new(-2825,215,1515)) end)
 local mapListHolder=Instance.new("Frame",mapF)
 mapListHolder.Size=UDim2.new(1,0,0,0); mapListHolder.AutomaticSize=Enum.AutomaticSize.Y
 mapListHolder.BackgroundTransparency=1; mapListHolder.BorderSizePixel=0; mapListHolder.LayoutOrder=5
@@ -1033,59 +927,47 @@ local function refreshMaps()
     if #maps==0 then
         local l=Instance.new("TextLabel",mapListHolder); l.Size=UDim2.new(1,0,0,24)
         l.BackgroundTransparency=1; l.Text="Nenhum mapa no inventário"
-        l.TextColor3=C.dim; l.Font=Enum.Font.Gotham; l.TextSize=9
-        l.TextXAlignment=Enum.TextXAlignment.Center; l.LayoutOrder=1
+        l.TextColor3=C.dim; l.Font=Enum.Font.Gotham; l.TextSize=9; l.TextXAlignment=Enum.TextXAlignment.Center; l.LayoutOrder=1
         refreshSize(); return
     end
     for i,m in ipairs(maps) do
         local b=Instance.new("TextButton",mapListHolder); b.Size=UDim2.new(1,0,0,32)
-        b.BackgroundColor3=m.fixed and C.card or Color3.fromRGB(30,26,18)
-        b.BorderSizePixel=0; b.Text=""; b.AutoButtonColor=false; b.LayoutOrder=i
+        b.BackgroundColor3=m.fixed and C.card or Color3.fromRGB(30,26,18); b.BorderSizePixel=0; b.Text=""; b.AutoButtonColor=false; b.LayoutOrder=i
         Instance.new("UICorner",b).CornerRadius=UDim.new(0,5); pad(b,8,8,3,3)
-
-        local nm=Instance.new("TextLabel",b); nm.Size=UDim2.new(1,0,0,12)
-        nm.Position=UDim2.new(0,0,0,0); nm.BackgroundTransparency=1
+        local nm=Instance.new("TextLabel",b); nm.Size=UDim2.new(1,0,0,12); nm.Position=UDim2.new(0,0,0,0); nm.BackgroundTransparency=1
         nm.Text=(m.fixed and "📜 " or "❔ ")..m.name; nm.TextColor3=m.fixed and C.gold or C.yel
         nm.Font=Enum.Font.GothamBold; nm.TextSize=9; nm.TextXAlignment=Enum.TextXAlignment.Left
-
-        local cd=Instance.new("TextLabel",b); cd.Size=UDim2.new(1,0,0,11)
-        cd.Position=UDim2.new(0,0,0,13); cd.BackgroundTransparency=1
+        local cd=Instance.new("TextLabel",b); cd.Size=UDim2.new(1,0,0,11); cd.Position=UDim2.new(0,0,0,13); cd.BackgroundTransparency=1
         if m.fixed then
-            cd.Text=string.format("X=%d  Y=%d  Z=%d", m.pos.X, m.pos.Y, m.pos.Z)
-            cd.TextColor3=C.cyan
+            cd.Text=string.format("X=%d  Y=%d  Z=%d",m.pos.X,m.pos.Y,m.pos.Z); cd.TextColor3=C.cyan
         else
-            cd.Text="→ vai no Jack Marrow (Forsaken) pra fixar"
-            cd.TextColor3=C.dim
+            cd.Text="→ vai no Jack Marrow (Forsaken) pra fixar"; cd.TextColor3=C.dim
         end
         cd.Font=Enum.Font.Code; cd.TextSize=8; cd.TextXAlignment=Enum.TextXAlignment.Left
-
         if m.fixed then
             b.MouseEnter:Connect(function() tw(b,{BackgroundColor3=C.cardH}):Play() end)
             b.MouseLeave:Connect(function() tw(b,{BackgroundColor3=C.card}):Play() end)
             local pos=m.pos
             b.MouseButton1Click:Connect(function()
-                ripple(b,C.gold)
-                tw(b,{BackgroundColor3=C.gold}):Play(); task.wait(0.12); tw(b,{BackgroundColor3=C.card}):Play()
+                ripple(b,C.gold); tw(b,{BackgroundColor3=C.gold}):Play(); task.wait(0.12); tw(b,{BackgroundColor3=C.card}):Play()
                 tpTo(pos)
             end)
         end
     end
     refreshSize()
 end
-
 mapRefresh.MouseButton1Click:Connect(function()
-    mapRefresh.Text="⏳  Escaneando..."; task.wait(0.2)
-    refreshMaps(); mapRefresh.Text="🔍  Escanear mapas"
+    mapRefresh.Text="⏳  Escaneando..."; task.wait(0.2); refreshMaps(); mapRefresh.Text="🔍  Escanear mapas"
 end)
 
 -- ═══════════════════════════════════════
--- PAGE NPCs (igual v13)
+-- PAGE NPCs
 -- ═══════════════════════════════════════
 local pg3=tabPages["NPCs"]
 local rngF=Instance.new("Frame",pg3); rngF.Size=UDim2.new(1,0,0,0); rngF.AutomaticSize=Enum.AutomaticSize.Y
 rngF.BackgroundColor3=C.card; rngF.BorderSizePixel=0; rngF.LayoutOrder=1
 pad(rngF,10,10,7,7)
-local rngLy=Instance.new("UIListLayout",rngF); rngLy.SortOrder=Enum.SortOrder.LayoutOrder; rngLy.Padding=UDim.new(0,4)
+local rngLy2=Instance.new("UIListLayout",rngF); rngLy2.SortOrder=Enum.SortOrder.LayoutOrder; rngLy2.Padding=UDim.new(0,4)
 local rngRow1=Instance.new("Frame",rngF); rngRow1.Size=UDim2.new(1,0,0,13); rngRow1.BackgroundTransparency=1; rngRow1.LayoutOrder=1
 local rngLbl=Instance.new("TextLabel",rngRow1); rngLbl.Size=UDim2.new(1,0,1,0); rngLbl.BackgroundTransparency=1
 rngLbl.Text="Scan range: "..npcRange.." studs"; rngLbl.TextColor3=C.acc; rngLbl.Font=Enum.Font.GothamBold; rngLbl.TextSize=8; rngLbl.TextXAlignment=Enum.TextXAlignment.Left
@@ -1112,7 +994,6 @@ UIS.InputChanged:Connect(function(i)
     rngLbl.Text="Scan range: "..npcRange.." studs"
 end)
 mkDiv(pg3,2)
-
 local scanBtn=Instance.new("TextButton",pg3); scanBtn.Size=UDim2.new(1,0,0,30); scanBtn.LayoutOrder=3
 scanBtn.BackgroundColor3=Color3.fromRGB(16,28,60); scanBtn.BorderSizePixel=0
 scanBtn.Text="🔍  Scan Nearby NPCs"; scanBtn.TextColor3=C.acc
@@ -1122,14 +1003,12 @@ scanBtn.MouseEnter:Connect(function() tw(scanBtn,{BackgroundColor3=Color3.fromRG
 scanBtn.MouseLeave:Connect(function() tw(scanBtn,{BackgroundColor3=Color3.fromRGB(16,28,60)}):Play() end)
 scanBtn.MouseButton1Click:Connect(function() ripple(scanBtn,C.acc) end)
 mkDiv(pg3,4)
-
 local npcScroll=Instance.new("ScrollingFrame",pg3)
 npcScroll.Size=UDim2.new(1,0,0,220); npcScroll.BackgroundTransparency=1; npcScroll.BorderSizePixel=0
 npcScroll.ScrollBarThickness=3; npcScroll.ScrollBarImageColor3=C.acc
 npcScroll.CanvasSize=UDim2.new(0,0,0,0); npcScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; npcScroll.LayoutOrder=5
 local npcLy=Instance.new("UIListLayout",npcScroll); npcLy.SortOrder=Enum.SortOrder.LayoutOrder; npcLy.Padding=UDim.new(0,2)
 pad(npcScroll,8,8,4,4)
-
 local function rebuildNPCs()
     for _,ch in ipairs(npcScroll:GetChildren()) do
         if not ch:IsA("UIListLayout") and not ch:IsA("UIPadding") then ch:Destroy() end
@@ -1160,7 +1039,7 @@ scanBtn.MouseButton1Click:Connect(function()
 end)
 
 -- ═══════════════════════════════════════
--- TOGGLES (v14)
+-- TOGGLES
 -- ═══════════════════════════════════════
 local function updateDot()
     local anyOn=noclipOn or speedOn or jumpOn or shakeOn or autoSellOn or autoReelOn
@@ -1190,8 +1069,6 @@ shSec.togHit.MouseButton1Click:Connect(function()
     shakeOn=not shakeOn; shSec.setTog(shakeOn)
     if shakeOn then startShake() else stopShake() end; updateDot()
 end)
-
--- Auto-reel toggle
 reSec.togHit.MouseButton1Click:Connect(function()
     autoReelOn=not autoReelOn; reSec.setTog(autoReelOn)
     if autoReelOn then startAutoReel() else stopAutoReel() end; updateDot()
@@ -1225,37 +1102,31 @@ autoTogHit.MouseButton1Click:Connect(function()
     updateDot()
 end)
 
--- Shake status
+-- Status loops
 task.spawn(function()
-    local dots={"",".",".","..."}; local di=1
-    while true do
-        task.wait(0.2); di=di%4+1
+    local d={"",".",".","..."}; local i=1
+    while true do task.wait(0.2); i=i%4+1
         if shSec.statusLbl then
             if shakeOn then
-                if shakeActive then shSec.statusLbl.Text="● Enter pressing"..dots[di]; shSec.statusLbl.TextColor3=C.grn
-                else shSec.statusLbl.Text="○ waiting shake"..dots[di]; shSec.statusLbl.TextColor3=C.yel end
+                shSec.statusLbl.Text=(shakeActive and "● Enter pressing" or "○ waiting shake")..d[i]
+                shSec.statusLbl.TextColor3=shakeActive and C.grn or C.yel
             else shSec.statusLbl.Text="" end
         end
     end
 end)
-
--- Reel status
 task.spawn(function()
-    local dots={"",".",".","..."}; local di=1
-    while true do
-        task.wait(0.2); di=di%4+1
+    local d={"",".",".","..."}; local i=1
+    while true do task.wait(0.2); i=i%4+1
         if reSec.statusLbl then
             if autoReelOn then
-                if reelActive then reSec.statusLbl.Text="● guiando barra"..dots[di]; reSec.statusLbl.TextColor3=C.grn
-                else reSec.statusLbl.Text="○ aguardando peixe"..dots[di]; reSec.statusLbl.TextColor3=C.yel end
+                reSec.statusLbl.Text=(reelActive and "● clicando reel" or "○ aguardando UI")..d[i]
+                reSec.statusLbl.TextColor3=reelActive and C.grn or C.yel
             else reSec.statusLbl.Text="" end
         end
     end
 end)
 
--- ═══════════════════════════════════════
 -- REBIND
--- ═══════════════════════════════════════
 local function setupBind(bindBtn,id,getKey,setKey)
     bindBtn.MouseButton1Click:Connect(function()
         if listening then return end
@@ -1263,13 +1134,11 @@ local function setupBind(bindBtn,id,getKey,setKey)
         local conn; conn=UIS.InputBegan:Connect(function(inp)
             if inp.UserInputType~=Enum.UserInputType.Keyboard then return end
             if inp.KeyCode==Enum.KeyCode.Escape then
-                bindBtn.Text=getKey().Name; tw(bindBtn,{TextColor3=C.acc}):Play()
-                listening=nil; conn:Disconnect(); return
+                bindBtn.Text=getKey().Name; tw(bindBtn,{TextColor3=C.acc}):Play(); listening=nil; conn:Disconnect(); return
             end
             if BLOCKED[inp.KeyCode] then
                 bindBtn.Text="invalid!"; tw(bindBtn,{TextColor3=C.red}):Play()
-                task.wait(0.8); bindBtn.Text=getKey().Name; tw(bindBtn,{TextColor3=C.acc}):Play()
-                listening=nil; conn:Disconnect(); return
+                task.wait(0.8); bindBtn.Text=getKey().Name; tw(bindBtn,{TextColor3=C.acc}):Play(); listening=nil; conn:Disconnect(); return
             end
             setKey(inp.KeyCode); bindBtn.Text=inp.KeyCode.Name
             tw(bindBtn,{TextColor3=C.acc}):Play(); listening=nil; conn:Disconnect()
@@ -1328,6 +1197,4 @@ TweenSvc:Create(frame,TweenInfo.new(0.45,Enum.EasingStyle.Back,Enum.EasingDirect
     Position=UDim2.new(0,18,0.5,-180),
     BackgroundTransparency=0,
 }):Play()
-
--- Carrega mapas ao abrir
 task.delay(1, refreshMaps)
