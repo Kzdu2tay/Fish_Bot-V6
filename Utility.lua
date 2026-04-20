@@ -1,9 +1,13 @@
 --[[
-    UTILITY v10 — Fisch
-    V = hide/show
-    Drag by header
+    UTILITY v11 — Fisch (bug fixes)
+    V = hide/show  |  Drag by header
     100% client-side, no prints
-    v10: sell expandido (auto-sell, sell all inv), bordas circulares corrigidas
+
+    v11 FIXES:
+    • Shake não trava mais (throttle 100ms + task.wait maior)
+    • Speed não para ao mudar direção (re-aplica via Heartbeat)
+    • Noclip não faz bater invisível (Stepped + Accessories)
+    • V não buga GUI (debounce com tracking de animação)
 ]]
 
 local Players  = game:GetService("Players")
@@ -20,7 +24,9 @@ local PG = LP:WaitForChild("PlayerGui")
 -- ═══════════════════════════════════════
 local noclipOn   = false; local noclipConn = nil; local ncKey = Enum.KeyCode.F
 local speedOn    = false; local speedVal   = 45;  local spKey = Enum.KeyCode.G
+local speedConn  = nil
 local jumpOn     = false; local jumpVal    = 80;  local hjKey = Enum.KeyCode.H
+local jumpConn   = nil
 local reJumpOn   = false; local reJumpConn = nil
 local shakeOn    = false; local shakeThread = nil; local shakeKey = Enum.KeyCode.J
 local shakeActive = false
@@ -30,7 +36,7 @@ local npcRange   = 150
 local listening  = nil
 local currentTab = "Cheats"
 local guiVisible = true
-local vDebounce  = false
+local vAnimating = false
 
 -- ═══════════════════════════════════════
 -- ISLANDS
@@ -69,28 +75,83 @@ local function hrp()  local c=chr(); return c and c:FindFirstChild("HumanoidRoot
 local function tool() local c=chr(); return c and c:FindFirstChildOfClass("Tool") end
 
 -- ═══════════════════════════════════════
--- NOCLIP
+-- NOCLIP v11 FIX
+-- Troca PreSimulation → Stepped (roda depois da física)
+-- Inclui Accessories (handles batem em coisas)
 -- ═══════════════════════════════════════
 local function setNoclip(v)
     noclipOn = v
     if noclipConn then noclipConn:Disconnect(); noclipConn=nil end
+
     if v then
-        noclipConn = RunSvc.PreSimulation:Connect(function()
-            local c=chr(); if not c then return end
+        noclipConn = RunSvc.Stepped:Connect(function()
+            local c = chr(); if not c then return end
             for _,p in ipairs(c:GetDescendants()) do
-                if p:IsA("BasePart") then p.CanCollide=false end
+                if p:IsA("BasePart") then
+                    p.CanCollide = false
+                end
+            end
+            -- Accessories (chapéus, cabelo, etc)
+            for _,acc in ipairs(c:GetChildren()) do
+                if acc:IsA("Accessory") then
+                    local h = acc:FindFirstChild("Handle")
+                    if h and h:IsA("BasePart") then h.CanCollide = false end
+                end
             end
         end)
     else
-        local c=chr()
-        if c then for _,p in ipairs(c:GetDescendants()) do
-            if p:IsA("BasePart") and p.Name~="HumanoidRootPart" then p.CanCollide=true end
-        end end
+        local c = chr()
+        if c then
+            for _,p in ipairs(c:GetDescendants()) do
+                if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+                    p.CanCollide = true
+                end
+            end
+        end
     end
 end
 
-local function applySpeed() local h=hum(); if h then h.WalkSpeed=speedOn and speedVal or 16 end end
-local function applyJump()  local h=hum(); if h then h.JumpPower =jumpOn  and jumpVal  or 50 end end
+-- ═══════════════════════════════════════
+-- SPEED v11 FIX
+-- Re-aplica TODO frame — se o jogo resetar, recupera na hora
+-- ═══════════════════════════════════════
+local function applySpeedOnce()
+    local h = hum(); if h then h.WalkSpeed = speedOn and speedVal or 16 end
+end
+
+local function startSpeedLoop()
+    if speedConn then speedConn:Disconnect(); speedConn=nil end
+    speedConn = RunSvc.Heartbeat:Connect(function()
+        if not speedOn then speedConn:Disconnect(); speedConn=nil; return end
+        local h = hum()
+        if h and h.WalkSpeed ~= speedVal then h.WalkSpeed = speedVal end
+    end)
+end
+
+local function stopSpeedLoop()
+    if speedConn then speedConn:Disconnect(); speedConn=nil end
+    local h = hum(); if h then h.WalkSpeed = 16 end
+end
+
+-- ═══════════════════════════════════════
+-- JUMP (mesma proteção)
+-- ═══════════════════════════════════════
+local function startJumpLoop()
+    if jumpConn then jumpConn:Disconnect(); jumpConn=nil end
+    jumpConn = RunSvc.Heartbeat:Connect(function()
+        if not jumpOn then jumpConn:Disconnect(); jumpConn=nil; return end
+        local h = hum()
+        if h then
+            h.UseJumpPower = true
+            if h.JumpPower ~= jumpVal then h.JumpPower = jumpVal end
+        end
+    end)
+end
+
+local function stopJumpLoop()
+    if jumpConn then jumpConn:Disconnect(); jumpConn=nil end
+    local h = hum(); if h then h.JumpPower = 50 end
+end
 
 local function startReJump()
     if reJumpConn then reJumpConn:Disconnect(); reJumpConn=nil end
@@ -98,37 +159,47 @@ local function startReJump()
         if not reJumpOn or not jumpOn then reJumpConn:Disconnect(); reJumpConn=nil; return end
         local h=hum()
         if h and h.FloorMaterial~=Enum.Material.Air then
-            h.JumpPower=jumpVal; h:ChangeState(Enum.HumanoidStateType.Jumping); task.wait(0.15)
+            h:ChangeState(Enum.HumanoidStateType.Jumping); task.wait(0.15)
         end
     end)
 end
 local function stopReJump() if reJumpConn then reJumpConn:Disconnect(); reJumpConn=nil end end
 
 -- ═══════════════════════════════════════
--- SHAKE v9
+-- SHAKE v11 FIX — não trava mais
+-- Throttle de 100ms entre cliques
+-- task.wait de 0.1 (em vez de 0.035) evita saturar o loop
+-- pcall pra não crashar se o botão sumir
 -- ═══════════════════════════════════════
 local function getShakeButton()
     local sui = PG:FindFirstChild("shakeui")
     if not sui or not sui.Enabled then return nil end
     local sz = sui:FindFirstChild("safezone")
-    if not sz then return nil end
+    if not sz or not sz.Visible then return nil end
     local btn = sz:FindFirstChild("button")
-    if btn and btn:IsA("GuiButton") and btn.Visible then return btn end
+    if btn and btn:IsA("GuiButton") and btn.Visible and btn.Active then
+        return btn
+    end
     return nil
 end
 
 local function startShake()
     if shakeThread then task.cancel(shakeThread); shakeThread=nil end
     shakeThread = task.spawn(function()
+        local lastClick = 0
         while shakeOn do
             local btn = getShakeButton()
             if btn then
                 shakeActive = true
-                btn.MouseButton1Click:Fire()
-                task.wait(0.035)
+                local now = tick()
+                if now - lastClick >= 0.1 then
+                    lastClick = now
+                    pcall(function() btn.MouseButton1Click:Fire() end)
+                end
+                task.wait(0.1)
             else
                 shakeActive = false
-                task.wait(0.05)
+                task.wait(0.15)
             end
         end
         shakeActive = false
@@ -141,102 +212,65 @@ local function stopShake()
 end
 
 -- ═══════════════════════════════════════
--- SELL — EXPANDIDO (sem paywall)
--- Tenta todos os metodos conhecidos do Fisch
+-- SELL
 -- ═══════════════════════════════════════
-
--- Metodo principal: tenta vender um tool especifico
 local function trySellTool(t)
     if not t then return false, "no_tool" end
-
-    -- 1) Tenta RemoteEvents/Functions em RS
     local rsEv = RS:FindFirstChild("events") or RS:FindFirstChild("Events")
         or RS:FindFirstChild("Remotes") or RS:FindFirstChild("remotes")
     if rsEv then
-        local names = {
-            "sell","Sell","appraise","Appraise",
-            "sellfish","SellFish","SellItem","appraiseFish",
-            "sellItem","SellFish","FishSell","submitFish",
-            "SubmitFish","cashIn","CashIn","redeemFish",
-        }
+        local names = {"sell","Sell","appraise","Appraise","sellfish","SellFish","SellItem","appraiseFish","sellItem","FishSell","submitFish","SubmitFish","cashIn","CashIn","redeemFish"}
         for _,n in ipairs(names) do
             local e=rsEv:FindFirstChild(n)
             if e then
-                if e:IsA("RemoteEvent") then
-                    pcall(function() e:FireServer(t) end)
-                    return true, "RE:"..n
+                if e:IsA("RemoteEvent") then pcall(function() e:FireServer(t) end); return true, "RE:"..n
                 elseif e:IsA("RemoteFunction") then
                     local ok=pcall(function() return e:InvokeServer(t) end)
                     if ok then return true, "RF:"..n end
                 end
             end
         end
-        -- busca generica em toda a arvore de remotes
         for _,e in ipairs(rsEv:GetDescendants()) do
             local lower = e.Name:lower()
             if (lower:find("sell") or lower:find("appraise") or lower:find("submit") or lower:find("cash")) then
-                if e:IsA("RemoteEvent") then
-                    pcall(function() e:FireServer(t) end)
-                    return true, "RE:"..e.Name
-                end
+                if e:IsA("RemoteEvent") then pcall(function() e:FireServer(t) end); return true, "RE:"..e.Name end
             end
         end
     end
-
-    -- 2) Tenta GUI buttons visiveis com "sell" ou "appraise"
     for _,obj in ipairs(PG:GetDescendants()) do
         if obj:IsA("GuiButton") and obj.Visible then
             local n=obj.Name:lower()
             if n:find("sell") or n:find("appraise") or n:find("submit") or n:find("cashin") then
                 local sz=obj.AbsoluteSize
-                if sz.X>2 and sz.Y>2 then
-                    pcall(function() obj.MouseButton1Click:Fire() end)
-                    return true, "GUI:"..obj.Name
-                end
+                if sz.X>2 and sz.Y>2 then pcall(function() obj.MouseButton1Click:Fire() end); return true, "GUI:"..obj.Name end
             end
         end
     end
-
-    -- 3) Tenta ativar a tool (alguns jogos processam o sell pelo Activate)
     pcall(function() t:Activate() end)
-
     return false, "no_method"
 end
 
--- Vende o item na mao
 local function sellFromHand()
     local t=tool()
     if not t then return false,"No item in hand" end
     return trySellTool(t)
 end
 
--- Vende TODOS os itens do backpack (nao apenas o da mao)
 local function sellAll()
     local sold, failed = 0, 0
     local bp = LP:FindFirstChild("Backpack")
     local items = {}
-
-    -- pega itens do backpack
-    if bp then
-        for _,t in ipairs(bp:GetChildren()) do
-            if t:IsA("Tool") then table.insert(items, t) end
-        end
-    end
-    -- pega item na mao tambem
-    local hand = tool()
-    if hand then table.insert(items, hand) end
-
+    if bp then for _,t in ipairs(bp:GetChildren()) do if t:IsA("Tool") then table.insert(items, t) end end end
+    local hand = tool(); if hand then table.insert(items, hand) end
     for _,t in ipairs(items) do
-        local ok,_ = trySellTool(t)
+        local ok = trySellTool(t)
         if ok then sold=sold+1 else failed=failed+1 end
-        task.wait(0.15) -- pequeno delay entre cada venda
+        task.wait(0.15)
     end
-
     if sold==0 and failed==0 then return false,"Inventory empty" end
     return true, "Sold "..sold..(failed>0 and " | Failed "..failed or "")
 end
 
--- Auto-sell: vende automaticamente a cada X segundos
 local function startAutoSell(statusLbl)
     if autoSellThread then task.cancel(autoSellThread); autoSellThread=nil end
     autoSellThread = task.spawn(function()
@@ -265,9 +299,6 @@ local function tpTo(pos)
     r.CFrame=CFrame.new(pos+Vector3.new(0,5,0)); return true
 end
 
--- ═══════════════════════════════════════
--- NEARBY NPCs
--- ═══════════════════════════════════════
 local function getNearby()
     local r=hrp(); if not r then return {} end
     local found={}
@@ -277,9 +308,7 @@ local function getNearby()
             local part=obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChildOfClass("BasePart")
             if h2 and part then
                 local d=(r.Position-part.Position).Magnitude
-                if d<=npcRange then
-                    table.insert(found,{name=obj.Name, part=part, dist=math.floor(d)})
-                end
+                if d<=npcRange then table.insert(found,{name=obj.Name, part=part, dist=math.floor(d)}) end
             end
         end
     end
@@ -292,16 +321,17 @@ local function tpToNPC(part)
     r.CFrame=CFrame.new((part.CFrame*CFrame.new(0,0,-3.5)).Position+Vector3.new(0,3,0))
 end
 
+-- v11: re-aplica tudo no respawn
 LP.CharacterAdded:Connect(function()
     task.wait(0.5)
     if noclipOn then setNoclip(true) end
-    if speedOn  then applySpeed()    end
-    if jumpOn   then applyJump()     end
+    if speedOn  then applySpeedOnce(); startSpeedLoop() end
+    if jumpOn   then startJumpLoop() end
     if reJumpOn and jumpOn then startReJump() end
 end)
 
 -- ═══════════════════════════════════════
--- DESTROY OLD GUI
+-- GUI
 -- ═══════════════════════════════════════
 pcall(function()
     for _,n in ipairs({"UtilityGui","NoclipGui"}) do
@@ -312,9 +342,6 @@ end)
 local gui=Instance.new("ScreenGui",PG)
 gui.Name="UtilityGui"; gui.ResetOnSpawn=false; gui.DisplayOrder=999
 
--- ═══════════════════════════════════════
--- COLORS
--- ═══════════════════════════════════════
 local C={
     bg=Color3.fromRGB(8,10,18),      panel=Color3.fromRGB(13,16,28),
     card=Color3.fromRGB(18,22,38),   cardH=Color3.fromRGB(24,30,52),
@@ -324,16 +351,11 @@ local C={
     dim=Color3.fromRGB(70,82,112),   txt=Color3.fromRGB(210,218,240),
     sub=Color3.fromRGB(128,140,175), bdr=Color3.fromRGB(26,33,58),
     sellBg=Color3.fromRGB(16,58,36), sellH=Color3.fromRGB(20,72,44),
-    autoBg=Color3.fromRGB(40,28,10), autoH=Color3.fromRGB(55,38,12),
-    autoOn=Color3.fromRGB(30,22,8),
 }
 
 local function tw(o,p,d) return TweenSvc:Create(o,TweenInfo.new(d or 0.15,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),p) end
 local function twB(o,p)  return TweenSvc:Create(o,TweenInfo.new(0.22,Enum.EasingStyle.Back,Enum.EasingDirection.Out),p) end
 
--- ═══════════════════════════════════════
--- ROOT FRAME
--- ═══════════════════════════════════════
 local frame=Instance.new("Frame",gui)
 frame.Size=UDim2.new(0,212,0,36)
 frame.Position=UDim2.new(0,18,0.5,-160)
@@ -354,9 +376,7 @@ local function pad(p,l,r,t,b)
     u.PaddingTop=UDim.new(0,t or 6);   u.PaddingBottom=UDim.new(0,b or 6)
 end
 
--- ═══════════════════════════════════════
 -- HEADER
--- ═══════════════════════════════════════
 local header=Instance.new("Frame",frame)
 header.Size=UDim2.new(1,0,0,36); header.BackgroundColor3=C.panel
 header.BorderSizePixel=0; header.LayoutOrder=0
@@ -373,7 +393,7 @@ Instance.new("UICorner",dot).CornerRadius=UDim.new(1,0)
 
 local htitle=Instance.new("TextLabel",header)
 htitle.Size=UDim2.new(1,-60,1,0); htitle.Position=UDim2.new(0,24,0,0)
-htitle.BackgroundTransparency=1; htitle.Text="⚙  UTILITY  v10"
+htitle.BackgroundTransparency=1; htitle.Text="⚙  UTILITY  v11"
 htitle.TextColor3=C.txt; htitle.Font=Enum.Font.GothamBlack; htitle.TextSize=11
 htitle.TextXAlignment=Enum.TextXAlignment.Left
 
@@ -384,9 +404,7 @@ vHint.Text="V"; vHint.TextColor3=C.dim; vHint.Font=Enum.Font.GothamBold; vHint.T
 vHint.TextXAlignment=Enum.TextXAlignment.Center
 Instance.new("UICorner",vHint).CornerRadius=UDim.new(0,4)
 
--- ═══════════════════════════════════════
--- TABS (3)
--- ═══════════════════════════════════════
+-- TABS
 local tabBar=Instance.new("Frame",frame)
 tabBar.Size=UDim2.new(1,0,0,30); tabBar.BackgroundColor3=C.panel
 tabBar.BorderSizePixel=0; tabBar.LayoutOrder=1
@@ -424,18 +442,16 @@ local function switchTab(name)
     currentTab=name
     for n,pg in pairs(tabPages) do pg.Visible=(n==name) end
     for n,b in pairs(tabBtns) do
-        tw(b,{BackgroundColor3=(n==name)and C.acc or C.card,TextColor3=(n==name)and C.bg or C.dim}):Play()
+        tw(b,{BackgroundColor3=(n==name) and C.acc or C.card,TextColor3=(n==name) and C.bg or C.dim}):Play()
     end
-    frame.AutomaticSize=(guiVisible and Enum.AutomaticSize.Y or Enum.AutomaticSize.None)
+    if guiVisible then frame.AutomaticSize=Enum.AutomaticSize.Y end
 end
 
 for name,b in pairs(tabBtns) do
     b.MouseButton1Click:Connect(function() switchTab(name) end)
 end
 
--- ═══════════════════════════════════════
 -- SECTION BUILDER
--- ═══════════════════════════════════════
 local BLOCKED={
     [Enum.KeyCode.Return]=true,[Enum.KeyCode.Escape]=true,
     [Enum.KeyCode.Tab]=true,[Enum.KeyCode.Backspace]=true,
@@ -544,25 +560,21 @@ local function mkSection(parent, cfg)
     return {togHit=togHit,bindBtn=bindB,rjTogHit=rjTogHit,setTog=setTog,setRj=setRj,statusLbl=statusLbl}
 end
 
--- ═══════════════════════════════════════
 -- PAGE CHEATS
--- ═══════════════════════════════════════
 local pg1=tabPages["Cheats"]
 mkDiv(pg1,1)
 local ncSec=mkSection(pg1,{order=2,icon="👻",label="Noclip",keyName=ncKey.Name})
 mkDiv(pg1,3)
 local spSec=mkSection(pg1,{order=4,icon="💨",label="Speed",keyName=spKey.Name,
-    slider={min=16,max=300,def=speedVal,label="Speed",onChange=function(v) speedVal=v; if speedOn then local h=hum(); if h then h.WalkSpeed=v end end end}})
+    slider={min=16,max=300,def=speedVal,label="Speed",onChange=function(v) speedVal=v end}})
 mkDiv(pg1,5)
 local hjSec=mkSection(pg1,{order=6,icon="🦘",label="High Jump",keyName=hjKey.Name,
-    slider={min=50,max=500,def=jumpVal,label="Power",onChange=function(v) jumpVal=v; if jumpOn then local h=hum(); if h then h.JumpPower=v end end end},rejump=true})
+    slider={min=50,max=500,def=jumpVal,label="Power",onChange=function(v) jumpVal=v end},rejump=true})
 mkDiv(pg1,7)
 local shSec=mkSection(pg1,{order=8,icon="🔄",label="Shake",keyName=shakeKey.Name,showStatus=true})
 mkDiv(pg1,9)
 
--- ═══════════════════════════════════════
--- SELL SECTION — expandida com bordas circulares
--- ═══════════════════════════════════════
+-- SELL SECTION
 local sellF=Instance.new("Frame",pg1)
 sellF.Size=UDim2.new(1,0,0,0); sellF.AutomaticSize=Enum.AutomaticSize.Y
 sellF.BackgroundColor3=C.card; sellF.BorderSizePixel=0; sellF.LayoutOrder=10
@@ -572,19 +584,16 @@ su.PaddingTop=UDim.new(0,7);   su.PaddingBottom=UDim.new(0,9)
 local sLy=Instance.new("UIListLayout",sellF)
 sLy.SortOrder=Enum.SortOrder.LayoutOrder; sLy.Padding=UDim.new(0,5)
 
--- Titulo
 local sTR=Instance.new("Frame",sellF); sTR.Size=UDim2.new(1,0,0,16); sTR.BackgroundTransparency=1; sTR.LayoutOrder=1
 local sTL=Instance.new("TextLabel",sTR); sTL.Size=UDim2.new(1,0,1,0); sTL.BackgroundTransparency=1
 sTL.Text="💰  Sell"; sTL.TextColor3=C.sub; sTL.Font=Enum.Font.GothamBold; sTL.TextSize=10; sTL.TextXAlignment=Enum.TextXAlignment.Left
 
--- Status label
 local sellSt=Instance.new("TextLabel",sellF)
 sellSt.Size=UDim2.new(1,0,0,10); sellSt.BackgroundTransparency=1
 sellSt.Text="Waiting..."; sellSt.TextColor3=C.dim
 sellSt.Font=Enum.Font.Gotham; sellSt.TextSize=8
 sellSt.TextXAlignment=Enum.TextXAlignment.Left; sellSt.LayoutOrder=2
 
--- Bind row
 local sBR=Instance.new("Frame",sellF); sBR.Size=UDim2.new(1,0,0,20); sBR.BackgroundTransparency=1; sBR.LayoutOrder=3
 local sBL=Instance.new("TextLabel",sBR); sBL.Size=UDim2.new(0,38,1,0); sBL.BackgroundTransparency=1
 sBL.Text="Key:"; sBL.TextColor3=C.dim; sBL.Font=Enum.Font.Gotham; sBL.TextSize=8; sBL.TextXAlignment=Enum.TextXAlignment.Left
@@ -593,57 +602,51 @@ sellBind.Size=UDim2.new(0,64,0,18); sellBind.Position=UDim2.new(0,40,0.5,-9)
 sellBind.BackgroundColor3=Color3.fromRGB(18,22,44); sellBind.BorderSizePixel=0
 sellBind.Text=sellKey.Name; sellBind.TextColor3=C.acc
 sellBind.Font=Enum.Font.GothamBold; sellBind.TextSize=9; sellBind.AutoButtonColor=false
-Instance.new("UICorner",sellBind).CornerRadius=UDim.new(0,5)  -- ✅ CIRCULAR
+Instance.new("UICorner",sellBind).CornerRadius=UDim.new(0,5)
 Instance.new("UIStroke",sellBind).Color=C.accD
 
--- Botao: Sell Item in Hand
 local sellBtn=Instance.new("TextButton",sellF)
 sellBtn.Size=UDim2.new(1,0,0,28); sellBtn.LayoutOrder=4
 sellBtn.BackgroundColor3=C.sellBg; sellBtn.BorderSizePixel=0
 sellBtn.Text="💰  Sell Item in Hand"; sellBtn.TextColor3=C.grn
 sellBtn.Font=Enum.Font.GothamBold; sellBtn.TextSize=9; sellBtn.AutoButtonColor=false
-Instance.new("UICorner",sellBtn).CornerRadius=UDim.new(0,7)  -- ✅ CIRCULAR
+Instance.new("UICorner",sellBtn).CornerRadius=UDim.new(0,7)
 Instance.new("UIStroke",sellBtn).Color=Color3.fromRGB(22,82,50)
 sellBtn.MouseEnter:Connect(function() tw(sellBtn,{BackgroundColor3=C.sellH}):Play() end)
 sellBtn.MouseLeave:Connect(function() tw(sellBtn,{BackgroundColor3=C.sellBg}):Play() end)
 
--- Divisor interno
 local innerDiv=Instance.new("Frame",sellF)
 innerDiv.Size=UDim2.new(1,0,0,1); innerDiv.BackgroundColor3=C.bdr
 innerDiv.BorderSizePixel=0; innerDiv.LayoutOrder=5
 
--- Botao: Sell ALL Inventory
 local sellAllBtn=Instance.new("TextButton",sellF)
 sellAllBtn.Size=UDim2.new(1,0,0,28); sellAllBtn.LayoutOrder=6
 sellAllBtn.BackgroundColor3=Color3.fromRGB(14,50,30); sellAllBtn.BorderSizePixel=0
 sellAllBtn.Text="📦  Sell All Inventory"; sellAllBtn.TextColor3=C.grn
 sellAllBtn.Font=Enum.Font.GothamBold; sellAllBtn.TextSize=9; sellAllBtn.AutoButtonColor=false
-Instance.new("UICorner",sellAllBtn).CornerRadius=UDim.new(0,7)  -- ✅ CIRCULAR
+Instance.new("UICorner",sellAllBtn).CornerRadius=UDim.new(0,7)
 Instance.new("UIStroke",sellAllBtn).Color=Color3.fromRGB(18,70,40)
 sellAllBtn.MouseEnter:Connect(function() tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(18,64,38)}):Play() end)
 sellAllBtn.MouseLeave:Connect(function() tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(14,50,30)}):Play() end)
 
--- Divisor interno
 local innerDiv2=Instance.new("Frame",sellF)
 innerDiv2.Size=UDim2.new(1,0,0,1); innerDiv2.BackgroundColor3=C.bdr
 innerDiv2.BorderSizePixel=0; innerDiv2.LayoutOrder=7
 
--- Auto-Sell row (toggle + delay slider)
 local autoRow=Instance.new("Frame",sellF)
 autoRow.Size=UDim2.new(1,0,0,20); autoRow.BackgroundTransparency=1; autoRow.LayoutOrder=8
 local autoLbl=Instance.new("TextLabel",autoRow); autoLbl.Size=UDim2.new(1,-52,1,0); autoLbl.BackgroundTransparency=1
 autoLbl.Text="🔁  Auto-Sell"; autoLbl.TextColor3=C.sub; autoLbl.Font=Enum.Font.GothamBold; autoLbl.TextSize=10; autoLbl.TextXAlignment=Enum.TextXAlignment.Left
 local autoTr=Instance.new("Frame",autoRow); autoTr.Size=UDim2.new(0,36,0,18); autoTr.Position=UDim2.new(1,-36,0.5,-9)
 autoTr.BackgroundColor3=Color3.fromRGB(22,28,50); autoTr.BorderSizePixel=0
-Instance.new("UICorner",autoTr).CornerRadius=UDim.new(0,9)  -- ✅ CIRCULAR
+Instance.new("UICorner",autoTr).CornerRadius=UDim.new(0,9)
 Instance.new("UIStroke",autoTr).Color=C.bdr
 local autoKn=Instance.new("Frame",autoTr); autoKn.Size=UDim2.new(0,14,0,14); autoKn.Position=UDim2.new(0,2,0.5,-7)
 autoKn.BackgroundColor3=Color3.fromRGB(195,205,235); autoKn.BorderSizePixel=0
-Instance.new("UICorner",autoKn).CornerRadius=UDim.new(0,7)  -- ✅ CIRCULAR
+Instance.new("UICorner",autoKn).CornerRadius=UDim.new(0,7)
 local autoTogHit=Instance.new("TextButton",autoTr); autoTogHit.Size=UDim2.new(1,0,1,0)
 autoTogHit.BackgroundTransparency=1; autoTogHit.Text=""; autoTogHit.AutoButtonColor=false; autoTogHit.ZIndex=5
 
--- Delay slider para auto-sell
 local autoDelRow1=Instance.new("Frame",sellF); autoDelRow1.Size=UDim2.new(1,0,0,13); autoDelRow1.BackgroundTransparency=1; autoDelRow1.LayoutOrder=9
 local autoDelLbl=Instance.new("TextLabel",autoDelRow1); autoDelLbl.Size=UDim2.new(1,0,1,0); autoDelLbl.BackgroundTransparency=1
 autoDelLbl.Text="Delay: 1.5s"; autoDelLbl.TextColor3=C.acc; autoDelLbl.Font=Enum.Font.GothamBold; autoDelLbl.TextSize=8; autoDelLbl.TextXAlignment=Enum.TextXAlignment.Left
@@ -657,7 +660,7 @@ adFill.BackgroundColor3=C.grn; adFill.BorderSizePixel=0
 Instance.new("UICorner",adFill).CornerRadius=UDim.new(0,2)
 local adKn=Instance.new("Frame",adBg); adKn.Size=UDim2.new(0,11,0,11); adKn.AnchorPoint=Vector2.new(0.5,0.5)
 adKn.Position=UDim2.new(adPct,0,0.5,0); adKn.BackgroundColor3=Color3.fromRGB(255,255,255); adKn.BorderSizePixel=0; adKn.ZIndex=3
-Instance.new("UICorner",adKn).CornerRadius=UDim.new(0,6)  -- ✅ CIRCULAR
+Instance.new("UICorner",adKn).CornerRadius=UDim.new(0,6)
 local adHit=Instance.new("TextButton",adBg); adHit.Size=UDim2.new(1,0,0,20); adHit.Position=UDim2.new(0,0,0.5,-10)
 adHit.BackgroundTransparency=1; adHit.Text=""; adHit.AutoButtonColor=false; adHit.ZIndex=4
 local adDrag=false
@@ -671,7 +674,6 @@ UIS.InputChanged:Connect(function(i)
     autoDelLbl.Text="Delay: "..autoSellDelay.."s"
 end)
 
--- Auto-sell status
 local autoStLbl=Instance.new("TextLabel",sellF)
 autoStLbl.Size=UDim2.new(1,0,0,10); autoStLbl.BackgroundTransparency=1
 autoStLbl.Text=""; autoStLbl.TextColor3=C.dim
@@ -680,9 +682,7 @@ autoStLbl.TextXAlignment=Enum.TextXAlignment.Left; autoStLbl.LayoutOrder=11
 
 mkDiv(pg1,11)
 
--- ═══════════════════════════════════════
 -- PAGE TP
--- ═══════════════════════════════════════
 local pg2=tabPages["TP"]
 local tpScroll=Instance.new("ScrollingFrame",pg2)
 tpScroll.Size=UDim2.new(1,0,0,280); tpScroll.BackgroundTransparency=1; tpScroll.BorderSizePixel=0
@@ -702,7 +702,7 @@ for i,isl in ipairs(ISLANDS) do
     b.BackgroundColor3=bc; b.BorderSizePixel=0; b.Text="📍  "..isl.name
     b.TextColor3=tc; b.Font=Enum.Font.GothamBold; b.TextSize=9; b.TextXAlignment=Enum.TextXAlignment.Left
     b.AutoButtonColor=false; b.LayoutOrder=i
-    Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); pad(b,8,8,0,0)  -- ✅ CIRCULAR
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); pad(b,8,8,0,0)
     b.MouseEnter:Connect(function() tw(b,{BackgroundColor3=hc,TextColor3=C.txt}):Play() end)
     b.MouseLeave:Connect(function() tw(b,{BackgroundColor3=bc,TextColor3=tc}):Play() end)
     b.MouseButton1Click:Connect(function()
@@ -714,11 +714,8 @@ for i,isl in ipairs(ISLANDS) do
     end)
 end
 
--- ═══════════════════════════════════════
 -- PAGE NPCs
--- ═══════════════════════════════════════
 local pg3=tabPages["NPCs"]
-
 local rngF=Instance.new("Frame",pg3); rngF.Size=UDim2.new(1,0,0,0); rngF.AutomaticSize=Enum.AutomaticSize.Y
 rngF.BackgroundColor3=C.card; rngF.BorderSizePixel=0; rngF.LayoutOrder=1
 pad(rngF,10,10,7,7)
@@ -736,7 +733,7 @@ rngFill.BackgroundColor3=C.acc; rngFill.BorderSizePixel=0
 Instance.new("UICorner",rngFill).CornerRadius=UDim.new(0,2)
 local rngKn=Instance.new("Frame",rngBg); rngKn.Size=UDim2.new(0,11,0,11); rngKn.AnchorPoint=Vector2.new(0.5,0.5)
 rngKn.Position=UDim2.new(rPct,0,0.5,0); rngKn.BackgroundColor3=Color3.fromRGB(255,255,255); rngKn.BorderSizePixel=0; rngKn.ZIndex=3
-Instance.new("UICorner",rngKn).CornerRadius=UDim.new(0,6)  -- ✅ CIRCULAR
+Instance.new("UICorner",rngKn).CornerRadius=UDim.new(0,6)
 local rngHit=Instance.new("TextButton",rngBg); rngHit.Size=UDim2.new(1,0,0,20); rngHit.Position=UDim2.new(0,0,0.5,-10)
 rngHit.BackgroundTransparency=1; rngHit.Text=""; rngHit.AutoButtonColor=false; rngHit.ZIndex=4
 local rngDrag=false
@@ -751,12 +748,11 @@ UIS.InputChanged:Connect(function(i)
 end)
 mkDiv(pg3,2)
 
--- scan button — ✅ AGORA COM BORDA CIRCULAR
 local scanBtn=Instance.new("TextButton",pg3); scanBtn.Size=UDim2.new(1,0,0,30); scanBtn.LayoutOrder=3
 scanBtn.BackgroundColor3=Color3.fromRGB(16,28,60); scanBtn.BorderSizePixel=0
 scanBtn.Text="🔍  Scan Nearby NPCs"; scanBtn.TextColor3=C.acc
 scanBtn.Font=Enum.Font.GothamBold; scanBtn.TextSize=9; scanBtn.AutoButtonColor=false
-Instance.new("UICorner",scanBtn).CornerRadius=UDim.new(0,7)  -- ✅ CIRCULAR (era 0 antes!)
+Instance.new("UICorner",scanBtn).CornerRadius=UDim.new(0,7)
 Instance.new("UIStroke",scanBtn).Color=C.accD
 scanBtn.MouseEnter:Connect(function() tw(scanBtn,{BackgroundColor3=Color3.fromRGB(20,36,78)}):Play() end)
 scanBtn.MouseLeave:Connect(function() tw(scanBtn,{BackgroundColor3=Color3.fromRGB(16,28,60)}):Play() end)
@@ -785,7 +781,7 @@ local function rebuildNPCs()
         b.BackgroundColor3=C.card; b.BorderSizePixel=0; b.AutoButtonColor=false; b.LayoutOrder=i
         b.Text="🧑  "..npc.name.."  ("..npc.dist.." st)"
         b.TextColor3=C.sub; b.Font=Enum.Font.GothamBold; b.TextSize=8; b.TextXAlignment=Enum.TextXAlignment.Left
-        Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); pad(b,8,8,0,0)  -- ✅ CIRCULAR
+        Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); pad(b,8,8,0,0)
         b.MouseEnter:Connect(function() tw(b,{BackgroundColor3=C.cardH,TextColor3=C.txt}):Play() end)
         b.MouseLeave:Connect(function() tw(b,{BackgroundColor3=C.card,TextColor3=C.sub}):Play() end)
         local cp=npc.part
@@ -802,52 +798,67 @@ scanBtn.MouseButton1Click:Connect(function()
 end)
 
 -- ═══════════════════════════════════════
--- VISIBILITY
+-- VISIBILITY v11 — FIX SPAM DO V
+-- Trava completa durante animação
+-- Usa Completed:Connect em vez de delay arbitrário
 -- ═══════════════════════════════════════
 local function setVisible(v)
-    if vDebounce then return end
-    vDebounce=true
-    guiVisible=v
+    if vAnimating then return end
+    if guiVisible == v then return end
+    vAnimating = true
+    guiVisible = v
+
     if v then
-        frame.AutomaticSize=Enum.AutomaticSize.Y
         for _,ch in ipairs(frame:GetChildren()) do
-            if ch~=header and (ch:IsA("Frame") or ch:IsA("ScrollingFrame")) then ch.Visible=true end
-        end
-        tw(vHint,{TextColor3=C.dim},0.1):Play()
-    else
-        frame.AutomaticSize=Enum.AutomaticSize.None
-        tw(frame,{Size=UDim2.new(0,212,0,36)},0.18):Play()
-        task.delay(0.18,function()
-            for _,ch in ipairs(frame:GetChildren()) do
-                if ch~=header and (ch:IsA("Frame") or ch:IsA("ScrollingFrame")) then ch.Visible=false end
+            if ch~=header and (ch:IsA("Frame") or ch:IsA("ScrollingFrame")) then
+                ch.Visible = true
             end
+        end
+        frame.AutomaticSize = Enum.AutomaticSize.Y
+        tw(vHint,{TextColor3=C.dim},0.15):Play()
+        task.delay(0.2, function() vAnimating = false end)
+    else
+        frame.AutomaticSize = Enum.AutomaticSize.None
+        local shrink = tw(frame,{Size=UDim2.new(0,212,0,36)},0.18)
+        shrink:Play()
+        shrink.Completed:Connect(function()
+            if not guiVisible then
+                for _,ch in ipairs(frame:GetChildren()) do
+                    if ch~=header and (ch:IsA("Frame") or ch:IsA("ScrollingFrame")) then
+                        ch.Visible = false
+                    end
+                end
+            end
+            vAnimating = false
         end)
-        tw(vHint,{TextColor3=C.acc},0.1):Play()
+        tw(vHint,{TextColor3=C.acc},0.15):Play()
     end
-    task.delay(0.25, function() vDebounce=false end)
 end
 
--- ═══════════════════════════════════════
--- UPDATE DOT
--- ═══════════════════════════════════════
 local function updateDot()
     tw(dot,{BackgroundColor3=(noclipOn or speedOn or jumpOn or shakeOn or autoSellOn) and C.grn or C.dim}):Play()
 end
 
--- ═══════════════════════════════════════
 -- TOGGLES
--- ═══════════════════════════════════════
 ncSec.togHit.MouseButton1Click:Connect(function()
     noclipOn=not noclipOn; setNoclip(noclipOn); ncSec.setTog(noclipOn)
     tw(fBdr,{Color=noclipOn and C.grn or C.bdr}):Play(); updateDot()
 end)
+
 spSec.togHit.MouseButton1Click:Connect(function()
-    speedOn=not speedOn; spSec.setTog(speedOn); applySpeed(); updateDot()
+    speedOn=not speedOn; spSec.setTog(speedOn)
+    if speedOn then applySpeedOnce(); startSpeedLoop()
+    else stopSpeedLoop() end
+    updateDot()
 end)
+
 hjSec.togHit.MouseButton1Click:Connect(function()
-    jumpOn=not jumpOn; hjSec.setTog(jumpOn); applyJump()
-    if not jumpOn then reJumpOn=false; hjSec.setRj(false); stopReJump() end; updateDot()
+    jumpOn=not jumpOn; hjSec.setTog(jumpOn)
+    if jumpOn then startJumpLoop()
+    else stopJumpLoop(); reJumpOn=false; hjSec.setRj(false); stopReJump() end
+    updateDot()
 end)
+
 if hjSec.rjTogHit then
     hjSec.rjTogHit.MouseButton1Click:Connect(function()
         if not jumpOn then return end
@@ -855,12 +866,12 @@ if hjSec.rjTogHit then
         if reJumpOn then startReJump() else stopReJump() end
     end)
 end
+
 shSec.togHit.MouseButton1Click:Connect(function()
     shakeOn=not shakeOn; shSec.setTog(shakeOn)
     if shakeOn then startShake() else stopShake() end; updateDot()
 end)
 
--- Sell in hand
 sellBtn.MouseButton1Click:Connect(function()
     task.spawn(function()
         tw(sellBtn,{BackgroundColor3=Color3.fromRGB(10,44,26)}):Play(); task.wait(0.1)
@@ -871,7 +882,6 @@ sellBtn.MouseButton1Click:Connect(function()
     end)
 end)
 
--- Sell All
 sellAllBtn.MouseButton1Click:Connect(function()
     task.spawn(function()
         tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(10,38,22)}):Play(); task.wait(0.1)
@@ -882,22 +892,15 @@ sellAllBtn.MouseButton1Click:Connect(function()
     end)
 end)
 
--- Auto-sell toggle
 autoTogHit.MouseButton1Click:Connect(function()
     autoSellOn=not autoSellOn
     tw(autoTr,{BackgroundColor3=autoSellOn and C.grn or Color3.fromRGB(22,28,50)}):Play()
     twB(autoKn,{Position=autoSellOn and UDim2.new(0,20,0.5,-7) or UDim2.new(0,2,0.5,-7)}):Play()
-    if autoSellOn then
-        startAutoSell(autoStLbl)
-    else
-        stopAutoSell()
-        autoStLbl.Text="Auto-sell off"
-        task.delay(2, function() autoStLbl.Text="" end)
-    end
+    if autoSellOn then startAutoSell(autoStLbl)
+    else stopAutoSell(); autoStLbl.Text="Auto-sell off"; task.delay(2, function() autoStLbl.Text="" end) end
     updateDot()
 end)
 
--- shake status watcher
 task.spawn(function()
     while true do
         task.wait(0.2)
@@ -910,9 +913,7 @@ task.spawn(function()
     end
 end)
 
--- ═══════════════════════════════════════
 -- REBIND
--- ═══════════════════════════════════════
 local function setupBind(bindBtn,id,getKey,setKey)
     bindBtn.MouseButton1Click:Connect(function()
         if listening then return end
@@ -940,9 +941,7 @@ setupBind(hjSec.bindBtn, "hj",   function() return hjKey    end, function(k) hjK
 setupBind(shSec.bindBtn, "sh",   function() return shakeKey end, function(k) shakeKey=k end)
 setupBind(sellBind,      "sell", function() return sellKey  end, function(k) sellKey=k  end)
 
--- ═══════════════════════════════════════
 -- DRAG
--- ═══════════════════════════════════════
 do
     local dr,ds,sp2=false,nil,nil
     local dh=Instance.new("TextButton",frame)
@@ -958,9 +957,7 @@ do
     end)
 end
 
--- ═══════════════════════════════════════
 -- HOTKEYS
--- ═══════════════════════════════════════
 UIS.InputBegan:Connect(function(inp,gpe)
     if gpe or listening then return end
     local k=inp.KeyCode
@@ -969,10 +966,16 @@ UIS.InputBegan:Connect(function(inp,gpe)
     elseif k==ncKey then
         noclipOn=not noclipOn; setNoclip(noclipOn); ncSec.setTog(noclipOn)
         tw(fBdr,{Color=noclipOn and C.grn or C.bdr}):Play(); updateDot()
-    elseif k==spKey then speedOn=not speedOn; spSec.setTog(speedOn); applySpeed(); updateDot()
+    elseif k==spKey then
+        speedOn=not speedOn; spSec.setTog(speedOn)
+        if speedOn then applySpeedOnce(); startSpeedLoop()
+        else stopSpeedLoop() end
+        updateDot()
     elseif k==hjKey then
-        jumpOn=not jumpOn; hjSec.setTog(jumpOn); applyJump()
-        if not jumpOn then reJumpOn=false; hjSec.setRj(false); stopReJump() end; updateDot()
+        jumpOn=not jumpOn; hjSec.setTog(jumpOn)
+        if jumpOn then startJumpLoop()
+        else stopJumpLoop(); reJumpOn=false; hjSec.setRj(false); stopReJump() end
+        updateDot()
     elseif k==shakeKey then
         shakeOn=not shakeOn; shSec.setTog(shakeOn)
         if shakeOn then startShake() else stopShake() end; updateDot()
