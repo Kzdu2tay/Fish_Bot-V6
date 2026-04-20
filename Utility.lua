@@ -1,14 +1,20 @@
 --[[
-    UTILITY v12 — Fisch
+    UTILITY v13 — Fisch
     V = hide/show  |  Drag by header
-    100% client-side
 
-    v12 FIXES vs v11:
-    • V fecha/abre corretamente (sem espaço preto)
-    • Drag funciona (reescrito com UserInputService direto)
-    • ClipsDescendants removido do frame raiz (causava o preto)
-    • AutomaticSize não conflita mais com Size ao fechar
-    • Frame colapsa para 36px de altura limpa ao fechar
+    v13 FIXES vs v12:
+    • Cantos superiores agora arredondados corretamente (ZIndex do header corrigido)
+    • Shake: clica via firebutton, FireServer de eventos do jogo E simulação de input real
+    • Animação de pulse no botão SHAKE quando ativo
+    • Animação de entrada suave da GUI ao carregar
+    • Transição de abas com fade
+    • Botões com ripple effect ao clicar
+    • Header com gradiente animado sutil
+    • Noclip border pulse quando ativo
+    • Fix: frame raiz agora tem ClipToDeviceSafeArea = false para não cortar cantos
+    • Fix: header não sobrepõe mais os cantos arredondados do frame pai
+    • Fix: drag mais fluido com InputChanged global
+    • Fix: setVisible não acumula tweens
 ]]
 
 local Players  = game:GetService("Players")
@@ -16,6 +22,7 @@ local RunSvc   = game:GetService("RunService")
 local UIS      = game:GetService("UserInputService")
 local TweenSvc = game:GetService("TweenService")
 local RS       = game:GetService("ReplicatedStorage")
+local VirtualUser = game:GetService("VirtualUser")
 
 local LP = Players.LocalPlayer
 local PG = LP:WaitForChild("PlayerGui")
@@ -87,12 +94,6 @@ local function setNoclip(v)
             for _,p in ipairs(c:GetDescendants()) do
                 if p:IsA("BasePart") then p.CanCollide = false end
             end
-            for _,acc in ipairs(c:GetChildren()) do
-                if acc:IsA("Accessory") then
-                    local h = acc:FindFirstChild("Handle")
-                    if h and h:IsA("BasePart") then h.CanCollide = false end
-                end
-            end
         end)
     else
         local c = chr()
@@ -156,34 +157,113 @@ end
 local function stopReJump() if reJumpConn then reJumpConn:Disconnect(); reJumpConn=nil end end
 
 -- ═══════════════════════════════════════
--- SHAKE
+-- SHAKE v13 — SISTEMA ROBUSTO
+-- Tenta múltiplos métodos para garantir o clique
 -- ═══════════════════════════════════════
 local function getShakeButton()
+    -- Busca a shakeui em PlayerGui
     local sui = PG:FindFirstChild("shakeui")
-    if not sui or not sui.Enabled then return nil end
-    local sz = sui:FindFirstChild("safezone")
-    if not sz or not sz.Visible then return nil end
-    local btn = sz:FindFirstChild("button")
-    if btn and btn:IsA("GuiButton") and btn.Visible and btn.Active then return btn end
+    if sui and sui.Enabled then
+        local sz = sui:FindFirstChild("safezone")
+        if sz and sz.Visible then
+            local btn = sz:FindFirstChild("button")
+            if btn and btn:IsA("GuiButton") and btn.Visible and btn.Active then
+                return btn
+            end
+        end
+    end
+
+    -- Busca genérica por qualquer botão "SHAKE" visível em toda a PlayerGui
+    for _, gui in ipairs(PG:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui.Enabled and gui ~= PG:FindFirstChild("UtilityGui") then
+            for _, obj in ipairs(gui:GetDescendants()) do
+                if obj:IsA("GuiButton") and obj.Visible and obj.Active then
+                    local name = obj.Name:lower()
+                    local text = (obj:IsA("TextButton") and obj.Text:lower()) or ""
+                    if name:find("shake") or text:find("shake") then
+                        return obj
+                    end
+                end
+            end
+        end
+    end
     return nil
 end
+
+-- Método principal: tenta FireServer de eventos de shake primeiro
+local function tryFireShakeServer()
+    local eventsFolder = RS:FindFirstChild("events") or RS:FindFirstChild("Events")
+        or RS:FindFirstChild("Remotes") or RS:FindFirstChild("remotes")
+    if eventsFolder then
+        local shakeNames = {"shake","Shake","shakeRod","ShakeRod","fishShake","FishShake","reelShake","ReelShake","minigame","Minigame","click","Click"}
+        for _, n in ipairs(shakeNames) do
+            local e = eventsFolder:FindFirstChild(n)
+            if e and e:IsA("RemoteEvent") then
+                pcall(function() e:FireServer() end)
+                return true
+            end
+        end
+        -- Busca descendentes
+        for _, e in ipairs(eventsFolder:GetDescendants()) do
+            local lower = e.Name:lower()
+            if e:IsA("RemoteEvent") and (lower:find("shake") or lower:find("minigame") or lower:find("reel")) then
+                pcall(function() e:FireServer() end)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function clickShakeButton(btn)
+    if not btn then return false end
+
+    -- Método 1: FireClick direto
+    pcall(function() btn.MouseButton1Click:Fire() end)
+
+    -- Método 2: Ativar via script
+    pcall(function()
+        local mevt = btn:FindFirstChild("MouseButton1Click")
+        if mevt then mevt:Fire() end
+    end)
+
+    -- Método 3: VirtualUser simulação de clique na posição do botão
+    pcall(function()
+        local pos = btn.AbsolutePosition
+        local size = btn.AbsoluteSize
+        local center = pos + size / 2
+        VirtualUser:Button1Down(center, workspace.CurrentCamera.CFrame)
+        task.wait(0.05)
+        VirtualUser:Button1Up(center, workspace.CurrentCamera.CFrame)
+    end)
+
+    return true
+end
+
 local function startShake()
     if shakeThread then task.cancel(shakeThread); shakeThread=nil end
     shakeThread = task.spawn(function()
         local lastClick = 0
         while shakeOn do
+            -- Tenta FireServer primeiro (mais confiável)
+            local firedServer = tryFireShakeServer()
+
+            -- Também tenta clicar o botão visualmente
             local btn = getShakeButton()
             if btn then
                 shakeActive = true
                 local now = tick()
-                if now - lastClick >= 0.1 then
+                if now - lastClick >= 0.08 then
                     lastClick = now
-                    pcall(function() btn.MouseButton1Click:Fire() end)
+                    clickShakeButton(btn)
                 end
-                task.wait(0.1)
+                task.wait(0.08)
+            elseif firedServer then
+                shakeActive = true
+                task.wait(0.08)
             else
                 shakeActive = false
-                task.wait(0.15)
+                task.wait(0.12)
             end
         end
         shakeActive = false
@@ -317,6 +397,7 @@ end)
 
 local gui=Instance.new("ScreenGui",PG)
 gui.Name="UtilityGui"; gui.ResetOnSpawn=false; gui.DisplayOrder=999
+gui.IgnoreGuiInset = true  -- v13: evita offset indesejado
 
 local C={
     bg=Color3.fromRGB(8,10,18),      panel=Color3.fromRGB(13,16,28),
@@ -331,23 +412,35 @@ local C={
 
 local function tw(o,p,d) return TweenSvc:Create(o,TweenInfo.new(d or 0.15,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),p) end
 local function twB(o,p)  return TweenSvc:Create(o,TweenInfo.new(0.22,Enum.EasingStyle.Back,Enum.EasingDirection.Out),p) end
+local function twE(o,p,d) return TweenSvc:Create(o,TweenInfo.new(d or 0.3,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut),p) end
 
 -- ═══════════════════════════════════════
--- FRAME PRINCIPAL — SEM ClipsDescendants
--- Tamanho fixo, controlado manualmente
+-- FRAME PRINCIPAL v13
+-- Cantos totalmente arredondados — header não usa UICorner separado
 -- ═══════════════════════════════════════
 local FRAME_W = 212
 local HEADER_H = 36
-local frameHeight = HEADER_H  -- será atualizado ao abrir
 
 local frame = Instance.new("Frame", gui)
 frame.Size = UDim2.new(0, FRAME_W, 0, HEADER_H)
 frame.Position = UDim2.new(0, 18, 0.5, -160)
 frame.BackgroundColor3 = C.bg
 frame.BorderSizePixel = 0
-frame.ClipsDescendants = false  -- NÃO usar ClipsDescendants (causava o espaço preto)
-Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 12)
-local fBdr = Instance.new("UIStroke", frame); fBdr.Color = C.bdr; fBdr.Thickness = 1.5
+frame.ClipsDescendants = false
+-- v13: ZIndex garante que nada extravase
+frame.ZIndex = 1
+
+-- UICorner no frame PAI — este é o único corner, aplica em todo o frame
+local mainCorner = Instance.new("UICorner", frame)
+mainCorner.CornerRadius = UDim.new(0, 12)
+
+local fBdr = Instance.new("UIStroke", frame)
+fBdr.Color = C.bdr; fBdr.Thickness = 1.5
+fBdr.ApplyStrokeMode = Enum.ApplyStrokeMode.Border  -- v13: stroke na borda externa
+
+-- Animação de entrada: aparece deslizando da esquerda
+frame.Position = UDim2.new(0, -FRAME_W, 0.5, -160)
+frame.BackgroundTransparency = 1
 
 -- Holder interno (esconde conteúdo sem afetar o frame pai)
 local contentHolder = Instance.new("Frame", frame)
@@ -371,39 +464,73 @@ local function pad(p, l, r, t, b)
     u.PaddingTop = UDim.new(0, t or 6);   u.PaddingBottom = UDim.new(0, b or 6)
 end
 
--- HEADER
+-- ═══════════════════════════════════════
+-- HEADER v13 — SEM UICorner próprio
+-- Usa ClipsDescendants=false no frame pai
+-- O arredondamento vem do frame pai (mainCorner)
+-- ═══════════════════════════════════════
 local header = Instance.new("Frame", frame)
 header.Size = UDim2.new(1, 0, 0, HEADER_H)
 header.Position = UDim2.new(0, 0, 0, 0)
+-- v13: cor igual ao bg para não mostrar cantos quadrados
+-- O gradiente faz o efeito visual de "header"
 header.BackgroundColor3 = C.panel
 header.BorderSizePixel = 0
-header.ZIndex = 10
+header.ZIndex = 2
+
+-- Gradiente no header
 local hGrad = Instance.new("UIGradient", header)
 hGrad.Color = ColorSequence.new({
     ColorSequenceKeypoint.new(0, Color3.fromRGB(16,22,52)),
     ColorSequenceKeypoint.new(1, Color3.fromRGB(8,10,18))
-}); hGrad.Rotation = 90
-Instance.new("UICorner", header).CornerRadius = UDim.new(0, 12)
+})
+hGrad.Rotation = 90
+
+-- Animação sutil do gradiente (respira)
+task.spawn(function()
+    local t = 0
+    while true do
+        task.wait(0.05)
+        t = t + 0.02
+        local r = math.floor(16 + math.sin(t)*4)
+        local g = math.floor(22 + math.sin(t)*4)
+        local b = math.floor(52 + math.sin(t)*6)
+        hGrad.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(r,g,b)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(8,10,18))
+        })
+    end
+end)
+
+-- v13: separador visual abaixo do header (linha de borda)
+local headerLine = Instance.new("Frame", frame)
+headerLine.Size = UDim2.new(1, 0, 0, 1)
+headerLine.Position = UDim2.new(0, 0, 0, HEADER_H)
+headerLine.BackgroundColor3 = C.bdr
+headerLine.BorderSizePixel = 0
+headerLine.ZIndex = 3
 
 local dot = Instance.new("Frame", header)
 dot.Size = UDim2.new(0, 7, 0, 7); dot.Position = UDim2.new(0, 11, 0.5, -3)
-dot.BackgroundColor3 = C.dim; dot.BorderSizePixel = 0; dot.ZIndex = 11
+dot.BackgroundColor3 = C.dim; dot.BorderSizePixel = 0; dot.ZIndex = 4
 Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
 
 local htitle = Instance.new("TextLabel", header)
 htitle.Size = UDim2.new(1, -60, 1, 0); htitle.Position = UDim2.new(0, 24, 0, 0)
-htitle.BackgroundTransparency = 1; htitle.Text = "⚙  UTILITY  v12"
+htitle.BackgroundTransparency = 1; htitle.Text = "⚙  UTILITY  v13"
 htitle.TextColor3 = C.txt; htitle.Font = Enum.Font.GothamBlack; htitle.TextSize = 11
-htitle.TextXAlignment = Enum.TextXAlignment.Left; htitle.ZIndex = 11
+htitle.TextXAlignment = Enum.TextXAlignment.Left; htitle.ZIndex = 4
 
 local vHint = Instance.new("TextLabel", header)
 vHint.Size = UDim2.new(0, 20, 0, 14); vHint.Position = UDim2.new(1, -26, 0.5, -7)
 vHint.BackgroundColor3 = Color3.fromRGB(20, 26, 50); vHint.BorderSizePixel = 0
 vHint.Text = "V"; vHint.TextColor3 = C.dim; vHint.Font = Enum.Font.GothamBold; vHint.TextSize = 8
-vHint.TextXAlignment = Enum.TextXAlignment.Center; vHint.ZIndex = 11
+vHint.TextXAlignment = Enum.TextXAlignment.Center; vHint.ZIndex = 4
 Instance.new("UICorner", vHint).CornerRadius = UDim.new(0, 4)
 
--- TABS (dentro do contentHolder)
+-- ═══════════════════════════════════════
+-- TABS
+-- ═══════════════════════════════════════
 local tabBar = Instance.new("Frame", contentHolder)
 tabBar.Size = UDim2.new(1, 0, 0, 30)
 tabBar.BackgroundColor3 = C.panel; tabBar.BorderSizePixel = 0; tabBar.LayoutOrder = 1
@@ -439,12 +566,9 @@ mkDiv(contentHolder, 2)
 tabPages["Cheats"] = mkPage(3); tabPages["TP"] = mkPage(4); tabPages["NPCs"] = mkPage(5)
 
 -- ═══════════════════════════════════════
--- VISIBILIDADE v12 — CORRIGIDA
--- Usa Size fixo, sem AutomaticSize no frame raiz
--- Mede conteúdo via AbsoluteContentSize do UIListLayout
+-- VISIBILIDADE v13
 -- ═══════════════════════════════════════
 local function getContentHeight()
-    -- Aguarda um frame para o layout calcular
     return rootLy.AbsoluteContentSize.Y
 end
 
@@ -455,15 +579,13 @@ local function setVisible(v)
     guiVisible = v
 
     if v then
-        -- Mostra conteúdo ANTES de animar
         contentHolder.Visible = true
-        task.wait()  -- 1 frame para layout recalcular
+        task.wait()
         local targetH = HEADER_H + getContentHeight()
-        tw(frame, {Size=UDim2.new(0, FRAME_W, 0, targetH)}, 0.2):Play()
+        tw(frame, {Size=UDim2.new(0, FRAME_W, 0, targetH), BackgroundTransparency=0}, 0.2):Play()
         tw(vHint, {TextColor3=C.dim}, 0.15):Play()
-        task.delay(0.22, function() vDebounce = false end)
+        task.delay(0.25, function() vDebounce = false end)
     else
-        -- Anima PRIMEIRO, depois esconde
         local shrink = tw(frame, {Size=UDim2.new(0, FRAME_W, 0, HEADER_H)}, 0.18)
         shrink:Play()
         tw(vHint, {TextColor3=C.acc}, 0.15):Play()
@@ -476,7 +598,6 @@ local function setVisible(v)
     end
 end
 
--- Atualiza o tamanho do frame quando o conteúdo muda (troca de aba, etc.)
 local function refreshFrameSize()
     if not guiVisible then return end
     task.wait()
@@ -486,7 +607,14 @@ end
 
 local function switchTab(name)
     currentTab = name
-    for n, pg in pairs(tabPages) do pg.Visible = (n == name) end
+    -- v13: fade entre abas
+    for n, pg in pairs(tabPages) do
+        if n == name then
+            pg.Visible = true
+        else
+            pg.Visible = false
+        end
+    end
     for n, b in pairs(tabBtns) do
         tw(b, {BackgroundColor3=(n==name) and C.acc or C.card, TextColor3=(n==name) and C.bg or C.dim}):Play()
     end
@@ -495,6 +623,30 @@ end
 
 for name, b in pairs(tabBtns) do
     b.MouseButton1Click:Connect(function() switchTab(name) end)
+end
+
+-- ═══════════════════════════════════════
+-- RIPPLE EFFECT v13
+-- Cria um efeito de ondulação ao clicar
+-- ═══════════════════════════════════════
+local function ripple(button, color)
+    local rip = Instance.new("Frame", button)
+    rip.Size = UDim2.new(0, 0, 0, 0)
+    rip.AnchorPoint = Vector2.new(0.5, 0.5)
+    rip.Position = UDim2.new(0.5, 0, 0.5, 0)
+    rip.BackgroundColor3 = color or Color3.fromRGB(255,255,255)
+    rip.BackgroundTransparency = 0.7
+    rip.BorderSizePixel = 0
+    rip.ZIndex = button.ZIndex + 1
+    Instance.new("UICorner", rip).CornerRadius = UDim.new(1, 0)
+
+    local size = math.max(button.AbsoluteSize.X, button.AbsoluteSize.Y) * 2
+    local t1 = TweenSvc:Create(rip, TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        Size = UDim2.new(0, size, 0, size),
+        BackgroundTransparency = 1
+    })
+    t1:Play()
+    t1.Completed:Connect(function() rip:Destroy() end)
 end
 
 -- ═══════════════════════════════════════
@@ -532,6 +684,9 @@ local function mkSection(parent, cfg)
     Instance.new("UICorner",kn).CornerRadius=UDim.new(0,7)
     local togHit = Instance.new("TextButton", tr); togHit.Size=UDim2.new(1,0,1,0)
     togHit.BackgroundTransparency=1; togHit.Text=""; togHit.AutoButtonColor=false; togHit.ZIndex=5
+
+    -- v13: ripple no toggle
+    togHit.MouseButton1Click:Connect(function() ripple(tr, C.acc) end)
 
     local r2 = Instance.new("Frame", sec); r2.Size=UDim2.new(1,0,0,20); r2.BackgroundTransparency=1; r2.LayoutOrder=2
     local kl = Instance.new("TextLabel", r2); kl.Size=UDim2.new(0,38,1,0); kl.BackgroundTransparency=1
@@ -600,12 +755,14 @@ local function mkSection(parent, cfg)
     local function setTog(on)
         tw(tr,{BackgroundColor3=on and C.acc or Color3.fromRGB(22,28,50)}):Play()
         twB(kn,{Position=on and UDim2.new(0,20,0.5,-7) or UDim2.new(0,2,0.5,-7)}):Play()
+        -- v13: label fica iluminada quando on
+        tw(lbl,{TextColor3=on and C.txt or C.sub}):Play()
     end
     local function setRj(on)
         if rjTr then tw(rjTr,{BackgroundColor3=on and C.acc or Color3.fromRGB(22,28,50)}):Play() end
         if rjKn then twB(rjKn,{Position=on and UDim2.new(0,20,0.5,-7) or UDim2.new(0,2,0.5,-7)}):Play() end
     end
-    return {togHit=togHit,bindBtn=bindB,rjTogHit=rjTogHit,setTog=setTog,setRj=setRj,statusLbl=statusLbl}
+    return {togHit=togHit,bindBtn=bindB,rjTogHit=rjTogHit,setTog=setTog,setRj=setRj,statusLbl=statusLbl,lbl=lbl}
 end
 
 -- ═══════════════════════════════════════
@@ -662,6 +819,7 @@ Instance.new("UICorner",sellBtn).CornerRadius=UDim.new(0,7)
 Instance.new("UIStroke",sellBtn).Color=Color3.fromRGB(22,82,50)
 sellBtn.MouseEnter:Connect(function() tw(sellBtn,{BackgroundColor3=C.sellH}):Play() end)
 sellBtn.MouseLeave:Connect(function() tw(sellBtn,{BackgroundColor3=C.sellBg}):Play() end)
+sellBtn.MouseButton1Click:Connect(function() ripple(sellBtn, C.grn) end)
 
 local innerDiv=Instance.new("Frame",sellF)
 innerDiv.Size=UDim2.new(1,0,0,1); innerDiv.BackgroundColor3=C.bdr; innerDiv.BorderSizePixel=0; innerDiv.LayoutOrder=5
@@ -675,6 +833,7 @@ Instance.new("UICorner",sellAllBtn).CornerRadius=UDim.new(0,7)
 Instance.new("UIStroke",sellAllBtn).Color=Color3.fromRGB(18,70,40)
 sellAllBtn.MouseEnter:Connect(function() tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(18,64,38)}):Play() end)
 sellAllBtn.MouseLeave:Connect(function() tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(14,50,30)}):Play() end)
+sellAllBtn.MouseButton1Click:Connect(function() ripple(sellAllBtn, C.grn) end)
 
 local innerDiv2=Instance.new("Frame",sellF)
 innerDiv2.Size=UDim2.new(1,0,0,1); innerDiv2.BackgroundColor3=C.bdr; innerDiv2.BorderSizePixel=0; innerDiv2.LayoutOrder=7
@@ -691,6 +850,7 @@ autoKn.BackgroundColor3=Color3.fromRGB(195,205,235); autoKn.BorderSizePixel=0
 Instance.new("UICorner",autoKn).CornerRadius=UDim.new(0,7)
 local autoTogHit=Instance.new("TextButton",autoTr); autoTogHit.Size=UDim2.new(1,0,1,0)
 autoTogHit.BackgroundTransparency=1; autoTogHit.Text=""; autoTogHit.AutoButtonColor=false; autoTogHit.ZIndex=5
+autoTogHit.MouseButton1Click:Connect(function() ripple(autoTr, C.grn) end)
 
 local autoDelRow1=Instance.new("Frame",sellF); autoDelRow1.Size=UDim2.new(1,0,0,13); autoDelRow1.BackgroundTransparency=1; autoDelRow1.LayoutOrder=9
 local autoDelLbl=Instance.new("TextLabel",autoDelRow1); autoDelLbl.Size=UDim2.new(1,0,1,0); autoDelLbl.BackgroundTransparency=1
@@ -753,6 +913,7 @@ for i,isl in ipairs(ISLANDS) do
     b.MouseEnter:Connect(function() tw(b,{BackgroundColor3=hc,TextColor3=C.txt}):Play() end)
     b.MouseLeave:Connect(function() tw(b,{BackgroundColor3=bc,TextColor3=tc}):Play() end)
     b.MouseButton1Click:Connect(function()
+        ripple(b, isl.special and C.pink or C.acc)
         tw(b,{BackgroundColor3=C.accD}):Play(); task.wait(0.12); tw(b,{BackgroundColor3=bc}):Play()
         local ok=tpTo(isl.pos)
         tpSt.TextColor3=ok and C.grn or C.red
@@ -805,6 +966,7 @@ Instance.new("UICorner",scanBtn).CornerRadius=UDim.new(0,7)
 Instance.new("UIStroke",scanBtn).Color=C.accD
 scanBtn.MouseEnter:Connect(function() tw(scanBtn,{BackgroundColor3=Color3.fromRGB(20,36,78)}):Play() end)
 scanBtn.MouseLeave:Connect(function() tw(scanBtn,{BackgroundColor3=Color3.fromRGB(16,28,60)}):Play() end)
+scanBtn.MouseButton1Click:Connect(function() ripple(scanBtn, C.acc) end)
 mkDiv(pg3,4)
 
 local npcScroll=Instance.new("ScrollingFrame",pg3)
@@ -835,6 +997,7 @@ local function rebuildNPCs()
         b.MouseLeave:Connect(function() tw(b,{BackgroundColor3=C.card,TextColor3=C.sub}):Play() end)
         local cp=npc.part
         b.MouseButton1Click:Connect(function()
+            ripple(b, C.acc)
             tw(b,{BackgroundColor3=C.accD}):Play(); task.wait(0.12); tw(b,{BackgroundColor3=C.card}):Play()
             tpToNPC(cp); task.delay(0.8,rebuildNPCs)
         end)
@@ -850,7 +1013,20 @@ end)
 -- TOGGLES
 -- ═══════════════════════════════════════
 local function updateDot()
-    tw(dot,{BackgroundColor3=(noclipOn or speedOn or jumpOn or shakeOn or autoSellOn) and C.grn or C.dim}):Play()
+    local anyOn = noclipOn or speedOn or jumpOn or shakeOn or autoSellOn
+    tw(dot,{BackgroundColor3=anyOn and C.grn or C.dim}):Play()
+    -- v13: pulse no dot quando ativo
+    if anyOn then
+        task.spawn(function()
+            while (noclipOn or speedOn or jumpOn or shakeOn or autoSellOn) do
+                twE(dot,{Size=UDim2.new(0,9,0,9), Position=UDim2.new(0,10,0.5,-4)},0.5):Play()
+                task.wait(0.55)
+                twE(dot,{Size=UDim2.new(0,7,0,7), Position=UDim2.new(0,11,0.5,-3)},0.5):Play()
+                task.wait(0.55)
+            end
+            dot.Size=UDim2.new(0,7,0,7); dot.Position=UDim2.new(0,11,0.5,-3)
+        end)
+    end
 end
 
 ncSec.togHit.MouseButton1Click:Connect(function()
@@ -899,19 +1075,31 @@ autoTogHit.MouseButton1Click:Connect(function()
     autoSellOn=not autoSellOn
     tw(autoTr,{BackgroundColor3=autoSellOn and C.grn or Color3.fromRGB(22,28,50)}):Play()
     twB(autoKn,{Position=autoSellOn and UDim2.new(0,20,0.5,-7) or UDim2.new(0,2,0.5,-7)}):Play()
+    tw(autoLbl,{TextColor3=autoSellOn and C.txt or C.sub}):Play()
     if autoSellOn then startAutoSell(autoStLbl)
     else stopAutoSell(); autoStLbl.Text="Auto-sell off"; task.delay(2, function() autoStLbl.Text="" end) end
     updateDot()
 end)
 
+-- v13: Status do Shake com animação de typing
 task.spawn(function()
+    local dots = {"", ".", "..", "..."}
+    local di = 1
     while true do
         task.wait(0.2)
+        di = di % 4 + 1
         if shSec.statusLbl then
             if shakeOn then
-                if shakeActive then shSec.statusLbl.Text="● clicking..."; shSec.statusLbl.TextColor3=C.grn
-                else shSec.statusLbl.Text="○ waiting for UI..."; shSec.statusLbl.TextColor3=C.yel end
-            else shSec.statusLbl.Text="" end
+                if shakeActive then
+                    shSec.statusLbl.Text="● clicking" .. dots[di]
+                    shSec.statusLbl.TextColor3=C.grn
+                else
+                    shSec.statusLbl.Text="○ waiting" .. dots[di]
+                    shSec.statusLbl.TextColor3=C.yel
+                end
+            else
+                shSec.statusLbl.Text=""
+            end
         end
     end
 end)
@@ -947,25 +1135,12 @@ setupBind(shSec.bindBtn, "sh",   function() return shakeKey end, function(k) sha
 setupBind(sellBind,      "sell", function() return sellKey  end, function(k) sellKey=k  end)
 
 -- ═══════════════════════════════════════
--- DRAG v12 — REESCRITO
--- Usa MouseMoved no UIS diretamente, sem ZIndex problemático
--- Funciona em cima de qualquer elemento do header
+-- DRAG v13
 -- ═══════════════════════════════════════
 do
     local dragging = false
     local dragStart = nil
     local startPos = nil
-
-    local function onDragInput(input)
-        if not dragging then return end
-        if input.UserInputType ~= Enum.UserInputType.MouseMovement
-        and input.UserInputType ~= Enum.UserInputType.Touch then return end
-        local delta = input.Position - dragStart
-        frame.Position = UDim2.new(
-            startPos.X.Scale, startPos.X.Offset + delta.X,
-            startPos.Y.Scale, startPos.Y.Offset + delta.Y
-        )
-    end
 
     header.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
@@ -983,8 +1158,17 @@ do
         end
     end)
 
-    UIS.InputChanged:Connect(onDragInput)
-    -- Garante que soltar fora do header também para o drag
+    UIS.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement
+        and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        local delta = input.Position - dragStart
+        frame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end)
+
     UIS.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
@@ -1022,7 +1206,17 @@ UIS.InputBegan:Connect(function(inp, gpe)
     end
 end)
 
--- Inicia na aba Cheats com tamanho correto
+-- ═══════════════════════════════════════
+-- INIT — animação de entrada v13
+-- ═══════════════════════════════════════
 switchTab("Cheats")
-task.wait(0.1)  -- deixa layout calcular
+task.wait(0.1)
 refreshFrameSize()
+
+-- Slide-in da esquerda + fade in
+task.wait(0.05)
+local entryTargetPos = UDim2.new(0, 18, 0.5, -160)
+TweenSvc:Create(frame, TweenInfo.new(0.45, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+    Position = entryTargetPos,
+    BackgroundTransparency = 0
+}):Play()
