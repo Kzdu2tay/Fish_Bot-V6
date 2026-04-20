@@ -201,21 +201,33 @@ end
 local function stopShake() shakeOn=false; shakeActive=false; if shakeThread then task.cancel(shakeThread); shakeThread=nil end end
 
 -- ═══════════════════════════════════════
--- 🎣 AUTO-REEL v15 — cliques humanizados
+-- 🎣 AUTO-REEL v16 — hold/release com força proporcional
 --
--- ESTRATÉGIA ANTI-BAN:
--- Em vez de segurar o mouse (muito óbvio para anti-cheat),
--- o reel usa rafagas de cliques curtos (press+release) com
--- timing variado (jitter aleatório), igual um jogador humano
--- que fica clicando rápido pra manter a barra em cima do peixe.
+-- MECÂNICA REAL DO FISCH:
+-- • Segurar mouse = aplica força → barra branca se move em direção ao peixe
+-- • Soltar mouse  = barra freia/oscila naturalmente
 --
--- LÓGICA:
--- 1. Encontra a reelUI e lê posição do playerbar e fishbar
--- 2. Se o peixe está MUITO longe da barra (>20% do tamanho) → clica rápido (intervalo ~55ms)
--- 3. Se peixe está perto (10-20%) → clica moderado (~90ms)
--- 4. Se peixe está na zona verde (<10%) → pausa (~120ms)
--- 5. Timing tem jitter ±15ms aleatório por clique
--- 6. Nunca passa de 18 cliques/segundo (threshold humano seguro)
+-- LÓGICA DE 3 ESTADOS:
+--
+-- 1. LONGE (peixe >30% fora da barra):
+--    → Segurar contínuo (hold longo ~180-250ms) com jitter
+--    → Força máxima pra alcançar o peixe rápido
+--
+-- 2. CHEGANDO (peixe 10-30% fora):
+--    → Pulsos: hold ~80-120ms, soltar ~35-55ms
+--    → Força moderada, evita ultrapassar
+--
+-- 3. DENTRO (peixe dentro da barra, <10%):
+--    → Pulsinhos curtos: hold ~40-65ms, soltar ~50-80ms
+--    → Só mantém posição, acompanha oscilação
+--    → Se a barra JÁ ESTÁ na frente do peixe (overshooting):
+--      simplesmente solta tudo por ~60-90ms
+--
+-- ANTI-BAN:
+-- • Jitter aleatório em TODOS os timings (±15-25ms)
+-- • Nunca é um padrão fixo
+-- • Usa VIM:SendMouseButtonEvent (mesmo que o sistema usa pro mouse real)
+-- • mouseDown é mantido em estado correto — nunca deixa "preso"
 -- ═══════════════════════════════════════
 local function findReelUI()
     for _,name in ipairs({"reelui","fishingrod","reelbar","Fishing","FishingBar","ReelUI","FishingUI"}) do
@@ -246,71 +258,104 @@ local function findReelElements(rGui)
     return playerbar, fishbar
 end
 
-local function doClick(x, y)
-    -- Press
-    pcall(function()
-        VIM:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, true, game, 0)
-    end)
-    -- Hold brevíssimo (3-8ms), parece humano
-    task.wait(0.003 + math.random()*0.005)
-    -- Release
-    pcall(function()
-        VIM:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, false, game, 0)
-    end)
+-- Estado global do mouse virtual (evita deixar preso)
+local _mouseHeld = false
+local function mousePress(x, y)
+    if _mouseHeld then return end
+    pcall(function() VIM:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, true, game, 0) end)
+    _mouseHeld = true
+end
+local function mouseRelease(x, y)
+    if not _mouseHeld then return end
+    pcall(function() VIM:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, false, game, 0) end)
+    _mouseHeld = false
+end
+local function forceRelease()
+    -- Garante soltar mesmo sem coordenada exata
+    pcall(function() VIM:SendMouseButtonEvent(0, 0, 0, false, game, 0) end)
+    _mouseHeld = false
 end
 
 local function startAutoReel()
     if autoReelThread then task.cancel(autoReelThread); autoReelThread=nil end
-    reelActive=false
+    reelActive = false
+    forceRelease()
 
-    autoReelThread=task.spawn(function()
+    autoReelThread = task.spawn(function()
         while autoReelOn do
-            local rGui=findReelUI()
+            local rGui = findReelUI()
             if not rGui then
-                reelActive=false
+                -- UI não aberta — garante mouse solto e aguarda
+                if _mouseHeld then forceRelease() end
+                reelActive = false
                 task.wait(0.1)
             else
-                local pb, fb=findReelElements(rGui)
+                local pb, fb = findReelElements(rGui)
                 if not pb or not fb then
-                    reelActive=false
+                    if _mouseHeld then forceRelease() end
+                    reelActive = false
                     task.wait(0.08)
                 else
-                    reelActive=true
+                    reelActive = true
 
-                    -- Centros absolutos
-                    local pCX = pb.AbsolutePosition.X + pb.AbsoluteSize.X*0.5
-                    local pCY = pb.AbsolutePosition.Y + pb.AbsoluteSize.Y*0.5
-                    local fCX = fb.AbsolutePosition.X + fb.AbsoluteSize.X*0.5
+                    -- Coordenada de clique: centro da playerbar
+                    local cx = pb.AbsolutePosition.X + pb.AbsoluteSize.X * 0.5
+                    local cy = pb.AbsolutePosition.Y + pb.AbsoluteSize.Y * 0.5
 
-                    -- Distância relativa ao tamanho da barra
-                    local barW   = pb.AbsoluteSize.X
-                    local diff   = math.abs(fCX - pCX)
-                    local ratio  = diff / math.max(barW, 1)
+                    -- Borda esquerda e direita da playerbar
+                    local pbL = pb.AbsolutePosition.X
+                    local pbR = pb.AbsolutePosition.X + pb.AbsoluteSize.X
 
-                    -- Zona verde = peixe dentro de 10% → pausa, não clica
-                    if ratio < 0.10 then
-                        task.wait(0.10 + rnd(0,0.02))
+                    -- Centro do peixe
+                    local fCX = fb.AbsolutePosition.X + fb.AbsoluteSize.X * 0.5
 
-                    -- Zona amarela = 10~22% → clique moderado
-                    elseif ratio < 0.22 then
-                        doClick(pCX, pCY)
-                        task.wait(0.085 + rnd(-0.015, 0.015))
+                    -- O peixe está dentro da barra?
+                    local fishInside = fCX >= pbL and fCX <= pbR
 
-                    -- Zona vermelha = >22% → clique rápido
+                    -- Distância do centro da barra ao peixe, relativa ao tamanho da barra
+                    local barW = math.max(pb.AbsoluteSize.X, 1)
+                    local dist = math.abs(fCX - (pbL + barW*0.5))
+                    local ratio = dist / barW
+
+                    if fishInside then
+                        -- ── ESTADO 3: PEIXE DENTRO DA BARRA ──
+                        -- Pulsinhos curtos pra acompanhar oscilação sem ultrapassar
+                        -- Hold curto → força suave
+                        mousePress(cx, cy)
+                        task.wait(0.042 + rnd(-0.008, 0.018))
+                        mouseRelease(cx, cy)
+                        task.wait(0.055 + rnd(-0.010, 0.025))
+
+                    elseif ratio < 0.30 then
+                        -- ── ESTADO 2: CHEGANDO (10-30% fora) ──
+                        -- Pulsos médios — força moderada, evita overshooting
+                        mousePress(cx, cy)
+                        task.wait(0.095 + rnd(-0.015, 0.025))
+                        mouseRelease(cx, cy)
+                        task.wait(0.040 + rnd(-0.008, 0.018))
+
                     else
-                        doClick(pCX, pCY)
-                        task.wait(0.055 + rnd(-0.010, 0.015))
+                        -- ── ESTADO 1: LONGE (>30% fora) ──
+                        -- Hold longo contínuo — força máxima pra alcançar
+                        mousePress(cx, cy)
+                        task.wait(0.200 + rnd(-0.020, 0.050))
+                        mouseRelease(cx, cy)
+                        task.wait(0.025 + rnd(0, 0.015))
                     end
                 end
             end
         end
-        reelActive=false
+
+        -- Desligou — garante mouse solto
+        forceRelease()
+        reelActive = false
     end)
 end
 
 local function stopAutoReel()
-    autoReelOn=false; reelActive=false
-    if autoReelThread then task.cancel(autoReelThread); autoReelThread=nil end
+    autoReelOn = false; reelActive = false
+    forceRelease()
+    if autoReelThread then task.cancel(autoReelThread); autoReelThread = nil end
 end
 
 -- ═══════════════════════════════════════
@@ -505,7 +550,7 @@ Instance.new("UICorner",dot).CornerRadius=UDim.new(1,0)
 
 local htitle=Instance.new("TextLabel",header)
 htitle.Size=UDim2.new(1,-60,1,0); htitle.Position=UDim2.new(0,24,0,0)
-htitle.BackgroundTransparency=1; htitle.Text="⚙  UTILITY  v15"
+htitle.BackgroundTransparency=1; htitle.Text="⚙  UTILITY  v16"
 htitle.TextColor3=C.txt; htitle.Font=Enum.Font.GothamBlack; htitle.TextSize=11
 htitle.TextXAlignment=Enum.TextXAlignment.Left; htitle.ZIndex=4
 
