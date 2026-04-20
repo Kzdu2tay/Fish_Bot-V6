@@ -1,13 +1,14 @@
 --[[
-    UTILITY v11 — Fisch (bug fixes)
+    UTILITY v12 — Fisch
     V = hide/show  |  Drag by header
-    100% client-side, no prints
+    100% client-side
 
-    v11 FIXES:
-    • Shake não trava mais (throttle 100ms + task.wait maior)
-    • Speed não para ao mudar direção (re-aplica via Heartbeat)
-    • Noclip não faz bater invisível (Stepped + Accessories)
-    • V não buga GUI (debounce com tracking de animação)
+    v12 FIXES vs v11:
+    • V fecha/abre corretamente (sem espaço preto)
+    • Drag funciona (reescrito com UserInputService direto)
+    • ClipsDescendants removido do frame raiz (causava o preto)
+    • AutomaticSize não conflita mais com Size ao fechar
+    • Frame colapsa para 36px de altura limpa ao fechar
 ]]
 
 local Players  = game:GetService("Players")
@@ -36,7 +37,7 @@ local npcRange   = 150
 local listening  = nil
 local currentTab = "Cheats"
 local guiVisible = true
-local vAnimating = false
+local vDebounce  = false
 
 -- ═══════════════════════════════════════
 -- ISLANDS
@@ -75,23 +76,17 @@ local function hrp()  local c=chr(); return c and c:FindFirstChild("HumanoidRoot
 local function tool() local c=chr(); return c and c:FindFirstChildOfClass("Tool") end
 
 -- ═══════════════════════════════════════
--- NOCLIP v11 FIX
--- Troca PreSimulation → Stepped (roda depois da física)
--- Inclui Accessories (handles batem em coisas)
+-- NOCLIP
 -- ═══════════════════════════════════════
 local function setNoclip(v)
     noclipOn = v
     if noclipConn then noclipConn:Disconnect(); noclipConn=nil end
-
     if v then
         noclipConn = RunSvc.Stepped:Connect(function()
             local c = chr(); if not c then return end
             for _,p in ipairs(c:GetDescendants()) do
-                if p:IsA("BasePart") then
-                    p.CanCollide = false
-                end
+                if p:IsA("BasePart") then p.CanCollide = false end
             end
-            -- Accessories (chapéus, cabelo, etc)
             for _,acc in ipairs(c:GetChildren()) do
                 if acc:IsA("Accessory") then
                     local h = acc:FindFirstChild("Handle")
@@ -112,13 +107,11 @@ local function setNoclip(v)
 end
 
 -- ═══════════════════════════════════════
--- SPEED v11 FIX
--- Re-aplica TODO frame — se o jogo resetar, recupera na hora
+-- SPEED
 -- ═══════════════════════════════════════
 local function applySpeedOnce()
     local h = hum(); if h then h.WalkSpeed = speedOn and speedVal or 16 end
 end
-
 local function startSpeedLoop()
     if speedConn then speedConn:Disconnect(); speedConn=nil end
     speedConn = RunSvc.Heartbeat:Connect(function()
@@ -127,14 +120,13 @@ local function startSpeedLoop()
         if h and h.WalkSpeed ~= speedVal then h.WalkSpeed = speedVal end
     end)
 end
-
 local function stopSpeedLoop()
     if speedConn then speedConn:Disconnect(); speedConn=nil end
     local h = hum(); if h then h.WalkSpeed = 16 end
 end
 
 -- ═══════════════════════════════════════
--- JUMP (mesma proteção)
+-- JUMP
 -- ═══════════════════════════════════════
 local function startJumpLoop()
     if jumpConn then jumpConn:Disconnect(); jumpConn=nil end
@@ -147,12 +139,10 @@ local function startJumpLoop()
         end
     end)
 end
-
 local function stopJumpLoop()
     if jumpConn then jumpConn:Disconnect(); jumpConn=nil end
     local h = hum(); if h then h.JumpPower = 50 end
 end
-
 local function startReJump()
     if reJumpConn then reJumpConn:Disconnect(); reJumpConn=nil end
     reJumpConn = RunSvc.Heartbeat:Connect(function()
@@ -166,10 +156,7 @@ end
 local function stopReJump() if reJumpConn then reJumpConn:Disconnect(); reJumpConn=nil end end
 
 -- ═══════════════════════════════════════
--- SHAKE v11 FIX — não trava mais
--- Throttle de 100ms entre cliques
--- task.wait de 0.1 (em vez de 0.035) evita saturar o loop
--- pcall pra não crashar se o botão sumir
+-- SHAKE
 -- ═══════════════════════════════════════
 local function getShakeButton()
     local sui = PG:FindFirstChild("shakeui")
@@ -177,12 +164,9 @@ local function getShakeButton()
     local sz = sui:FindFirstChild("safezone")
     if not sz or not sz.Visible then return nil end
     local btn = sz:FindFirstChild("button")
-    if btn and btn:IsA("GuiButton") and btn.Visible and btn.Active then
-        return btn
-    end
+    if btn and btn:IsA("GuiButton") and btn.Visible and btn.Active then return btn end
     return nil
 end
-
 local function startShake()
     if shakeThread then task.cancel(shakeThread); shakeThread=nil end
     shakeThread = task.spawn(function()
@@ -205,7 +189,6 @@ local function startShake()
         shakeActive = false
     end)
 end
-
 local function stopShake()
     shakeOn=false; shakeActive=false
     if shakeThread then task.cancel(shakeThread); shakeThread=nil end
@@ -249,13 +232,11 @@ local function trySellTool(t)
     pcall(function() t:Activate() end)
     return false, "no_method"
 end
-
 local function sellFromHand()
     local t=tool()
     if not t then return false,"No item in hand" end
     return trySellTool(t)
 end
-
 local function sellAll()
     local sold, failed = 0, 0
     local bp = LP:FindFirstChild("Backpack")
@@ -270,7 +251,6 @@ local function sellAll()
     if sold==0 and failed==0 then return false,"Inventory empty" end
     return true, "Sold "..sold..(failed>0 and " | Failed "..failed or "")
 end
-
 local function startAutoSell(statusLbl)
     if autoSellThread then task.cancel(autoSellThread); autoSellThread=nil end
     autoSellThread = task.spawn(function()
@@ -285,20 +265,18 @@ local function startAutoSell(statusLbl)
         if statusLbl then statusLbl.Text = "Auto-sell off" end
     end)
 end
-
 local function stopAutoSell()
     autoSellOn = false
     if autoSellThread then task.cancel(autoSellThread); autoSellThread=nil end
 end
 
 -- ═══════════════════════════════════════
--- TP
+-- TP / NPC
 -- ═══════════════════════════════════════
 local function tpTo(pos)
     local r=hrp(); if not r then return false end
     r.CFrame=CFrame.new(pos+Vector3.new(0,5,0)); return true
 end
-
 local function getNearby()
     local r=hrp(); if not r then return {} end
     local found={}
@@ -315,13 +293,11 @@ local function getNearby()
     table.sort(found,function(a,b) return a.dist<b.dist end)
     return found
 end
-
 local function tpToNPC(part)
     local r=hrp(); if not r then return end
     r.CFrame=CFrame.new((part.CFrame*CFrame.new(0,0,-3.5)).Position+Vector3.new(0,3,0))
 end
 
--- v11: re-aplica tudo no respawn
 LP.CharacterAdded:Connect(function()
     task.wait(0.5)
     if noclipOn then setNoclip(true) end
@@ -331,7 +307,7 @@ LP.CharacterAdded:Connect(function()
 end)
 
 -- ═══════════════════════════════════════
--- GUI
+-- GUI SETUP
 -- ═══════════════════════════════════════
 pcall(function()
     for _,n in ipairs({"UtilityGui","NoclipGui"}) do
@@ -356,103 +332,175 @@ local C={
 local function tw(o,p,d) return TweenSvc:Create(o,TweenInfo.new(d or 0.15,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),p) end
 local function twB(o,p)  return TweenSvc:Create(o,TweenInfo.new(0.22,Enum.EasingStyle.Back,Enum.EasingDirection.Out),p) end
 
-local frame=Instance.new("Frame",gui)
-frame.Size=UDim2.new(0,212,0,36)
-frame.Position=UDim2.new(0,18,0.5,-160)
-frame.BackgroundColor3=C.bg; frame.BorderSizePixel=0
-frame.ClipsDescendants=true
-Instance.new("UICorner",frame).CornerRadius=UDim.new(0,12)
-local fBdr=Instance.new("UIStroke",frame); fBdr.Color=C.bdr; fBdr.Thickness=1.5
-local rootLy=Instance.new("UIListLayout",frame)
-rootLy.SortOrder=Enum.SortOrder.LayoutOrder; rootLy.Padding=UDim.new(0,0)
+-- ═══════════════════════════════════════
+-- FRAME PRINCIPAL — SEM ClipsDescendants
+-- Tamanho fixo, controlado manualmente
+-- ═══════════════════════════════════════
+local FRAME_W = 212
+local HEADER_H = 36
+local frameHeight = HEADER_H  -- será atualizado ao abrir
 
-local function mkDiv(p,order)
-    local d=Instance.new("Frame",p); d.Size=UDim2.new(1,0,0,1)
-    d.BackgroundColor3=C.bdr; d.BorderSizePixel=0; d.LayoutOrder=order
+local frame = Instance.new("Frame", gui)
+frame.Size = UDim2.new(0, FRAME_W, 0, HEADER_H)
+frame.Position = UDim2.new(0, 18, 0.5, -160)
+frame.BackgroundColor3 = C.bg
+frame.BorderSizePixel = 0
+frame.ClipsDescendants = false  -- NÃO usar ClipsDescendants (causava o espaço preto)
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 12)
+local fBdr = Instance.new("UIStroke", frame); fBdr.Color = C.bdr; fBdr.Thickness = 1.5
+
+-- Holder interno (esconde conteúdo sem afetar o frame pai)
+local contentHolder = Instance.new("Frame", frame)
+contentHolder.Size = UDim2.new(1, 0, 0, 9999)
+contentHolder.Position = UDim2.new(0, 0, 0, HEADER_H)
+contentHolder.BackgroundTransparency = 1
+contentHolder.BorderSizePixel = 0
+contentHolder.ClipsDescendants = false
+
+local rootLy = Instance.new("UIListLayout", contentHolder)
+rootLy.SortOrder = Enum.SortOrder.LayoutOrder
+rootLy.Padding = UDim.new(0, 0)
+
+local function mkDiv(p, order)
+    local d = Instance.new("Frame", p); d.Size = UDim2.new(1, 0, 0, 1)
+    d.BackgroundColor3 = C.bdr; d.BorderSizePixel = 0; d.LayoutOrder = order
 end
-local function pad(p,l,r,t,b)
-    local u=Instance.new("UIPadding",p)
-    u.PaddingLeft=UDim.new(0,l or 10); u.PaddingRight=UDim.new(0,r or 10)
-    u.PaddingTop=UDim.new(0,t or 6);   u.PaddingBottom=UDim.new(0,b or 6)
+local function pad(p, l, r, t, b)
+    local u = Instance.new("UIPadding", p)
+    u.PaddingLeft = UDim.new(0, l or 10); u.PaddingRight = UDim.new(0, r or 10)
+    u.PaddingTop = UDim.new(0, t or 6);   u.PaddingBottom = UDim.new(0, b or 6)
 end
 
 -- HEADER
-local header=Instance.new("Frame",frame)
-header.Size=UDim2.new(1,0,0,36); header.BackgroundColor3=C.panel
-header.BorderSizePixel=0; header.LayoutOrder=0
-local hGrad=Instance.new("UIGradient",header)
-hGrad.Color=ColorSequence.new({
-    ColorSequenceKeypoint.new(0,Color3.fromRGB(16,22,52)),
-    ColorSequenceKeypoint.new(1,Color3.fromRGB(8,10,18))
-}); hGrad.Rotation=90
+local header = Instance.new("Frame", frame)
+header.Size = UDim2.new(1, 0, 0, HEADER_H)
+header.Position = UDim2.new(0, 0, 0, 0)
+header.BackgroundColor3 = C.panel
+header.BorderSizePixel = 0
+header.ZIndex = 10
+local hGrad = Instance.new("UIGradient", header)
+hGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(16,22,52)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(8,10,18))
+}); hGrad.Rotation = 90
+Instance.new("UICorner", header).CornerRadius = UDim.new(0, 12)
 
-local dot=Instance.new("Frame",header)
-dot.Size=UDim2.new(0,7,0,7); dot.Position=UDim2.new(0,11,0.5,-3)
-dot.BackgroundColor3=C.dim; dot.BorderSizePixel=0
-Instance.new("UICorner",dot).CornerRadius=UDim.new(1,0)
+local dot = Instance.new("Frame", header)
+dot.Size = UDim2.new(0, 7, 0, 7); dot.Position = UDim2.new(0, 11, 0.5, -3)
+dot.BackgroundColor3 = C.dim; dot.BorderSizePixel = 0; dot.ZIndex = 11
+Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
 
-local htitle=Instance.new("TextLabel",header)
-htitle.Size=UDim2.new(1,-60,1,0); htitle.Position=UDim2.new(0,24,0,0)
-htitle.BackgroundTransparency=1; htitle.Text="⚙  UTILITY  v11"
-htitle.TextColor3=C.txt; htitle.Font=Enum.Font.GothamBlack; htitle.TextSize=11
-htitle.TextXAlignment=Enum.TextXAlignment.Left
+local htitle = Instance.new("TextLabel", header)
+htitle.Size = UDim2.new(1, -60, 1, 0); htitle.Position = UDim2.new(0, 24, 0, 0)
+htitle.BackgroundTransparency = 1; htitle.Text = "⚙  UTILITY  v12"
+htitle.TextColor3 = C.txt; htitle.Font = Enum.Font.GothamBlack; htitle.TextSize = 11
+htitle.TextXAlignment = Enum.TextXAlignment.Left; htitle.ZIndex = 11
 
-local vHint=Instance.new("TextLabel",header)
-vHint.Size=UDim2.new(0,20,0,14); vHint.Position=UDim2.new(1,-26,0.5,-7)
-vHint.BackgroundColor3=Color3.fromRGB(20,26,50); vHint.BorderSizePixel=0
-vHint.Text="V"; vHint.TextColor3=C.dim; vHint.Font=Enum.Font.GothamBold; vHint.TextSize=8
-vHint.TextXAlignment=Enum.TextXAlignment.Center
-Instance.new("UICorner",vHint).CornerRadius=UDim.new(0,4)
+local vHint = Instance.new("TextLabel", header)
+vHint.Size = UDim2.new(0, 20, 0, 14); vHint.Position = UDim2.new(1, -26, 0.5, -7)
+vHint.BackgroundColor3 = Color3.fromRGB(20, 26, 50); vHint.BorderSizePixel = 0
+vHint.Text = "V"; vHint.TextColor3 = C.dim; vHint.Font = Enum.Font.GothamBold; vHint.TextSize = 8
+vHint.TextXAlignment = Enum.TextXAlignment.Center; vHint.ZIndex = 11
+Instance.new("UICorner", vHint).CornerRadius = UDim.new(0, 4)
 
--- TABS
-local tabBar=Instance.new("Frame",frame)
-tabBar.Size=UDim2.new(1,0,0,30); tabBar.BackgroundColor3=C.panel
-tabBar.BorderSizePixel=0; tabBar.LayoutOrder=1
-pad(tabBar,6,6,5,5)
-local tabLy=Instance.new("UIListLayout",tabBar)
-tabLy.FillDirection=Enum.FillDirection.Horizontal
-tabLy.SortOrder=Enum.SortOrder.LayoutOrder; tabLy.Padding=UDim.new(0,3)
+-- TABS (dentro do contentHolder)
+local tabBar = Instance.new("Frame", contentHolder)
+tabBar.Size = UDim2.new(1, 0, 0, 30)
+tabBar.BackgroundColor3 = C.panel; tabBar.BorderSizePixel = 0; tabBar.LayoutOrder = 1
+pad(tabBar, 6, 6, 5, 5)
+local tabLy = Instance.new("UIListLayout", tabBar)
+tabLy.FillDirection = Enum.FillDirection.Horizontal
+tabLy.SortOrder = Enum.SortOrder.LayoutOrder; tabLy.Padding = UDim.new(0, 3)
 
-local tabBtns={}; local tabPages={}
+local tabBtns = {}; local tabPages = {}
 
-local function mkTab(name,icon,order)
-    local b=Instance.new("TextButton",tabBar)
-    b.Size=UDim2.new(0.333,-2,1,0); b.BackgroundColor3=C.card
-    b.BorderSizePixel=0; b.Text=icon.." "..name
-    b.TextColor3=C.dim; b.Font=Enum.Font.GothamBold; b.TextSize=8
-    b.AutoButtonColor=false; b.LayoutOrder=order
-    Instance.new("UICorner",b).CornerRadius=UDim.new(0,6)
-    tabBtns[name]=b; return b
+local function mkTab(name, icon, order)
+    local b = Instance.new("TextButton", tabBar)
+    b.Size = UDim2.new(0.333, -2, 1, 0); b.BackgroundColor3 = C.card
+    b.BorderSizePixel = 0; b.Text = icon.." "..name
+    b.TextColor3 = C.dim; b.Font = Enum.Font.GothamBold; b.TextSize = 8
+    b.AutoButtonColor = false; b.LayoutOrder = order
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    tabBtns[name] = b; return b
 end
+
 local function mkPage(order)
-    local pg=Instance.new("Frame",frame)
-    pg.Size=UDim2.new(1,0,0,0); pg.AutomaticSize=Enum.AutomaticSize.Y
-    pg.BackgroundTransparency=1; pg.BorderSizePixel=0
-    pg.LayoutOrder=order; pg.Visible=false
-    local ly=Instance.new("UIListLayout",pg)
-    ly.SortOrder=Enum.SortOrder.LayoutOrder; ly.Padding=UDim.new(0,0)
+    local pg = Instance.new("Frame", contentHolder)
+    pg.Size = UDim2.new(1, 0, 0, 0); pg.AutomaticSize = Enum.AutomaticSize.Y
+    pg.BackgroundTransparency = 1; pg.BorderSizePixel = 0
+    pg.LayoutOrder = order; pg.Visible = false
+    local ly = Instance.new("UIListLayout", pg)
+    ly.SortOrder = Enum.SortOrder.LayoutOrder; ly.Padding = UDim.new(0, 0)
     return pg
 end
 
-mkTab("Cheats","🎮",1); mkTab("TP","🗺",2); mkTab("NPCs","🧑",3)
-mkDiv(frame,2)
-tabPages["Cheats"]=mkPage(3); tabPages["TP"]=mkPage(4); tabPages["NPCs"]=mkPage(5)
+mkTab("Cheats", "🎮", 1); mkTab("TP", "🗺", 2); mkTab("NPCs", "🧑", 3)
+mkDiv(contentHolder, 2)
+tabPages["Cheats"] = mkPage(3); tabPages["TP"] = mkPage(4); tabPages["NPCs"] = mkPage(5)
 
-local function switchTab(name)
-    currentTab=name
-    for n,pg in pairs(tabPages) do pg.Visible=(n==name) end
-    for n,b in pairs(tabBtns) do
-        tw(b,{BackgroundColor3=(n==name) and C.acc or C.card,TextColor3=(n==name) and C.bg or C.dim}):Play()
-    end
-    if guiVisible then frame.AutomaticSize=Enum.AutomaticSize.Y end
+-- ═══════════════════════════════════════
+-- VISIBILIDADE v12 — CORRIGIDA
+-- Usa Size fixo, sem AutomaticSize no frame raiz
+-- Mede conteúdo via AbsoluteContentSize do UIListLayout
+-- ═══════════════════════════════════════
+local function getContentHeight()
+    -- Aguarda um frame para o layout calcular
+    return rootLy.AbsoluteContentSize.Y
 end
 
-for name,b in pairs(tabBtns) do
+local function setVisible(v)
+    if vDebounce then return end
+    if guiVisible == v then return end
+    vDebounce = true
+    guiVisible = v
+
+    if v then
+        -- Mostra conteúdo ANTES de animar
+        contentHolder.Visible = true
+        task.wait()  -- 1 frame para layout recalcular
+        local targetH = HEADER_H + getContentHeight()
+        tw(frame, {Size=UDim2.new(0, FRAME_W, 0, targetH)}, 0.2):Play()
+        tw(vHint, {TextColor3=C.dim}, 0.15):Play()
+        task.delay(0.22, function() vDebounce = false end)
+    else
+        -- Anima PRIMEIRO, depois esconde
+        local shrink = tw(frame, {Size=UDim2.new(0, FRAME_W, 0, HEADER_H)}, 0.18)
+        shrink:Play()
+        tw(vHint, {TextColor3=C.acc}, 0.15):Play()
+        shrink.Completed:Connect(function()
+            if not guiVisible then
+                contentHolder.Visible = false
+            end
+            task.delay(0.05, function() vDebounce = false end)
+        end)
+    end
+end
+
+-- Atualiza o tamanho do frame quando o conteúdo muda (troca de aba, etc.)
+local function refreshFrameSize()
+    if not guiVisible then return end
+    task.wait()
+    local targetH = HEADER_H + getContentHeight()
+    frame.Size = UDim2.new(0, FRAME_W, 0, targetH)
+end
+
+local function switchTab(name)
+    currentTab = name
+    for n, pg in pairs(tabPages) do pg.Visible = (n == name) end
+    for n, b in pairs(tabBtns) do
+        tw(b, {BackgroundColor3=(n==name) and C.acc or C.card, TextColor3=(n==name) and C.bg or C.dim}):Play()
+    end
+    refreshFrameSize()
+end
+
+for name, b in pairs(tabBtns) do
     b.MouseButton1Click:Connect(function() switchTab(name) end)
 end
 
+-- ═══════════════════════════════════════
 -- SECTION BUILDER
-local BLOCKED={
+-- ═══════════════════════════════════════
+local BLOCKED = {
     [Enum.KeyCode.Return]=true,[Enum.KeyCode.Escape]=true,
     [Enum.KeyCode.Tab]=true,[Enum.KeyCode.Backspace]=true,
     [Enum.KeyCode.LeftShift]=true,[Enum.KeyCode.RightShift]=true,
@@ -462,67 +510,67 @@ local BLOCKED={
 }
 
 local function mkSection(parent, cfg)
-    local sec=Instance.new("Frame",parent)
-    sec.Size=UDim2.new(1,0,0,0); sec.AutomaticSize=Enum.AutomaticSize.Y
-    sec.BackgroundColor3=C.card; sec.BorderSizePixel=0; sec.LayoutOrder=cfg.order
-    local u=Instance.new("UIPadding",sec)
+    local sec = Instance.new("Frame", parent)
+    sec.Size = UDim2.new(1, 0, 0, 0); sec.AutomaticSize = Enum.AutomaticSize.Y
+    sec.BackgroundColor3 = C.card; sec.BorderSizePixel = 0; sec.LayoutOrder = cfg.order
+    local u = Instance.new("UIPadding", sec)
     u.PaddingLeft=UDim.new(0,10); u.PaddingRight=UDim.new(0,10)
     u.PaddingTop=UDim.new(0,7);   u.PaddingBottom=UDim.new(0,7)
-    local ly=Instance.new("UIListLayout",sec)
-    ly.SortOrder=Enum.SortOrder.LayoutOrder; ly.Padding=UDim.new(0,5)
+    local ly = Instance.new("UIListLayout", sec)
+    ly.SortOrder = Enum.SortOrder.LayoutOrder; ly.Padding = UDim.new(0, 5)
 
-    local r1=Instance.new("Frame",sec); r1.Size=UDim2.new(1,0,0,20); r1.BackgroundTransparency=1; r1.LayoutOrder=1
-    local lbl=Instance.new("TextLabel",r1); lbl.Size=UDim2.new(1,-52,1,0); lbl.BackgroundTransparency=1
+    local r1 = Instance.new("Frame", sec); r1.Size=UDim2.new(1,0,0,20); r1.BackgroundTransparency=1; r1.LayoutOrder=1
+    local lbl = Instance.new("TextLabel", r1); lbl.Size=UDim2.new(1,-52,1,0); lbl.BackgroundTransparency=1
     lbl.Text=cfg.icon.."  "..cfg.label; lbl.TextColor3=C.sub
     lbl.Font=Enum.Font.GothamBold; lbl.TextSize=10; lbl.TextXAlignment=Enum.TextXAlignment.Left
-    local tr=Instance.new("Frame",r1); tr.Size=UDim2.new(0,36,0,18); tr.Position=UDim2.new(1,-36,0.5,-9)
+    local tr = Instance.new("Frame", r1); tr.Size=UDim2.new(0,36,0,18); tr.Position=UDim2.new(1,-36,0.5,-9)
     tr.BackgroundColor3=Color3.fromRGB(22,28,50); tr.BorderSizePixel=0
     Instance.new("UICorner",tr).CornerRadius=UDim.new(0,9)
     Instance.new("UIStroke",tr).Color=C.bdr
-    local kn=Instance.new("Frame",tr); kn.Size=UDim2.new(0,14,0,14); kn.Position=UDim2.new(0,2,0.5,-7)
+    local kn = Instance.new("Frame", tr); kn.Size=UDim2.new(0,14,0,14); kn.Position=UDim2.new(0,2,0.5,-7)
     kn.BackgroundColor3=Color3.fromRGB(195,205,235); kn.BorderSizePixel=0
     Instance.new("UICorner",kn).CornerRadius=UDim.new(0,7)
-    local togHit=Instance.new("TextButton",tr); togHit.Size=UDim2.new(1,0,1,0)
+    local togHit = Instance.new("TextButton", tr); togHit.Size=UDim2.new(1,0,1,0)
     togHit.BackgroundTransparency=1; togHit.Text=""; togHit.AutoButtonColor=false; togHit.ZIndex=5
 
-    local r2=Instance.new("Frame",sec); r2.Size=UDim2.new(1,0,0,20); r2.BackgroundTransparency=1; r2.LayoutOrder=2
-    local kl=Instance.new("TextLabel",r2); kl.Size=UDim2.new(0,38,1,0); kl.BackgroundTransparency=1
+    local r2 = Instance.new("Frame", sec); r2.Size=UDim2.new(1,0,0,20); r2.BackgroundTransparency=1; r2.LayoutOrder=2
+    local kl = Instance.new("TextLabel", r2); kl.Size=UDim2.new(0,38,1,0); kl.BackgroundTransparency=1
     kl.Text="Key:"; kl.TextColor3=C.dim; kl.Font=Enum.Font.Gotham; kl.TextSize=8; kl.TextXAlignment=Enum.TextXAlignment.Left
-    local bindB=Instance.new("TextButton",r2); bindB.Size=UDim2.new(0,64,0,18); bindB.Position=UDim2.new(0,40,0.5,-9)
+    local bindB = Instance.new("TextButton", r2); bindB.Size=UDim2.new(0,64,0,18); bindB.Position=UDim2.new(0,40,0.5,-9)
     bindB.BackgroundColor3=Color3.fromRGB(18,22,44); bindB.BorderSizePixel=0
     bindB.Text=cfg.keyName; bindB.TextColor3=C.acc
     bindB.Font=Enum.Font.GothamBold; bindB.TextSize=9; bindB.AutoButtonColor=false
     Instance.new("UICorner",bindB).CornerRadius=UDim.new(0,5)
     Instance.new("UIStroke",bindB).Color=C.accD
 
-    local statusLbl=nil
+    local statusLbl = nil
     if cfg.showStatus then
-        local rs=Instance.new("Frame",sec); rs.Size=UDim2.new(1,0,0,12); rs.BackgroundTransparency=1; rs.LayoutOrder=2.5
-        statusLbl=Instance.new("TextLabel",rs); statusLbl.Size=UDim2.new(1,0,1,0)
+        local rs = Instance.new("Frame", sec); rs.Size=UDim2.new(1,0,0,12); rs.BackgroundTransparency=1; rs.LayoutOrder=2.5
+        statusLbl = Instance.new("TextLabel", rs); statusLbl.Size=UDim2.new(1,0,1,0)
         statusLbl.BackgroundTransparency=1; statusLbl.Text=""
         statusLbl.TextColor3=C.dim; statusLbl.Font=Enum.Font.Code; statusLbl.TextSize=8
         statusLbl.TextXAlignment=Enum.TextXAlignment.Left
     end
 
     if cfg.slider then
-        local s=cfg.slider
-        local rs1=Instance.new("Frame",sec); rs1.Size=UDim2.new(1,0,0,13); rs1.BackgroundTransparency=1; rs1.LayoutOrder=3
-        local vl=Instance.new("TextLabel",rs1); vl.Size=UDim2.new(1,0,1,0); vl.BackgroundTransparency=1
+        local s = cfg.slider
+        local rs1 = Instance.new("Frame", sec); rs1.Size=UDim2.new(1,0,0,13); rs1.BackgroundTransparency=1; rs1.LayoutOrder=3
+        local vl = Instance.new("TextLabel", rs1); vl.Size=UDim2.new(1,0,1,0); vl.BackgroundTransparency=1
         vl.Text=s.label..": "..s.def; vl.TextColor3=C.acc; vl.Font=Enum.Font.GothamBold; vl.TextSize=8; vl.TextXAlignment=Enum.TextXAlignment.Left
-        local rs2=Instance.new("Frame",sec); rs2.Size=UDim2.new(1,0,0,14); rs2.BackgroundTransparency=1; rs2.LayoutOrder=4
-        local sbg=Instance.new("Frame",rs2); sbg.Size=UDim2.new(1,0,0,4); sbg.Position=UDim2.new(0,0,0.5,-2)
+        local rs2 = Instance.new("Frame", sec); rs2.Size=UDim2.new(1,0,0,14); rs2.BackgroundTransparency=1; rs2.LayoutOrder=4
+        local sbg = Instance.new("Frame", rs2); sbg.Size=UDim2.new(1,0,0,4); sbg.Position=UDim2.new(0,0,0.5,-2)
         sbg.BackgroundColor3=Color3.fromRGB(20,25,45); sbg.BorderSizePixel=0
         Instance.new("UICorner",sbg).CornerRadius=UDim.new(0,2)
-        local pct0=(s.def-s.min)/(s.max-s.min)
-        local fill=Instance.new("Frame",sbg); fill.Size=UDim2.new(pct0,0,1,0)
+        local pct0 = (s.def-s.min)/(s.max-s.min)
+        local fill = Instance.new("Frame", sbg); fill.Size=UDim2.new(pct0,0,1,0)
         fill.BackgroundColor3=C.acc; fill.BorderSizePixel=0
         Instance.new("UICorner",fill).CornerRadius=UDim.new(0,2)
-        local sk=Instance.new("Frame",sbg); sk.Size=UDim2.new(0,11,0,11); sk.AnchorPoint=Vector2.new(0.5,0.5)
+        local sk = Instance.new("Frame", sbg); sk.Size=UDim2.new(0,11,0,11); sk.AnchorPoint=Vector2.new(0.5,0.5)
         sk.Position=UDim2.new(pct0,0,0.5,0); sk.BackgroundColor3=Color3.fromRGB(255,255,255); sk.BorderSizePixel=0; sk.ZIndex=3
         Instance.new("UICorner",sk).CornerRadius=UDim.new(0,6)
-        local sHit=Instance.new("TextButton",sbg); sHit.Size=UDim2.new(1,0,0,20); sHit.Position=UDim2.new(0,0,0.5,-10)
+        local sHit = Instance.new("TextButton", sbg); sHit.Size=UDim2.new(1,0,0,20); sHit.Position=UDim2.new(0,0,0.5,-10)
         sHit.BackgroundTransparency=1; sHit.Text=""; sHit.AutoButtonColor=false; sHit.ZIndex=4
-        local drag=false
+        local drag = false
         sHit.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=true end end)
         sHit.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=false end end)
         UIS.InputChanged:Connect(function(i)
@@ -534,10 +582,10 @@ local function mkSection(parent, cfg)
         end)
     end
 
-    local rjTr,rjKn,rjTogHit
+    local rjTr, rjKn, rjTogHit
     if cfg.rejump then
-        local rr=Instance.new("Frame",sec); rr.Size=UDim2.new(1,0,0,18); rr.BackgroundTransparency=1; rr.LayoutOrder=5
-        local rl=Instance.new("TextLabel",rr); rl.Size=UDim2.new(1,-52,1,0); rl.BackgroundTransparency=1
+        local rr = Instance.new("Frame", sec); rr.Size=UDim2.new(1,0,0,18); rr.BackgroundTransparency=1; rr.LayoutOrder=5
+        local rl = Instance.new("TextLabel", rr); rl.Size=UDim2.new(1,-52,1,0); rl.BackgroundTransparency=1
         rl.Text="↩  Re-jump"; rl.TextColor3=C.sub; rl.Font=Enum.Font.GothamBold; rl.TextSize=9; rl.TextXAlignment=Enum.TextXAlignment.Left
         rjTr=Instance.new("Frame",rr); rjTr.Size=UDim2.new(0,36,0,18); rjTr.Position=UDim2.new(1,-36,0.5,-9)
         rjTr.BackgroundColor3=Color3.fromRGB(22,28,50); rjTr.BorderSizePixel=0
@@ -560,40 +608,40 @@ local function mkSection(parent, cfg)
     return {togHit=togHit,bindBtn=bindB,rjTogHit=rjTogHit,setTog=setTog,setRj=setRj,statusLbl=statusLbl}
 end
 
+-- ═══════════════════════════════════════
 -- PAGE CHEATS
-local pg1=tabPages["Cheats"]
+-- ═══════════════════════════════════════
+local pg1 = tabPages["Cheats"]
 mkDiv(pg1,1)
-local ncSec=mkSection(pg1,{order=2,icon="👻",label="Noclip",keyName=ncKey.Name})
+local ncSec = mkSection(pg1,{order=2,icon="👻",label="Noclip",keyName=ncKey.Name})
 mkDiv(pg1,3)
-local spSec=mkSection(pg1,{order=4,icon="💨",label="Speed",keyName=spKey.Name,
+local spSec = mkSection(pg1,{order=4,icon="💨",label="Speed",keyName=spKey.Name,
     slider={min=16,max=300,def=speedVal,label="Speed",onChange=function(v) speedVal=v end}})
 mkDiv(pg1,5)
-local hjSec=mkSection(pg1,{order=6,icon="🦘",label="High Jump",keyName=hjKey.Name,
+local hjSec = mkSection(pg1,{order=6,icon="🦘",label="High Jump",keyName=hjKey.Name,
     slider={min=50,max=500,def=jumpVal,label="Power",onChange=function(v) jumpVal=v end},rejump=true})
 mkDiv(pg1,7)
-local shSec=mkSection(pg1,{order=8,icon="🔄",label="Shake",keyName=shakeKey.Name,showStatus=true})
+local shSec = mkSection(pg1,{order=8,icon="🔄",label="Shake",keyName=shakeKey.Name,showStatus=true})
 mkDiv(pg1,9)
 
 -- SELL SECTION
-local sellF=Instance.new("Frame",pg1)
+local sellF = Instance.new("Frame", pg1)
 sellF.Size=UDim2.new(1,0,0,0); sellF.AutomaticSize=Enum.AutomaticSize.Y
 sellF.BackgroundColor3=C.card; sellF.BorderSizePixel=0; sellF.LayoutOrder=10
-local su=Instance.new("UIPadding",sellF)
+local su = Instance.new("UIPadding", sellF)
 su.PaddingLeft=UDim.new(0,10); su.PaddingRight=UDim.new(0,10)
 su.PaddingTop=UDim.new(0,7);   su.PaddingBottom=UDim.new(0,9)
-local sLy=Instance.new("UIListLayout",sellF)
+local sLy = Instance.new("UIListLayout", sellF)
 sLy.SortOrder=Enum.SortOrder.LayoutOrder; sLy.Padding=UDim.new(0,5)
 
 local sTR=Instance.new("Frame",sellF); sTR.Size=UDim2.new(1,0,0,16); sTR.BackgroundTransparency=1; sTR.LayoutOrder=1
 local sTL=Instance.new("TextLabel",sTR); sTL.Size=UDim2.new(1,0,1,0); sTL.BackgroundTransparency=1
 sTL.Text="💰  Sell"; sTL.TextColor3=C.sub; sTL.Font=Enum.Font.GothamBold; sTL.TextSize=10; sTL.TextXAlignment=Enum.TextXAlignment.Left
-
 local sellSt=Instance.new("TextLabel",sellF)
 sellSt.Size=UDim2.new(1,0,0,10); sellSt.BackgroundTransparency=1
 sellSt.Text="Waiting..."; sellSt.TextColor3=C.dim
 sellSt.Font=Enum.Font.Gotham; sellSt.TextSize=8
 sellSt.TextXAlignment=Enum.TextXAlignment.Left; sellSt.LayoutOrder=2
-
 local sBR=Instance.new("Frame",sellF); sBR.Size=UDim2.new(1,0,0,20); sBR.BackgroundTransparency=1; sBR.LayoutOrder=3
 local sBL=Instance.new("TextLabel",sBR); sBL.Size=UDim2.new(0,38,1,0); sBL.BackgroundTransparency=1
 sBL.Text="Key:"; sBL.TextColor3=C.dim; sBL.Font=Enum.Font.Gotham; sBL.TextSize=8; sBL.TextXAlignment=Enum.TextXAlignment.Left
@@ -616,8 +664,7 @@ sellBtn.MouseEnter:Connect(function() tw(sellBtn,{BackgroundColor3=C.sellH}):Pla
 sellBtn.MouseLeave:Connect(function() tw(sellBtn,{BackgroundColor3=C.sellBg}):Play() end)
 
 local innerDiv=Instance.new("Frame",sellF)
-innerDiv.Size=UDim2.new(1,0,0,1); innerDiv.BackgroundColor3=C.bdr
-innerDiv.BorderSizePixel=0; innerDiv.LayoutOrder=5
+innerDiv.Size=UDim2.new(1,0,0,1); innerDiv.BackgroundColor3=C.bdr; innerDiv.BorderSizePixel=0; innerDiv.LayoutOrder=5
 
 local sellAllBtn=Instance.new("TextButton",sellF)
 sellAllBtn.Size=UDim2.new(1,0,0,28); sellAllBtn.LayoutOrder=6
@@ -630,8 +677,7 @@ sellAllBtn.MouseEnter:Connect(function() tw(sellAllBtn,{BackgroundColor3=Color3.
 sellAllBtn.MouseLeave:Connect(function() tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(14,50,30)}):Play() end)
 
 local innerDiv2=Instance.new("Frame",sellF)
-innerDiv2.Size=UDim2.new(1,0,0,1); innerDiv2.BackgroundColor3=C.bdr
-innerDiv2.BorderSizePixel=0; innerDiv2.LayoutOrder=7
+innerDiv2.Size=UDim2.new(1,0,0,1); innerDiv2.BackgroundColor3=C.bdr; innerDiv2.BorderSizePixel=0; innerDiv2.LayoutOrder=7
 
 local autoRow=Instance.new("Frame",sellF)
 autoRow.Size=UDim2.new(1,0,0,20); autoRow.BackgroundTransparency=1; autoRow.LayoutOrder=8
@@ -639,8 +685,7 @@ local autoLbl=Instance.new("TextLabel",autoRow); autoLbl.Size=UDim2.new(1,-52,1,
 autoLbl.Text="🔁  Auto-Sell"; autoLbl.TextColor3=C.sub; autoLbl.Font=Enum.Font.GothamBold; autoLbl.TextSize=10; autoLbl.TextXAlignment=Enum.TextXAlignment.Left
 local autoTr=Instance.new("Frame",autoRow); autoTr.Size=UDim2.new(0,36,0,18); autoTr.Position=UDim2.new(1,-36,0.5,-9)
 autoTr.BackgroundColor3=Color3.fromRGB(22,28,50); autoTr.BorderSizePixel=0
-Instance.new("UICorner",autoTr).CornerRadius=UDim.new(0,9)
-Instance.new("UIStroke",autoTr).Color=C.bdr
+Instance.new("UICorner",autoTr).CornerRadius=UDim.new(0,9); Instance.new("UIStroke",autoTr).Color=C.bdr
 local autoKn=Instance.new("Frame",autoTr); autoKn.Size=UDim2.new(0,14,0,14); autoKn.Position=UDim2.new(0,2,0.5,-7)
 autoKn.BackgroundColor3=Color3.fromRGB(195,205,235); autoKn.BorderSizePixel=0
 Instance.new("UICorner",autoKn).CornerRadius=UDim.new(0,7)
@@ -682,8 +727,10 @@ autoStLbl.TextXAlignment=Enum.TextXAlignment.Left; autoStLbl.LayoutOrder=11
 
 mkDiv(pg1,11)
 
+-- ═══════════════════════════════════════
 -- PAGE TP
-local pg2=tabPages["TP"]
+-- ═══════════════════════════════════════
+local pg2 = tabPages["TP"]
 local tpScroll=Instance.new("ScrollingFrame",pg2)
 tpScroll.Size=UDim2.new(1,0,0,280); tpScroll.BackgroundTransparency=1; tpScroll.BorderSizePixel=0
 tpScroll.ScrollBarThickness=3; tpScroll.ScrollBarImageColor3=C.acc
@@ -714,8 +761,10 @@ for i,isl in ipairs(ISLANDS) do
     end)
 end
 
+-- ═══════════════════════════════════════
 -- PAGE NPCs
-local pg3=tabPages["NPCs"]
+-- ═══════════════════════════════════════
+local pg3 = tabPages["NPCs"]
 local rngF=Instance.new("Frame",pg3); rngF.Size=UDim2.new(1,0,0,0); rngF.AutomaticSize=Enum.AutomaticSize.Y
 rngF.BackgroundColor3=C.card; rngF.BorderSizePixel=0; rngF.LayoutOrder=1
 pad(rngF,10,10,7,7)
@@ -798,67 +847,24 @@ scanBtn.MouseButton1Click:Connect(function()
 end)
 
 -- ═══════════════════════════════════════
--- VISIBILITY v11 — FIX SPAM DO V
--- Trava completa durante animação
--- Usa Completed:Connect em vez de delay arbitrário
+-- TOGGLES
 -- ═══════════════════════════════════════
-local function setVisible(v)
-    if vAnimating then return end
-    if guiVisible == v then return end
-    vAnimating = true
-    guiVisible = v
-
-    if v then
-        for _,ch in ipairs(frame:GetChildren()) do
-            if ch~=header and (ch:IsA("Frame") or ch:IsA("ScrollingFrame")) then
-                ch.Visible = true
-            end
-        end
-        frame.AutomaticSize = Enum.AutomaticSize.Y
-        tw(vHint,{TextColor3=C.dim},0.15):Play()
-        task.delay(0.2, function() vAnimating = false end)
-    else
-        frame.AutomaticSize = Enum.AutomaticSize.None
-        local shrink = tw(frame,{Size=UDim2.new(0,212,0,36)},0.18)
-        shrink:Play()
-        shrink.Completed:Connect(function()
-            if not guiVisible then
-                for _,ch in ipairs(frame:GetChildren()) do
-                    if ch~=header and (ch:IsA("Frame") or ch:IsA("ScrollingFrame")) then
-                        ch.Visible = false
-                    end
-                end
-            end
-            vAnimating = false
-        end)
-        tw(vHint,{TextColor3=C.acc},0.15):Play()
-    end
-end
-
 local function updateDot()
     tw(dot,{BackgroundColor3=(noclipOn or speedOn or jumpOn or shakeOn or autoSellOn) and C.grn or C.dim}):Play()
 end
 
--- TOGGLES
 ncSec.togHit.MouseButton1Click:Connect(function()
     noclipOn=not noclipOn; setNoclip(noclipOn); ncSec.setTog(noclipOn)
     tw(fBdr,{Color=noclipOn and C.grn or C.bdr}):Play(); updateDot()
 end)
-
 spSec.togHit.MouseButton1Click:Connect(function()
     speedOn=not speedOn; spSec.setTog(speedOn)
-    if speedOn then applySpeedOnce(); startSpeedLoop()
-    else stopSpeedLoop() end
-    updateDot()
+    if speedOn then applySpeedOnce(); startSpeedLoop() else stopSpeedLoop() end; updateDot()
 end)
-
 hjSec.togHit.MouseButton1Click:Connect(function()
     jumpOn=not jumpOn; hjSec.setTog(jumpOn)
-    if jumpOn then startJumpLoop()
-    else stopJumpLoop(); reJumpOn=false; hjSec.setRj(false); stopReJump() end
-    updateDot()
+    if jumpOn then startJumpLoop() else stopJumpLoop(); reJumpOn=false; hjSec.setRj(false); stopReJump() end; updateDot()
 end)
-
 if hjSec.rjTogHit then
     hjSec.rjTogHit.MouseButton1Click:Connect(function()
         if not jumpOn then return end
@@ -866,7 +872,6 @@ if hjSec.rjTogHit then
         if reJumpOn then startReJump() else stopReJump() end
     end)
 end
-
 shSec.togHit.MouseButton1Click:Connect(function()
     shakeOn=not shakeOn; shSec.setTog(shakeOn)
     if shakeOn then startShake() else stopShake() end; updateDot()
@@ -881,7 +886,6 @@ sellBtn.MouseButton1Click:Connect(function()
         task.wait(3); tw(sellSt,{TextColor3=C.dim}):Play(); sellSt.Text="Waiting..."
     end)
 end)
-
 sellAllBtn.MouseButton1Click:Connect(function()
     task.spawn(function()
         tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(10,38,22)}):Play(); task.wait(0.1)
@@ -891,7 +895,6 @@ sellAllBtn.MouseButton1Click:Connect(function()
         task.wait(3); tw(sellSt,{TextColor3=C.dim}):Play(); sellSt.Text="Waiting..."
     end)
 end)
-
 autoTogHit.MouseButton1Click:Connect(function()
     autoSellOn=not autoSellOn
     tw(autoTr,{BackgroundColor3=autoSellOn and C.grn or Color3.fromRGB(22,28,50)}):Play()
@@ -907,13 +910,15 @@ task.spawn(function()
         if shSec.statusLbl then
             if shakeOn then
                 if shakeActive then shSec.statusLbl.Text="● clicking..."; shSec.statusLbl.TextColor3=C.grn
-                else               shSec.statusLbl.Text="○ waiting for UI..."; shSec.statusLbl.TextColor3=C.yel end
+                else shSec.statusLbl.Text="○ waiting for UI..."; shSec.statusLbl.TextColor3=C.yel end
             else shSec.statusLbl.Text="" end
         end
     end
 end)
 
+-- ═══════════════════════════════════════
 -- REBIND
+-- ═══════════════════════════════════════
 local function setupBind(bindBtn,id,getKey,setKey)
     bindBtn.MouseButton1Click:Connect(function()
         if listening then return end
@@ -941,45 +946,74 @@ setupBind(hjSec.bindBtn, "hj",   function() return hjKey    end, function(k) hjK
 setupBind(shSec.bindBtn, "sh",   function() return shakeKey end, function(k) shakeKey=k end)
 setupBind(sellBind,      "sell", function() return sellKey  end, function(k) sellKey=k  end)
 
--- DRAG
+-- ═══════════════════════════════════════
+-- DRAG v12 — REESCRITO
+-- Usa MouseMoved no UIS diretamente, sem ZIndex problemático
+-- Funciona em cima de qualquer elemento do header
+-- ═══════════════════════════════════════
 do
-    local dr,ds,sp2=false,nil,nil
-    local dh=Instance.new("TextButton",frame)
-    dh.Size=UDim2.new(1,-20,0,36); dh.Position=UDim2.new(0,0,0,0)
-    dh.BackgroundTransparency=1; dh.Text=""; dh.AutoButtonColor=false; dh.ZIndex=20
-    dh.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dr=true; ds=i.Position; sp2=frame.Position end end)
-    UIS.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dr=false end end)
-    UIS.InputChanged:Connect(function(i)
-        if dr and i.UserInputType==Enum.UserInputType.MouseMovement then
-            local d=i.Position-ds
-            frame.Position=UDim2.new(sp2.X.Scale,sp2.X.Offset+d.X,sp2.Y.Scale,sp2.Y.Offset+d.Y)
+    local dragging = false
+    local dragStart = nil
+    local startPos = nil
+
+    local function onDragInput(input)
+        if not dragging then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement
+        and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        local delta = input.Position - dragStart
+        frame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+        end
+    end)
+
+    header.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    UIS.InputChanged:Connect(onDragInput)
+    -- Garante que soltar fora do header também para o drag
+    UIS.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
         end
     end)
 end
 
+-- ═══════════════════════════════════════
 -- HOTKEYS
-UIS.InputBegan:Connect(function(inp,gpe)
+-- ═══════════════════════════════════════
+UIS.InputBegan:Connect(function(inp, gpe)
     if gpe or listening then return end
-    local k=inp.KeyCode
-    if k==Enum.KeyCode.V then
+    local k = inp.KeyCode
+    if k == Enum.KeyCode.V then
         setVisible(not guiVisible)
-    elseif k==ncKey then
+    elseif k == ncKey then
         noclipOn=not noclipOn; setNoclip(noclipOn); ncSec.setTog(noclipOn)
         tw(fBdr,{Color=noclipOn and C.grn or C.bdr}):Play(); updateDot()
-    elseif k==spKey then
+    elseif k == spKey then
         speedOn=not speedOn; spSec.setTog(speedOn)
-        if speedOn then applySpeedOnce(); startSpeedLoop()
-        else stopSpeedLoop() end
-        updateDot()
-    elseif k==hjKey then
+        if speedOn then applySpeedOnce(); startSpeedLoop() else stopSpeedLoop() end; updateDot()
+    elseif k == hjKey then
         jumpOn=not jumpOn; hjSec.setTog(jumpOn)
-        if jumpOn then startJumpLoop()
-        else stopJumpLoop(); reJumpOn=false; hjSec.setRj(false); stopReJump() end
-        updateDot()
-    elseif k==shakeKey then
+        if jumpOn then startJumpLoop() else stopJumpLoop(); reJumpOn=false; hjSec.setRj(false); stopReJump() end; updateDot()
+    elseif k == shakeKey then
         shakeOn=not shakeOn; shSec.setTog(shakeOn)
         if shakeOn then startShake() else stopShake() end; updateDot()
-    elseif k==sellKey then
+    elseif k == sellKey then
         task.spawn(function()
             local ok,msg=sellFromHand()
             sellSt.TextColor3=ok and C.grn or C.red; sellSt.Text=(ok and "✅ " or "❌ ")..msg
@@ -988,4 +1022,7 @@ UIS.InputBegan:Connect(function(inp,gpe)
     end
 end)
 
+-- Inicia na aba Cheats com tamanho correto
 switchTab("Cheats")
+task.wait(0.1)  -- deixa layout calcular
+refreshFrameSize()
