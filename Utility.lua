@@ -771,6 +771,7 @@ local function startCast()
     State.runtime.lastCastEquipAttempt = 0
     State.runtime.castActive = false
     State.runtime.castPhase = "idle"
+    local primeStartedAt = 0
 
     startTask("cast", function()
         while State.flags.cast do
@@ -817,17 +818,27 @@ local function startCast()
                     task.wait(0.08)
                 end
             else
-                forceCastRelease()
                 State.runtime.castActive = false
                 State.runtime.castPhase = "arming"
+                local camera = workspace.CurrentCamera
+                local centerX = camera and (camera.ViewportSize.X * 0.5) or 400
+                local centerY = camera and (camera.ViewportSize.Y * 0.5) or 300
 
-                if tick() - State.runtime.lastCastEquipAttempt >= 0.75 then
+                if tick() - State.runtime.lastCastEquipAttempt >= 0.90 then
                     State.runtime.lastCastEquipAttempt = tick()
                     equipRodSlot()
-                    task.wait(0.22)
-                else
-                    task.wait(0.08)
                 end
+
+                if (not State.runtime.castMouseHeld) or (tick() - primeStartedAt >= 1.35) then
+                    if State.runtime.castMouseHeld then
+                        sendMouseUp(centerX, centerY)
+                        task.wait(0.12)
+                    end
+                    sendMouseDown(centerX, centerY)
+                    primeStartedAt = tick()
+                end
+
+                task.wait(0.08)
             end
         end
 
@@ -1036,6 +1047,7 @@ local function startAutoReel()
         local sessionStart = 0
         local sessionDiagnosis
         local lastFishX = nil
+        local lastControlSwitch = tick()
 
         while State.flags.autoReel do
             local reelGui = findReelUI()
@@ -1058,6 +1070,7 @@ local function startAutoReel()
                     reelForceRelease()
                     hideReelOverlay(reelGui)
                     State.runtime.reelActive = false
+                    lastFishX = nil
                     task.wait(0.08)
                 else
                     State.runtime.reelActive = true
@@ -1093,38 +1106,54 @@ local function startAutoReel()
                     end
                     lastFishX = fishCenterX
 
-                    local innerMargin = math.max(barWidth * 0.18, 8)
-                    local desiredHold = State.runtime.reelMouseHeld
+                    local centerOffset = (fishCenterX - barCenter) / barWidth
+                    local edgeMargin = math.max(barWidth * 0.20, 12)
+                    local strongThreshold = 0.11
+                    local softThreshold = 0.05
+                    local desiredHold = nil
 
-                    if fishCenterX > (barRight - innerMargin) then
+                    if fishCenterX >= (barRight - edgeMargin) then
                         desiredHold = true
-                    elseif fishCenterX < (barLeft + innerMargin) then
+                    elseif fishCenterX <= (barLeft + edgeMargin) then
                         desiredHold = false
-                    else
-                        local centerOffset = (fishCenterX - barCenter) / barWidth
-                        if centerOffset > 0.10 then
-                            desiredHold = true
-                        elseif centerOffset < -0.10 then
-                            desiredHold = false
-                        elseif fishVelocity > 1.2 then
-                            desiredHold = true
-                        elseif fishVelocity < -1.2 then
-                            desiredHold = false
-                        end
+                    elseif centerOffset > strongThreshold then
+                        desiredHold = true
+                    elseif centerOffset < -strongThreshold then
+                        desiredHold = false
+                    elseif centerOffset > softThreshold and fishVelocity >= 0 then
+                        desiredHold = true
+                    elseif centerOffset < -softThreshold and fishVelocity <= 0 then
+                        desiredHold = false
+                    elseif math.abs(centerOffset) <= 0.03 then
+                        desiredHold = false
                     end
 
-                    if desiredHold then
-                        reelMousePress(barCenter, playerBar.AbsolutePosition.Y + playerBar.AbsoluteSize.Y * 0.5)
-                    else
-                        reelMouseRelease(barCenter, playerBar.AbsolutePosition.Y + playerBar.AbsoluteSize.Y * 0.5)
+                    local switchDelay = State.runtime.reelMouseHeld and 0.095 or 0.080
+                    local pointerY = playerBar.AbsolutePosition.Y + playerBar.AbsoluteSize.Y * 0.5
+
+                    if desiredHold ~= nil and desiredHold ~= State.runtime.reelMouseHeld then
+                        if tick() - lastControlSwitch >= switchDelay then
+                            if desiredHold then
+                                reelMousePress(barCenter, pointerY)
+                            else
+                                reelMouseRelease(barCenter, pointerY)
+                            end
+                            lastControlSwitch = tick()
+                        end
+                    elseif desiredHold == true and not State.runtime.reelMouseHeld and tick() - lastControlSwitch >= 0.11 then
+                        reelMousePress(barCenter, pointerY)
+                        lastControlSwitch = tick()
+                    elseif desiredHold == false and State.runtime.reelMouseHeld and tick() - lastControlSwitch >= 0.11 then
+                        reelMouseRelease(barCenter, pointerY)
+                        lastControlSwitch = tick()
                     end
 
                     if fishInside then
-                        task.wait(0.035)
+                        task.wait(0.050)
                     elseif ratio < 0.30 then
-                        task.wait(0.028)
+                        task.wait(0.042)
                     else
-                        task.wait(0.022)
+                        task.wait(0.035)
                     end
                 end
             else
@@ -1133,6 +1162,7 @@ local function startAutoReel()
                 end
                 State.runtime.reelActive = false
                 lastFishX = nil
+                lastControlSwitch = tick()
 
                 if wasActive then
                     wasActive = false
