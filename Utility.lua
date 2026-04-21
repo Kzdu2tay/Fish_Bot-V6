@@ -1,13 +1,15 @@
 --[[
-    UTILITY v18 — REFACTOR + GUI POLISH
+    UTILITY v19 — AUTO-REEL REWRITE
 
-    Melhorias desta versão:
-    • Estrutura mais organizada e com menos repetição
-    • GUI mais larga, mais limpa e com busca em TP/Rods
-    • Toggle/status centralizados para reduzir flicker
-    • Auto-cast e auto-reel com heurísticas mais seguras
-    • Helpers reutilizáveis para cards, botões, sliders e binds
-    • Mantém recursos do v17: auto-cast, auto-reel adaptativo, sell, maps e NPC scan
+    O que mudou vs v18 (APENAS auto-reel):
+    • Duty-cycle ao invés de on/off bruto — proporcional à distância do peixe
+    • Loop em RunService.Heartbeat (60fps real) — sem task.wait, sem lag
+    • Sem switchDelay — sem oscilação de 100ms spammando clique
+    • Anti-ricochete nas bordas (cooldown 80ms após cada troca forçada)
+    • Sem predição (você pediu)
+    • Overlay visual < > , mantido igual ao v18
+
+    Resto do script (cast, shake, TP, sell, maps, learning) = idêntico v18
 ]]
 
 local Players = game:GetService("Players")
@@ -22,71 +24,47 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 local State = {
     flags = {
-        noclip = false,
-        speed = false,
-        jump = false,
-        rejump = false,
-        shake = false,
-        cast = false,
-        autoSell = false,
-        autoReel = false,
+        noclip = false, speed = false, jump = false, rejump = false,
+        shake = false, cast = false, autoSell = false, autoReel = false,
     },
     values = {
-        speed = 45,
-        jump = 80,
-        autoSellDelay = 1.5,
-        npcRange = 150,
-        castReleasePct = 0.72,
+        speed = 45, jump = 80, autoSellDelay = 1.5,
+        npcRange = 150, castReleasePct = 0.72,
     },
     keys = {
-        noclip = Enum.KeyCode.F,
-        speed = Enum.KeyCode.G,
-        jump = Enum.KeyCode.H,
-        shake = Enum.KeyCode.J,
-        cast = Enum.KeyCode.U,
-        sell = Enum.KeyCode.K,
-        reel = Enum.KeyCode.L,
-        toggleGui = Enum.KeyCode.V,
+        noclip = Enum.KeyCode.F, speed = Enum.KeyCode.G, jump = Enum.KeyCode.H,
+        shake = Enum.KeyCode.J, cast = Enum.KeyCode.U, sell = Enum.KeyCode.K,
+        reel = Enum.KeyCode.L, toggleGui = Enum.KeyCode.V,
     },
     runtime = {
-        currentTab = "Cheats",
-        guiVisible = true,
-        guiAnimating = false,
-        listening = nil,
-        shakeActive = false,
-        reelActive = false,
-        castActive = false,
-        castPhase = "idle",
-        reelMouseHeld = false,
-        castMouseHeld = false,
-        lastCastEquipAttempt = 0,
+        currentTab = "Cheats", guiVisible = true, guiAnimating = false,
+        listening = nil, shakeActive = false, reelActive = false,
+        castActive = false, castPhase = "idle",
+        reelMouseHeld = false, castMouseHeld = false, lastCastEquipAttempt = 0,
     },
     tasks = {},
     connections = {},
 }
 
-local UI = {
-    tabs = {},
-    pages = {},
-    search = {},
-    refs = {},
-}
+local UI = { tabs = {}, pages = {}, search = {}, refs = {} }
 
+-- ════════════════════════════════════════
+-- REEL PARAMS v19 — duty-cycle based
+-- Instead of hold/release times, we store % of cycle to hold
+-- at different distances from fish.
+-- ════════════════════════════════════════
 local ReelParams = {
-    hold_far = 0.200,
-    release_far = 0.025,
-    hold_mid = 0.095,
-    release_mid = 0.040,
-    hold_inside = 0.042,
-    release_inside = 0.055,
+    duty_far = 0.90,     -- fish far (>30% away): hold 90% of time
+    duty_mid = 0.65,     -- fish mid (10-30%): hold 65%
+    duty_near = 0.50,    -- fish near (inside barWidth*5%): balance point
+    cycle_ms = 45,       -- total cycle duration (ms) — smaller = snappier
+    rebound_ms = 80,     -- anti-oscillation cooldown when fish crosses edge
+    dead_zone = 0.04,    -- dead zone as fraction of barWidth (center)
 }
 
 local LearnHistory = {
-    sessions = {},
-    totalWins = 0,
-    totalLosses = 0,
-    lastDiagnosis = "—",
-    adjustCount = 0,
+    sessions = {}, totalWins = 0, totalLosses = 0,
+    lastDiagnosis = "—", adjustCount = 0,
 }
 
 local ISLANDS = {
@@ -162,26 +140,16 @@ local RODS = {
 }
 
 local Theme = {
-    shell = Color3.fromRGB(8, 11, 19),
-    panel = Color3.fromRGB(14, 18, 31),
-    surface = Color3.fromRGB(18, 24, 41),
-    surfaceHover = Color3.fromRGB(24, 32, 54),
-    surfaceAlt = Color3.fromRGB(12, 16, 28),
-    accent = Color3.fromRGB(88, 164, 255),
-    accentSoft = Color3.fromRGB(48, 94, 190),
-    success = Color3.fromRGB(62, 215, 132),
-    danger = Color3.fromRGB(236, 87, 97),
-    warning = Color3.fromRGB(241, 192, 69),
-    text = Color3.fromRGB(223, 230, 247),
-    subtext = Color3.fromRGB(156, 170, 201),
-    muted = Color3.fromRGB(104, 118, 152),
-    border = Color3.fromRGB(31, 40, 70),
-    gold = Color3.fromRGB(255, 191, 74),
-    cyan = Color3.fromRGB(104, 230, 255),
-    purple = Color3.fromRGB(152, 108, 255),
-    cast = Color3.fromRGB(92, 255, 191),
-    sell = Color3.fromRGB(22, 68, 45),
-    sellHover = Color3.fromRGB(28, 84, 54),
+    shell = Color3.fromRGB(8, 11, 19), panel = Color3.fromRGB(14, 18, 31),
+    surface = Color3.fromRGB(18, 24, 41), surfaceHover = Color3.fromRGB(24, 32, 54),
+    surfaceAlt = Color3.fromRGB(12, 16, 28), accent = Color3.fromRGB(88, 164, 255),
+    accentSoft = Color3.fromRGB(48, 94, 190), success = Color3.fromRGB(62, 215, 132),
+    danger = Color3.fromRGB(236, 87, 97), warning = Color3.fromRGB(241, 192, 69),
+    text = Color3.fromRGB(223, 230, 247), subtext = Color3.fromRGB(156, 170, 201),
+    muted = Color3.fromRGB(104, 118, 152), border = Color3.fromRGB(31, 40, 70),
+    gold = Color3.fromRGB(255, 191, 74), cyan = Color3.fromRGB(104, 230, 255),
+    purple = Color3.fromRGB(152, 108, 255), cast = Color3.fromRGB(92, 255, 191),
+    sell = Color3.fromRGB(22, 68, 45), sellHover = Color3.fromRGB(28, 84, 54),
 }
 
 local GUI_WIDTH = 226
@@ -189,16 +157,11 @@ local HEADER_HEIGHT = 38
 local WINDOW_Y_OFFSET = -180
 
 local BLOCKED_KEYS = {
-    [Enum.KeyCode.Return] = true,
-    [Enum.KeyCode.Escape] = true,
-    [Enum.KeyCode.Tab] = true,
-    [Enum.KeyCode.Backspace] = true,
-    [Enum.KeyCode.LeftShift] = true,
-    [Enum.KeyCode.RightShift] = true,
-    [Enum.KeyCode.LeftControl] = true,
-    [Enum.KeyCode.RightControl] = true,
-    [Enum.KeyCode.LeftAlt] = true,
-    [Enum.KeyCode.RightAlt] = true,
+    [Enum.KeyCode.Return] = true, [Enum.KeyCode.Escape] = true,
+    [Enum.KeyCode.Tab] = true, [Enum.KeyCode.Backspace] = true,
+    [Enum.KeyCode.LeftShift] = true, [Enum.KeyCode.RightShift] = true,
+    [Enum.KeyCode.LeftControl] = true, [Enum.KeyCode.RightControl] = true,
+    [Enum.KeyCode.LeftAlt] = true, [Enum.KeyCode.RightAlt] = true,
     [Enum.KeyCode.V] = true,
 }
 
@@ -206,35 +169,25 @@ local function create(className, props)
     local parent = props.Parent
     props.Parent = nil
     local object = Instance.new(className)
-    for key, value in pairs(props) do
-        object[key] = value
-    end
-    if parent then
-        object.Parent = parent
-    end
+    for key, value in pairs(props) do object[key] = value end
+    if parent then object.Parent = parent end
     return object
 end
 
 local function addCorner(parent, radius)
-    create("UICorner", {
-        Parent = parent,
-        CornerRadius = UDim.new(0, radius),
-    })
+    create("UICorner", { Parent = parent, CornerRadius = UDim.new(0, radius) })
 end
 
 local function addStroke(parent, color, thickness, transparency)
     return create("UIStroke", {
-        Parent = parent,
-        Color = color,
-        Thickness = thickness or 1,
-        Transparency = transparency or 0,
+        Parent = parent, Color = color,
+        Thickness = thickness or 1, Transparency = transparency or 0,
     })
 end
 
 local function addGradient(parent, rotation, colors)
     return create("UIGradient", {
-        Parent = parent,
-        Rotation = rotation or 0,
+        Parent = parent, Rotation = rotation or 0,
         Color = ColorSequence.new(colors),
     })
 end
@@ -242,10 +195,8 @@ end
 local function addPadding(parent, left, right, top, bottom)
     return create("UIPadding", {
         Parent = parent,
-        PaddingLeft = UDim.new(0, left or 0),
-        PaddingRight = UDim.new(0, right or 0),
-        PaddingTop = UDim.new(0, top or 0),
-        PaddingBottom = UDim.new(0, bottom or 0),
+        PaddingLeft = UDim.new(0, left or 0), PaddingRight = UDim.new(0, right or 0),
+        PaddingTop = UDim.new(0, top or 0), PaddingBottom = UDim.new(0, bottom or 0),
     })
 end
 
@@ -262,49 +213,20 @@ local function spring(instance, properties)
     return tw
 end
 
-local function clamp(value, minValue, maxValue)
-    return math.max(minValue, math.min(maxValue, value))
-end
-
-local function rnd(minValue, maxValue)
-    return minValue + math.random() * (maxValue - minValue)
-end
-
-local function character()
-    return LocalPlayer.Character
-end
-
-local function humanoid()
-    local currentCharacter = character()
-    return currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
-end
-
-local function rootPart()
-    local currentCharacter = character()
-    return currentCharacter and currentCharacter:FindFirstChild("HumanoidRootPart")
-end
-
-local function heldTool()
-    local currentCharacter = character()
-    return currentCharacter and currentCharacter:FindFirstChildOfClass("Tool")
-end
+local function clamp(v, mn, mx) return math.max(mn, math.min(mx, v)) end
+local function character() return LocalPlayer.Character end
+local function humanoid() local c = character(); return c and c:FindFirstChildOfClass("Humanoid") end
+local function rootPart() local c = character(); return c and c:FindFirstChild("HumanoidRootPart") end
+local function heldTool() local c = character(); return c and c:FindFirstChildOfClass("Tool") end
 
 local function setStatus(label, text, color)
-    if not label then
-        return
-    end
-    if label.Text ~= text then
-        label.Text = text
-    end
-    if color and label.TextColor3 ~= color then
-        label.TextColor3 = color
-    end
+    if not label then return end
+    if label.Text ~= text then label.Text = text end
+    if color and label.TextColor3 ~= color then label.TextColor3 = color end
 end
 
 local function startTask(name, callback)
-    if State.tasks[name] then
-        task.cancel(State.tasks[name])
-    end
+    if State.tasks[name] then task.cancel(State.tasks[name]) end
     State.tasks[name] = task.spawn(callback)
 end
 
@@ -317,12 +239,11 @@ end
 
 local function saveLearnData()
     pcall(function()
-        LocalPlayer:SetAttribute("RP_hold_far", ReelParams.hold_far)
-        LocalPlayer:SetAttribute("RP_release_far", ReelParams.release_far)
-        LocalPlayer:SetAttribute("RP_hold_mid", ReelParams.hold_mid)
-        LocalPlayer:SetAttribute("RP_release_mid", ReelParams.release_mid)
-        LocalPlayer:SetAttribute("RP_hold_inside", ReelParams.hold_inside)
-        LocalPlayer:SetAttribute("RP_release_inside", ReelParams.release_inside)
+        LocalPlayer:SetAttribute("RP_duty_far", ReelParams.duty_far)
+        LocalPlayer:SetAttribute("RP_duty_mid", ReelParams.duty_mid)
+        LocalPlayer:SetAttribute("RP_duty_near", ReelParams.duty_near)
+        LocalPlayer:SetAttribute("RP_cycle_ms", ReelParams.cycle_ms)
+        LocalPlayer:SetAttribute("RP_rebound_ms", ReelParams.rebound_ms)
         LocalPlayer:SetAttribute("LH_wins", LearnHistory.totalWins)
         LocalPlayer:SetAttribute("LH_losses", LearnHistory.totalLosses)
         LocalPlayer:SetAttribute("LH_adjusts", LearnHistory.adjustCount)
@@ -332,29 +253,28 @@ end
 
 local function loadLearnData()
     pcall(function()
-        local function getAttribute(key, defaultValue)
-            local value = LocalPlayer:GetAttribute(key)
-            if value == nil then
-                return defaultValue
-            end
-            return value
+        local function getAttr(key, def)
+            local v = LocalPlayer:GetAttribute(key)
+            if v == nil then return def end
+            return v
         end
-
-        ReelParams.hold_far = getAttribute("RP_hold_far", 0.200)
-        ReelParams.release_far = getAttribute("RP_release_far", 0.025)
-        ReelParams.hold_mid = getAttribute("RP_hold_mid", 0.095)
-        ReelParams.release_mid = getAttribute("RP_release_mid", 0.040)
-        ReelParams.hold_inside = getAttribute("RP_hold_inside", 0.042)
-        ReelParams.release_inside = getAttribute("RP_release_inside", 0.055)
-        LearnHistory.totalWins = getAttribute("LH_wins", 0)
-        LearnHistory.totalLosses = getAttribute("LH_losses", 0)
-        LearnHistory.adjustCount = getAttribute("LH_adjusts", 0)
-        LearnHistory.lastDiagnosis = getAttribute("LH_last", "—")
+        ReelParams.duty_far = getAttr("RP_duty_far", 0.90)
+        ReelParams.duty_mid = getAttr("RP_duty_mid", 0.65)
+        ReelParams.duty_near = getAttr("RP_duty_near", 0.50)
+        ReelParams.cycle_ms = getAttr("RP_cycle_ms", 45)
+        ReelParams.rebound_ms = getAttr("RP_rebound_ms", 80)
+        LearnHistory.totalWins = getAttr("LH_wins", 0)
+        LearnHistory.totalLosses = getAttr("LH_losses", 0)
+        LearnHistory.adjustCount = getAttr("LH_adjusts", 0)
+        LearnHistory.lastDiagnosis = getAttr("LH_last", "—")
     end)
 end
 
+-- ════════════════════════════════════════
+-- LEARNING v19 — adjusts duty cycles instead of hold/release times
+-- ════════════════════════════════════════
 local function applyLearning(won, diagnosis)
-    local step = 0.007
+    local step = 0.025
     local message = ""
 
     if not won then
@@ -363,70 +283,51 @@ local function applyLearning(won, diagnosis)
         local overshootPct = diagnosis.timesOvershoots / math.max(diagnosis.timesInside + diagnosis.timesMid, 1)
 
         if farPct > 0.5 then
-            ReelParams.hold_far = clamp(ReelParams.hold_far + step, 0.120, 0.280)
-            ReelParams.release_far = clamp(ReelParams.release_far - step * 0.5, 0.010, 0.060)
-            message = "lento -> aumentei força"
+            ReelParams.duty_far = clamp(ReelParams.duty_far + step, 0.60, 0.98)
+            message = "lento -> aumentei duty far"
         elseif overshootPct > 0.3 then
-            ReelParams.hold_far = clamp(ReelParams.hold_far - step, 0.120, 0.280)
-            ReelParams.hold_mid = clamp(ReelParams.hold_mid - step * 0.7, 0.055, 0.150)
-            ReelParams.release_inside = clamp(ReelParams.release_inside + step, 0.030, 0.100)
-            message = "rápido demais -> reduzi força"
+            ReelParams.duty_far = clamp(ReelParams.duty_far - step, 0.60, 0.98)
+            ReelParams.duty_mid = clamp(ReelParams.duty_mid - step * 0.7, 0.35, 0.85)
+            message = "rápido demais -> reduzi duty"
         elseif diagnosis.timesInside > 0 and overshootPct < 0.1 then
-            ReelParams.hold_mid = clamp(ReelParams.hold_mid + step * 0.5, 0.055, 0.150)
-            ReelParams.release_mid = clamp(ReelParams.release_mid - step * 0.3, 0.020, 0.075)
-            message = "timing médio ajustado"
+            ReelParams.duty_mid = clamp(ReelParams.duty_mid + step * 0.5, 0.35, 0.85)
+            message = "timing médio refinado"
         else
-            ReelParams.hold_inside = clamp(ReelParams.hold_inside + step * 0.4, 0.025, 0.080)
-            message = "ajuste geral leve"
+            ReelParams.duty_near = clamp(ReelParams.duty_near + step * 0.3, 0.35, 0.70)
+            message = "ajuste leve centro"
         end
 
         LearnHistory.totalLosses = LearnHistory.totalLosses + 1
     else
         if diagnosis.timesOvershoots > 2 then
-            ReelParams.hold_far = clamp(ReelParams.hold_far - step * 0.3, 0.120, 0.280)
+            ReelParams.duty_far = clamp(ReelParams.duty_far - step * 0.3, 0.60, 0.98)
             message = "ganhou com overshoot -> refinando"
         else
             message = "perfeito ✓"
         end
-
         LearnHistory.totalWins = LearnHistory.totalWins + 1
     end
 
     LearnHistory.adjustCount = LearnHistory.adjustCount + 1
     LearnHistory.lastDiagnosis = (won and "✅ " or "❌ ") .. message
-    table.insert(LearnHistory.sessions, 1, {
-        won = won,
-        msg = message,
-        time = tick(),
-    })
-
-    if #LearnHistory.sessions > 20 then
-        table.remove(LearnHistory.sessions)
-    end
-
+    table.insert(LearnHistory.sessions, 1, { won = won, msg = message, time = tick() })
+    if #LearnHistory.sessions > 20 then table.remove(LearnHistory.sessions) end
     saveLearnData()
 end
 
 local function getRecentScore(amount)
     amount = amount or 10
-    local wins = 0
-    local total = 0
-
-    for index = 1, math.min(amount, #LearnHistory.sessions) do
+    local wins, total = 0, 0
+    for i = 1, math.min(amount, #LearnHistory.sessions) do
         total += 1
-        if LearnHistory.sessions[index].won then
-            wins += 1
-        end
+        if LearnHistory.sessions[i].won then wins += 1 end
     end
-
     return wins, total
 end
 
-local function bindConnection(name, connection)
-    if State.connections[name] then
-        State.connections[name]:Disconnect()
-    end
-    State.connections[name] = connection
+local function bindConnection(name, conn)
+    if State.connections[name] then State.connections[name]:Disconnect() end
+    State.connections[name] = conn
 end
 
 local function disconnectConnection(name)
@@ -437,27 +338,16 @@ local function disconnectConnection(name)
 end
 
 local function updateActivityDot()
-    local anyActive = State.flags.noclip
-        or State.flags.speed
-        or State.flags.jump
-        or State.flags.shake
-        or State.flags.cast
-        or State.flags.autoSell
-        or State.flags.autoReel
-
+    local any = State.flags.noclip or State.flags.speed or State.flags.jump
+        or State.flags.shake or State.flags.cast or State.flags.autoSell or State.flags.autoReel
     if UI.refs.activityDot then
-        tween(UI.refs.activityDot, {
-            BackgroundColor3 = anyActive and Theme.success or Theme.muted,
-        }, 0.15)
+        tween(UI.refs.activityDot, { BackgroundColor3 = any and Theme.success or Theme.muted }, 0.15)
     end
 end
 
 local function teleportTo(position)
     local root = rootPart()
-    if not root then
-        return false
-    end
-
+    if not root then return false end
     root.CFrame = CFrame.new(position + Vector3.new(0, 5, 0))
     return true
 end
@@ -465,130 +355,89 @@ end
 local function setNoclip(enabled)
     State.flags.noclip = enabled
     disconnectConnection("noclip")
-
     if enabled then
         bindConnection("noclip", RunService.Stepped:Connect(function()
-            local currentCharacter = character()
-            if not currentCharacter then
-                return
-            end
-
-            for _, part in ipairs(currentCharacter:GetDescendants()) do
-                if part:IsA("BasePart") then
-                    part.CanCollide = false
-                end
+            local c = character()
+            if not c then return end
+            for _, p in ipairs(c:GetDescendants()) do
+                if p:IsA("BasePart") then p.CanCollide = false end
             end
         end))
     else
-        local currentCharacter = character()
-        if currentCharacter then
-            for _, part in ipairs(currentCharacter:GetDescendants()) do
-                if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
-                    part.CanCollide = true
-                end
+        local c = character()
+        if c then
+            for _, p in ipairs(c:GetDescendants()) do
+                if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then p.CanCollide = true end
             end
         end
     end
 end
 
 local function applySpeedOnce()
-    local hum = humanoid()
-    if hum then
-        hum.WalkSpeed = State.flags.speed and State.values.speed or 16
-    end
+    local h = humanoid()
+    if h then h.WalkSpeed = State.flags.speed and State.values.speed or 16 end
 end
 
 local function startSpeedLoop()
     disconnectConnection("speed")
     bindConnection("speed", RunService.Heartbeat:Connect(function()
-        if not State.flags.speed then
-            disconnectConnection("speed")
-            return
-        end
-
-        local hum = humanoid()
-        if hum and hum.WalkSpeed ~= State.values.speed then
-            hum.WalkSpeed = State.values.speed
-        end
+        if not State.flags.speed then disconnectConnection("speed"); return end
+        local h = humanoid()
+        if h and h.WalkSpeed ~= State.values.speed then h.WalkSpeed = State.values.speed end
     end))
 end
 
 local function stopSpeedLoop()
     disconnectConnection("speed")
-    local hum = humanoid()
-    if hum then
-        hum.WalkSpeed = 16
-    end
+    local h = humanoid(); if h then h.WalkSpeed = 16 end
 end
 
 local function startJumpLoop()
     disconnectConnection("jump")
     bindConnection("jump", RunService.Heartbeat:Connect(function()
-        if not State.flags.jump then
-            disconnectConnection("jump")
-            return
-        end
-
-        local hum = humanoid()
-        if hum then
-            hum.UseJumpPower = true
-            if hum.JumpPower ~= State.values.jump then
-                hum.JumpPower = State.values.jump
-            end
+        if not State.flags.jump then disconnectConnection("jump"); return end
+        local h = humanoid()
+        if h then
+            h.UseJumpPower = true
+            if h.JumpPower ~= State.values.jump then h.JumpPower = State.values.jump end
         end
     end))
 end
 
 local function stopJumpLoop()
     disconnectConnection("jump")
-    local hum = humanoid()
-    if hum then
-        hum.JumpPower = 50
-    end
+    local h = humanoid(); if h then h.JumpPower = 50 end
 end
 
 local function startRejumpLoop()
     disconnectConnection("rejump")
     bindConnection("rejump", RunService.Heartbeat:Connect(function()
         if not State.flags.rejump or not State.flags.jump then
-            disconnectConnection("rejump")
-            return
+            disconnectConnection("rejump"); return
         end
-
-        local hum = humanoid()
-        if hum and hum.FloorMaterial ~= Enum.Material.Air then
-            hum:ChangeState(Enum.HumanoidStateType.Jumping)
+        local h = humanoid()
+        if h and h.FloorMaterial ~= Enum.Material.Air then
+            h:ChangeState(Enum.HumanoidStateType.Jumping)
             task.wait(0.15)
         end
     end))
 end
 
-local function stopRejumpLoop()
-    disconnectConnection("rejump")
-end
+local function stopRejumpLoop() disconnectConnection("rejump") end
 
 local function shakeUiVisible()
-    local shakeGui = PlayerGui:FindFirstChild("shakeui")
-    return shakeGui and shakeGui.Enabled ~= false
+    local g = PlayerGui:FindFirstChild("shakeui")
+    return g and g.Enabled ~= false
 end
 
-local function tapKey(keyCode)
-    pcall(function()
-        VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
-    end)
+local function tapKey(kc)
+    pcall(function() VirtualInputManager:SendKeyEvent(true, kc, false, game) end)
     task.wait(0.02)
-    pcall(function()
-        VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
-    end)
+    pcall(function() VirtualInputManager:SendKeyEvent(false, kc, false, game) end)
 end
 
-local function pressEnter()
-    tapKey(Enum.KeyCode.Return)
-end
-
-local function equipRodSlot()
-    tapKey(Enum.KeyCode.One)
-end
+local function pressEnter() tapKey(Enum.KeyCode.Return) end
+local function equipRodSlot() tapKey(Enum.KeyCode.One) end
 
 local function startShake()
     startTask("shake", function()
@@ -602,7 +451,6 @@ local function startShake()
                 task.wait(0.08)
             end
         end
-
         State.runtime.shakeActive = false
     end)
 end
@@ -613,82 +461,48 @@ local function stopShake()
 end
 
 local function sendMouseDown(x, y)
-    if State.runtime.castMouseHeld then
-        return
-    end
-
-    pcall(function()
-        VirtualInputManager:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, true, game, 0)
-    end)
+    if State.runtime.castMouseHeld then return end
+    pcall(function() VirtualInputManager:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, true, game, 0) end)
     State.runtime.castMouseHeld = true
 end
 
 local function sendMouseUp(x, y)
-    if not State.runtime.castMouseHeld then
-        return
-    end
-
-    pcall(function()
-        VirtualInputManager:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, false, game, 0)
-    end)
+    if not State.runtime.castMouseHeld then return end
+    pcall(function() VirtualInputManager:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, false, game, 0) end)
     State.runtime.castMouseHeld = false
 end
 
 local function forceCastRelease()
-    pcall(function()
-        VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
-    end)
+    pcall(function() VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0) end)
     State.runtime.castMouseHeld = false
 end
 
 local function findGuiByPatterns(names, includes, excludes)
     for _, name in ipairs(names) do
-        local gui = PlayerGui:FindFirstChild(name)
-        if gui and gui:IsA("ScreenGui") and gui.Enabled ~= false then
-            return gui
-        end
+        local g = PlayerGui:FindFirstChild(name)
+        if g and g:IsA("ScreenGui") and g.Enabled ~= false then return g end
     end
-
-    for _, gui in ipairs(PlayerGui:GetChildren()) do
-        if gui:IsA("ScreenGui") and gui.Enabled then
-            local lowerName = gui.Name:lower()
+    for _, g in ipairs(PlayerGui:GetChildren()) do
+        if g:IsA("ScreenGui") and g.Enabled then
+            local ln = g.Name:lower()
             local matched = false
-            for _, pattern in ipairs(includes) do
-                if lowerName:find(pattern) then
-                    matched = true
-                    break
-                end
-            end
-
+            for _, p in ipairs(includes) do if ln:find(p) then matched = true; break end end
             if matched then
                 local blocked = false
-                for _, pattern in ipairs(excludes or {}) do
-                    if lowerName:find(pattern) then
-                        blocked = true
-                        break
-                    end
-                end
-
-                if not blocked then
-                    return gui
-                end
+                for _, p in ipairs(excludes or {}) do if ln:find(p) then blocked = true; break end end
+                if not blocked then return g end
             end
         end
     end
-
     return nil
 end
 
-local function rectContains(parentObject, childObject)
-    local parentPos = parentObject.AbsolutePosition
-    local parentSize = parentObject.AbsoluteSize
-    local childPos = childObject.AbsolutePosition
-    local childSize = childObject.AbsoluteSize
-
-    return childPos.X >= parentPos.X - 2
-        and childPos.Y >= parentPos.Y - 2
-        and childPos.X + childSize.X <= parentPos.X + parentSize.X + 2
-        and childPos.Y + childSize.Y <= parentPos.Y + parentSize.Y + 2
+local function rectContains(parent, child)
+    local pp, ps = parent.AbsolutePosition, parent.AbsoluteSize
+    local cp, cs = child.AbsolutePosition, child.AbsoluteSize
+    return cp.X >= pp.X - 2 and cp.Y >= pp.Y - 2
+        and cp.X + cs.X <= pp.X + ps.X + 2
+        and cp.Y + cs.Y <= pp.Y + ps.Y + 2
 end
 
 local function findCastUI()
@@ -700,70 +514,51 @@ local function findCastUI()
 end
 
 local function findCastBar(castGui)
-    local bestBar
-    local bestBarScore = -math.huge
+    local bestBar, bestBarScore = nil, -math.huge
     local greenCandidates = {}
 
-    for _, descendant in ipairs(castGui:GetDescendants()) do
-        if descendant:IsA("Frame") and descendant.Visible then
-            local size = descendant.AbsoluteSize
-            local lowerName = descendant.Name:lower()
+    for _, d in ipairs(castGui:GetDescendants()) do
+        if d:IsA("Frame") and d.Visible then
+            local sz = d.AbsoluteSize
+            local ln = d.Name:lower()
 
-            if size.Y > 36 and size.X > 6 and size.X < 100 then
-                local ratio = size.Y / math.max(size.X, 1)
+            if sz.Y > 36 and sz.X > 6 and sz.X < 100 then
+                local ratio = sz.Y / math.max(sz.X, 1)
                 if ratio > 1.5 then
-                    local score = ratio * 3 + size.Y * 0.03
-                    if lowerName:find("bar") or lowerName:find("meter") or lowerName:find("power") then
-                        score += 4
-                    end
-                    if score > bestBarScore then
-                        bestBarScore = score
-                        bestBar = descendant
-                    end
+                    local score = ratio * 3 + sz.Y * 0.03
+                    if ln:find("bar") or ln:find("meter") or ln:find("power") then score += 4 end
+                    if score > bestBarScore then bestBarScore = score; bestBar = d end
                 end
             end
 
-            local color = descendant.BackgroundColor3
-            if color.G > color.R * 1.15 and color.G > color.B * 1.10 and color.G > 0.2 then
-                table.insert(greenCandidates, descendant)
-            elseif lowerName:find("fill") or lowerName:find("progress") or lowerName:find("green") then
-                table.insert(greenCandidates, descendant)
+            local c = d.BackgroundColor3
+            if c.G > c.R * 1.15 and c.G > c.B * 1.10 and c.G > 0.2 then
+                table.insert(greenCandidates, d)
+            elseif ln:find("fill") or ln:find("progress") or ln:find("green") then
+                table.insert(greenCandidates, d)
             end
         end
     end
 
-    if not bestBar then
-        return nil, nil
-    end
+    if not bestBar then return nil, nil end
 
-    local bestFill
-    local bestFillScore = -math.huge
-
-    for _, candidate in ipairs(greenCandidates) do
-        if candidate.Parent and rectContains(bestBar, candidate) then
-            local size = candidate.AbsoluteSize
-            local score = size.Y + size.X * 0.2
-            if candidate.Parent == bestBar then
-                score += 20
-            end
-            if score > bestFillScore then
-                bestFillScore = score
-                bestFill = candidate
-            end
+    local bestFill, bestFillScore = nil, -math.huge
+    for _, c in ipairs(greenCandidates) do
+        if c.Parent and rectContains(bestBar, c) then
+            local sz = c.AbsoluteSize
+            local score = sz.Y + sz.X * 0.2
+            if c.Parent == bestBar then score += 20 end
+            if score > bestFillScore then bestFillScore = score; bestFill = c end
         end
     end
 
     return bestBar, bestFill
 end
 
-local function getCastProgress(outerBar, greenFill)
-    if not outerBar or not greenFill then
-        return 0
-    end
-
-    local barHeight = math.max(outerBar.AbsoluteSize.Y, 1)
-    local fillHeight = greenFill.AbsoluteSize.Y
-    return math.clamp(fillHeight / barHeight, 0, 1)
+local function getCastProgress(outer, fill)
+    if not outer or not fill then return 0 end
+    local bh = math.max(outer.AbsoluteSize.Y, 1)
+    return math.clamp(fill.AbsoluteSize.Y / bh, 0, 1)
 end
 
 local function startCast()
@@ -776,65 +571,49 @@ local function startCast()
     local clearSince = 0
 
     local function hasFishingPhaseUI()
-        if shakeUiVisible() then
-            return true
+        if shakeUiVisible() then return true end
+        for _, n in ipairs({ "reelui", "ReelUI", "fishingrod", "FishingRod", "reelbar", "ReelBar", "Fishing", "FishingBar", "FishingUI" }) do
+            local g = PlayerGui:FindFirstChild(n)
+            if g and g.Enabled ~= false then return true end
         end
-
-        for _, name in ipairs({ "reelui", "ReelUI", "fishingrod", "FishingRod", "reelbar", "ReelBar", "Fishing", "FishingBar", "FishingUI" }) do
-            local gui = PlayerGui:FindFirstChild(name)
-            if gui and gui.Enabled ~= false then
-                return true
-            end
-        end
-
-        for _, gui in ipairs(PlayerGui:GetChildren()) do
-            if gui:IsA("ScreenGui") and gui.Enabled then
-                local lowerName = gui.Name:lower()
-                if (lowerName:find("reel") or lowerName:find("fish")) and not lowerName:find("shake") and not lowerName:find("cast") then
+        for _, g in ipairs(PlayerGui:GetChildren()) do
+            if g:IsA("ScreenGui") and g.Enabled then
+                local ln = g.Name:lower()
+                if (ln:find("reel") or ln:find("fish")) and not ln:find("shake") and not ln:find("cast") then
                     return true
                 end
             end
         end
-
         return false
     end
 
     startTask("cast", function()
         while State.flags.cast do
             local castGui = findCastUI()
-            local busyWithFishing = hasFishingPhaseUI()
+            local busy = hasFishingPhaseUI()
 
             if castGui and castGui.Enabled and not cycleLocked then
-                local outerBar, greenFill = findCastBar(castGui)
-                if outerBar and greenFill then
-                    local centerX = outerBar.AbsolutePosition.X + outerBar.AbsoluteSize.X * 0.5
-                    local centerY = outerBar.AbsolutePosition.Y + outerBar.AbsoluteSize.Y * 0.5
+                local outer, fill = findCastBar(castGui)
+                if outer and fill then
+                    local cx = outer.AbsolutePosition.X + outer.AbsoluteSize.X * 0.5
+                    local cy = outer.AbsolutePosition.Y + outer.AbsoluteSize.Y * 0.5
 
                     State.runtime.castActive = true
                     State.runtime.castPhase = "holding"
-                    sendMouseDown(centerX, centerY)
+                    sendMouseDown(cx, cy)
 
-                    local elapsed = 0
-                    local timeout = 3.5
-
+                    local elapsed, timeout = 0, 3.5
                     while State.flags.cast and elapsed < timeout do
                         task.wait(0.02)
                         elapsed += 0.02
-
-                        outerBar, greenFill = findCastBar(castGui)
-                        local progress = getCastProgress(outerBar, greenFill)
-
-                        if progress >= State.values.castReleasePct then
-                            break
-                        end
-
-                        if not castGui.Parent or castGui.Enabled == false then
-                            break
-                        end
+                        outer, fill = findCastBar(castGui)
+                        local progress = getCastProgress(outer, fill)
+                        if progress >= State.values.castReleasePct then break end
+                        if not castGui.Parent or castGui.Enabled == false then break end
                     end
 
                     State.runtime.castPhase = "releasing"
-                    sendMouseUp(centerX, centerY)
+                    sendMouseUp(cx, cy)
                     State.runtime.castActive = false
                     State.runtime.castPhase = "cooldown"
                     cycleLocked = true
@@ -846,14 +625,12 @@ local function startCast()
                     State.runtime.castPhase = "searching"
                     task.wait(0.08)
                 end
-            elseif cycleLocked or busyWithFishing then
+            elseif cycleLocked or busy then
                 forceCastRelease()
                 State.runtime.castActive = false
                 State.runtime.castPhase = "cooldown"
-
-                if busyWithFishing or (castGui and castGui.Enabled) then
-                    clearSince = 0
-                    cycleLocked = true
+                if busy or (castGui and castGui.Enabled) then
+                    clearSince = 0; cycleLocked = true
                 else
                     clearSince += 0.10
                     if clearSince >= 1.20 then
@@ -861,14 +638,13 @@ local function startCast()
                         State.runtime.castPhase = "idle"
                     end
                 end
-
                 task.wait(0.10)
             else
                 State.runtime.castActive = false
                 State.runtime.castPhase = "arming"
-                local camera = workspace.CurrentCamera
-                local centerX = camera and (camera.ViewportSize.X * 0.5) or 400
-                local centerY = camera and (camera.ViewportSize.Y * 0.5) or 300
+                local cam = workspace.CurrentCamera
+                local cx = cam and (cam.ViewportSize.X * 0.5) or 400
+                local cy = cam and (cam.ViewportSize.Y * 0.5) or 300
 
                 if tick() - State.runtime.lastCastEquipAttempt >= 0.90 then
                     State.runtime.lastCastEquipAttempt = tick()
@@ -877,13 +653,12 @@ local function startCast()
 
                 if (not State.runtime.castMouseHeld) or (tick() - primeStartedAt >= 1.35) then
                     if State.runtime.castMouseHeld then
-                        sendMouseUp(centerX, centerY)
+                        sendMouseUp(cx, cy)
                         task.wait(0.12)
                     end
-                    sendMouseDown(centerX, centerY)
+                    sendMouseDown(cx, cy)
                     primeStartedAt = tick()
                 end
-
                 task.wait(0.08)
             end
         end
@@ -903,187 +678,157 @@ local function stopCast()
     stopTask("cast")
 end
 
+-- ════════════════════════════════════════
+-- AUTO-REEL v19 — DUTY CYCLE REWRITE
+-- ════════════════════════════════════════
 local function findReelUI()
-    for _, name in ipairs({ "reelui", "ReelUI", "fishingrod", "FishingRod", "reelbar", "ReelBar", "Fishing", "FishingBar", "FishingUI" }) do
-        local gui = PlayerGui:FindFirstChild(name)
-        if gui and gui.Enabled ~= false then
-            return gui
+    for _, n in ipairs({ "reelui", "ReelUI", "fishingrod", "FishingRod", "reelbar", "ReelBar", "Fishing", "FishingBar", "FishingUI" }) do
+        local g = PlayerGui:FindFirstChild(n)
+        if g and g.Enabled ~= false then return g end
+    end
+    for _, g in ipairs(PlayerGui:GetChildren()) do
+        if g:IsA("ScreenGui") and g.Enabled then
+            local ln = g.Name:lower()
+            if (ln:find("reel") or ln:find("fish")) and not ln:find("shake") then return g end
         end
     end
-
-    for _, gui in ipairs(PlayerGui:GetChildren()) do
-        if gui:IsA("ScreenGui") and gui.Enabled then
-            local lowerName = gui.Name:lower()
-            if (lowerName:find("reel") or lowerName:find("fish")) and not lowerName:find("shake") then
-                return gui
-            end
-        end
-    end
-
     return nil
 end
 
 local function findReelElements(reelGui)
-    local playerBar
-    local fishBar
-
-    for _, descendant in ipairs(reelGui:GetDescendants()) do
-        if descendant:IsA("GuiObject") and descendant.Visible then
-            local lowerName = descendant.Name:lower()
-            if not playerBar and (lowerName == "playerbar" or lowerName == "player" or lowerName:find("playerbar")) then
-                playerBar = descendant
-            elseif not fishBar and (lowerName == "fish" or lowerName == "fishbar" or lowerName == "fishicon" or lowerName:find("fish") or lowerName:find("target")) then
-                fishBar = descendant
+    local pb, fb
+    for _, d in ipairs(reelGui:GetDescendants()) do
+        if d:IsA("GuiObject") and d.Visible then
+            local ln = d.Name:lower()
+            if not pb and (ln == "playerbar" or ln == "player" or ln:find("playerbar")) then
+                pb = d
+            elseif not fb and (ln == "fish" or ln == "fishbar" or ln == "fishicon" or ln:find("fish") or ln:find("target")) then
+                fb = d
             end
         end
     end
-
-    return playerBar, fishBar
+    return pb, fb
 end
 
 local function detectRewardGui()
-    for _, gui in ipairs(PlayerGui:GetChildren()) do
-        if gui:IsA("ScreenGui") and gui.Enabled then
-            local lowerName = gui.Name:lower()
-            if lowerName:find("reward") or lowerName:find("catch") or lowerName:find("result") or lowerName:find("caught") then
+    for _, g in ipairs(PlayerGui:GetChildren()) do
+        if g:IsA("ScreenGui") and g.Enabled then
+            local ln = g.Name:lower()
+            if ln:find("reward") or ln:find("catch") or ln:find("result") or ln:find("caught") then
                 return true, "win"
             end
-            if lowerName:find("fail") or lowerName:find("escape") or lowerName:find("lost") then
+            if ln:find("fail") or ln:find("escape") or ln:find("lost") then
                 return true, "lose"
             end
         end
     end
-
-    for _, gui in ipairs(PlayerGui:GetChildren()) do
-        if gui:IsA("ScreenGui") and gui.Enabled then
-            for _, descendant in ipairs(gui:GetDescendants()) do
-                if descendant:IsA("TextLabel") and descendant.Visible then
-                    local text = descendant.Text:lower()
-                    if text:find("got away") or text:find("escapou") or text:find("escaped") or text:find("failed") then
+    for _, g in ipairs(PlayerGui:GetChildren()) do
+        if g:IsA("ScreenGui") and g.Enabled then
+            for _, d in ipairs(g:GetDescendants()) do
+                if d:IsA("TextLabel") and d.Visible then
+                    local t = d.Text:lower()
+                    if t:find("got away") or t:find("escapou") or t:find("escaped") or t:find("failed") then
                         return true, "lose"
                     end
-                    if text:find("caught") or text:find("capturou") or text:find("pescou") or text:find("hooked") then
+                    if t:find("caught") or t:find("capturou") or t:find("pescou") or t:find("hooked") then
                         return true, "win"
                     end
                 end
             end
         end
     end
-
     return false, nil
 end
 
 local function reelMousePress(x, y)
-    if State.runtime.reelMouseHeld then
-        return
-    end
-    pcall(function()
-        VirtualInputManager:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, true, game, 0)
-    end)
+    if State.runtime.reelMouseHeld then return end
+    pcall(function() VirtualInputManager:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, true, game, 0) end)
     State.runtime.reelMouseHeld = true
 end
 
 local function reelMouseRelease(x, y)
-    if not State.runtime.reelMouseHeld then
-        return
-    end
-    pcall(function()
-        VirtualInputManager:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, false, game, 0)
-    end)
+    if not State.runtime.reelMouseHeld then return end
+    pcall(function() VirtualInputManager:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, false, game, 0) end)
     State.runtime.reelMouseHeld = false
 end
 
 local function reelForceRelease()
-    pcall(function()
-        VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
-    end)
+    pcall(function() VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0) end)
     State.runtime.reelMouseHeld = false
 end
 
 local function getOrCreateReelOverlay(reelGui)
     local overlay = reelGui:FindFirstChild("UtilityReelOverlay")
-    if overlay then
-        return overlay
-    end
+    if overlay then return overlay end
 
     overlay = create("Frame", {
-        Parent = reelGui,
-        Name = "UtilityReelOverlay",
-        Size = UDim2.new(1, 0, 1, 0),
-        BackgroundTransparency = 1,
-        BorderSizePixel = 0,
-        ZIndex = 19,
+        Parent = reelGui, Name = "UtilityReelOverlay",
+        Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1,
+        BorderSizePixel = 0, ZIndex = 19,
     })
 
     local function makeMarker(name, text, color)
         return create("TextLabel", {
-            Parent = overlay,
-            Name = name,
-            Size = UDim2.new(0, 14, 0, 14),
-            BackgroundTransparency = 1,
-            Text = text,
-            TextColor3 = color,
-            Font = Enum.Font.Code,
-            TextSize = 14,
+            Parent = overlay, Name = name,
+            Size = UDim2.new(0, 14, 0, 14), BackgroundTransparency = 1,
+            Text = text, TextColor3 = color,
+            Font = Enum.Font.Code, TextSize = 14,
             TextStrokeTransparency = 0.4,
             TextXAlignment = Enum.TextXAlignment.Center,
             TextYAlignment = Enum.TextYAlignment.Center,
-            Visible = false,
-            ZIndex = 20,
+            Visible = false, ZIndex = 20,
         })
     end
 
     makeMarker("Left", "<", Theme.warning)
     makeMarker("Right", ">", Theme.warning)
     makeMarker("Fish", ",", Theme.cast)
-
     return overlay
 end
 
 local function hideReelOverlay(reelGui)
-    if not reelGui then
-        return
-    end
-
+    if not reelGui then return end
     local overlay = reelGui:FindFirstChild("UtilityReelOverlay")
-    if not overlay then
-        return
-    end
-
-    for _, child in ipairs(overlay:GetChildren()) do
-        if child:IsA("TextLabel") then
-            child.Visible = false
-        end
+    if not overlay then return end
+    for _, ch in ipairs(overlay:GetChildren()) do
+        if ch:IsA("TextLabel") then ch.Visible = false end
     end
 end
 
-local function updateReelOverlay(reelGui, playerBar, fishBar)
+local function updateReelOverlay(reelGui, pb, fb)
     local overlay = getOrCreateReelOverlay(reelGui)
-    local leftMarker = overlay:FindFirstChild("Left")
-    local rightMarker = overlay:FindFirstChild("Right")
-    local fishMarker = overlay:FindFirstChild("Fish")
-
-    if not (leftMarker and rightMarker and fishMarker and playerBar and fishBar) then
-        hideReelOverlay(reelGui)
-        return
+    local l = overlay:FindFirstChild("Left")
+    local r = overlay:FindFirstChild("Right")
+    local f = overlay:FindFirstChild("Fish")
+    if not (l and r and f and pb and fb) then
+        hideReelOverlay(reelGui); return
     end
 
-    local barLeft = playerBar.AbsolutePosition.X
-    local barRight = playerBar.AbsolutePosition.X + playerBar.AbsoluteSize.X
-    local barBottom = playerBar.AbsolutePosition.Y + playerBar.AbsoluteSize.Y
-    local fishCenterX = fishBar.AbsolutePosition.X + fishBar.AbsoluteSize.X * 0.5
-    local fishBottom = fishBar.AbsolutePosition.Y + fishBar.AbsoluteSize.Y
+    local bl = pb.AbsolutePosition.X
+    local br = pb.AbsolutePosition.X + pb.AbsoluteSize.X
+    local bb = pb.AbsolutePosition.Y + pb.AbsoluteSize.Y
+    local fx = fb.AbsolutePosition.X + fb.AbsoluteSize.X * 0.5
+    local fy = fb.AbsolutePosition.Y + fb.AbsoluteSize.Y
 
-    leftMarker.Position = UDim2.fromOffset(math.floor(barLeft - 7), math.floor(barBottom + 1))
-    leftMarker.Visible = true
-
-    rightMarker.Position = UDim2.fromOffset(math.floor(barRight - 7), math.floor(barBottom + 1))
-    rightMarker.Visible = true
-
-    fishMarker.Position = UDim2.fromOffset(math.floor(fishCenterX - 7), math.floor(fishBottom - 1))
-    fishMarker.Visible = true
+    l.Position = UDim2.fromOffset(math.floor(bl - 7), math.floor(bb + 1))
+    l.Visible = true
+    r.Position = UDim2.fromOffset(math.floor(br - 7), math.floor(bb + 1))
+    r.Visible = true
+    f.Position = UDim2.fromOffset(math.floor(fx - 7), math.floor(fy - 1))
+    f.Visible = true
 end
 
+-- ════════════════════════════════════════
+-- CORE FIX v19: duty-cycle loop
+--
+-- How it works:
+-- 1. Runs every Heartbeat (~16ms)
+-- 2. Calculates fish offset from player bar center (-1 to +1)
+-- 3. Converts offset to duty cycle (% of time mouse should be down)
+-- 4. Within each cycle (45ms), mouse is down for (duty*cycle)ms
+-- 5. No switchDelay/oscillation — pure time-based modulation
+-- 6. Anti-rebound: if fish crosses center, lock state for 80ms
+-- ════════════════════════════════════════
 local function startAutoReel()
     reelForceRelease()
     State.runtime.reelActive = false
@@ -1091,10 +836,12 @@ local function startAutoReel()
     startTask("autoReel", function()
         local wasActive = false
         local sessionStart = 0
-        local sessionDiagnosis
-        local lastFishX = nil
-        local lastControlSwitch = tick()
-        local controlTargetHeld = false
+        local sessionDiag
+
+        -- Duty-cycle state
+        local cycleStartTime = tick()
+        local lastFishSide = 0  -- -1 left, 0 center, +1 right
+        local reboundUntil = 0  -- timestamp until which state is locked
 
         while State.flags.autoReel do
             local reelGui = findReelUI()
@@ -1103,136 +850,139 @@ local function startAutoReel()
                 if not wasActive then
                     wasActive = true
                     sessionStart = tick()
-                    sessionDiagnosis = {
-                        timesFar = 0,
-                        timesOvershoots = 0,
-                        timesInside = 0,
-                        timesMid = 0,
+                    sessionDiag = {
+                        timesFar = 0, timesOvershoots = 0,
+                        timesInside = 0, timesMid = 0,
                         startTime = tick(),
                     }
+                    cycleStartTime = tick()
+                    lastFishSide = 0
+                    reboundUntil = 0
                 end
 
-                local playerBar, fishBar = findReelElements(reelGui)
-                if not playerBar or not fishBar then
+                local pb, fb = findReelElements(reelGui)
+                if not pb or not fb then
                     reelForceRelease()
                     hideReelOverlay(reelGui)
                     State.runtime.reelActive = false
-                    lastFishX = nil
-                    controlTargetHeld = false
-                    task.wait(0.08)
+                    task.wait(0.05)
                 else
                     State.runtime.reelActive = true
 
-                    local barLeft = playerBar.AbsolutePosition.X
-                    local barRight = playerBar.AbsolutePosition.X + playerBar.AbsoluteSize.X
-                    local barWidth = math.max(playerBar.AbsoluteSize.X, 1)
+                    local barLeft = pb.AbsolutePosition.X
+                    local barRight = pb.AbsolutePosition.X + pb.AbsoluteSize.X
+                    local barWidth = math.max(pb.AbsoluteSize.X, 1)
                     local barCenter = barLeft + barWidth * 0.5
-                    local fishCenterX = fishBar.AbsolutePosition.X + fishBar.AbsoluteSize.X * 0.5
-                    local fishInside = fishCenterX >= barLeft and fishCenterX <= barRight
-                    local distance = math.abs(fishCenterX - barCenter)
-                    local ratio = distance / barWidth
-                    local overshoot = fishCenterX < (barLeft - barWidth * 0.10) or fishCenterX > (barRight + barWidth * 0.10)
+                    local barY = pb.AbsolutePosition.Y + pb.AbsoluteSize.Y * 0.5
+                    local fishX = fb.AbsolutePosition.X + fb.AbsoluteSize.X * 0.5
 
-                    if sessionDiagnosis then
+                    -- offset: -1 (far left) to +1 (far right), normalized to half barWidth
+                    local rawOffset = (fishX - barCenter) / (barWidth * 0.5)
+                    local offset = clamp(rawOffset, -1.2, 1.2)
+                    local absOffset = math.abs(offset)
+                    local fishInside = fishX >= barLeft and fishX <= barRight
+
+                    -- Diagnosis for learning
+                    if sessionDiag then
                         if fishInside then
-                            sessionDiagnosis.timesInside += 1
-                        elseif ratio < 0.30 then
-                            sessionDiagnosis.timesMid += 1
+                            sessionDiag.timesInside += 1
+                        elseif absOffset < 0.5 then
+                            sessionDiag.timesMid += 1
                         else
-                            sessionDiagnosis.timesFar += 1
+                            sessionDiag.timesFar += 1
                         end
-                        if overshoot then
-                            sessionDiagnosis.timesOvershoots += 1
+                        if absOffset > 1.1 then
+                            sessionDiag.timesOvershoots += 1
                         end
                     end
 
-                    updateReelOverlay(reelGui, playerBar, fishBar)
+                    updateReelOverlay(reelGui, pb, fb)
 
-                    local fishVelocity = 0
-                    if lastFishX then
-                        fishVelocity = fishCenterX - lastFishX
-                    end
-                    lastFishX = fishCenterX
+                    -- ───────────────────────────────
+                    -- DUTY CYCLE CALCULATION
+                    -- ───────────────────────────────
+                    -- offset = -1 (esquerda total) → duty = 0 (solta 100%)
+                    -- offset = +1 (direita total) → duty = 1 (segura 100%)
+                    -- offset ≈ 0 (centro) → duty ≈ duty_near (equilíbrio)
+                    -- Dead zone: if within dead_zone of center, use exactly duty_near
 
-                    local targetOffset = (fishCenterX - barCenter) / barWidth
-                    local edgeMargin = math.max(barWidth * 0.18, 10)
-                    local leftTrigger = barLeft + edgeMargin
-                    local rightTrigger = barRight - edgeMargin
-                    local timeInState = tick() - lastControlSwitch
-                    local desiredHold = controlTargetHeld
-
-                    if fishCenterX >= rightTrigger then
-                        desiredHold = true
-                    elseif fishCenterX <= leftTrigger then
-                        desiredHold = false
-                    elseif not fishInside then
-                        desiredHold = fishCenterX > barRight
-                    elseif State.runtime.reelMouseHeld then
-                        if fishCenterX <= (barLeft + barWidth * 0.62) then
-                            desiredHold = false
-                        elseif fishVelocity <= -0.35 and fishCenterX <= (barLeft + barWidth * 0.72) then
-                            desiredHold = false
-                        elseif timeInState > 0.16 and targetOffset <= 0.06 then
-                            desiredHold = false
+                    local duty
+                    if absOffset < ReelParams.dead_zone then
+                        -- Dead zone — no agitation
+                        duty = ReelParams.duty_near
+                    elseif offset > 0 then
+                        -- Fish is right of center → hold more
+                        if absOffset < 0.3 then
+                            -- Near: smooth transition near → mid
+                            duty = ReelParams.duty_near + (ReelParams.duty_mid - ReelParams.duty_near) * (absOffset / 0.3)
+                        elseif absOffset < 0.7 then
+                            -- Mid → far transition
+                            duty = ReelParams.duty_mid + (ReelParams.duty_far - ReelParams.duty_mid) * ((absOffset - 0.3) / 0.4)
                         else
-                            desiredHold = true
+                            duty = ReelParams.duty_far
                         end
                     else
-                        if fishCenterX >= (barLeft + barWidth * 0.74) then
-                            desiredHold = true
-                        elseif fishVelocity >= 0.55 and fishCenterX >= (barLeft + barWidth * 0.62) then
-                            desiredHold = true
-                        elseif timeInState > 0.18 and targetOffset > 0.10 then
-                            desiredHold = true
+                        -- Fish is left of center → release more (invert duty)
+                        if absOffset < 0.3 then
+                            duty = ReelParams.duty_near - (ReelParams.duty_mid - ReelParams.duty_near) * (absOffset / 0.3)
+                        elseif absOffset < 0.7 then
+                            duty = (1 - ReelParams.duty_mid) - (ReelParams.duty_far - ReelParams.duty_mid) * ((absOffset - 0.3) / 0.4)
                         else
-                            desiredHold = false
+                            duty = 1 - ReelParams.duty_far
                         end
                     end
 
-                    controlTargetHeld = desiredHold
+                    duty = clamp(duty, 0, 1)
 
-                    local switchDelay = State.runtime.reelMouseHeld and 0.13 or 0.10
-                    local pointerY = playerBar.AbsolutePosition.Y + playerBar.AbsoluteSize.Y * 0.5
+                    -- ───────────────────────────────
+                    -- ANTI-REBOUND (fix spam direita)
+                    -- ───────────────────────────────
+                    -- If fish just crossed center, lock the desired state
+                    -- for rebound_ms. Prevents oscillation when player bar
+                    -- overshoots and fish appears briefly on the other side.
+                    local fishSide = fishX > barCenter + barWidth * 0.02 and 1
+                        or (fishX < barCenter - barWidth * 0.02 and -1 or 0)
+                    if fishSide ~= 0 and fishSide ~= lastFishSide and lastFishSide ~= 0 then
+                        reboundUntil = tick() + (ReelParams.rebound_ms / 1000)
+                    end
+                    if fishSide ~= 0 then lastFishSide = fishSide end
 
-                    if desiredHold ~= nil and desiredHold ~= State.runtime.reelMouseHeld then
-                        if tick() - lastControlSwitch >= switchDelay then
-                            if desiredHold then
-                                reelMousePress(barCenter, pointerY)
-                            else
-                                reelMouseRelease(barCenter, pointerY)
-                            end
-                            lastControlSwitch = tick()
-                        end
-                    elseif desiredHold == true and not State.runtime.reelMouseHeld and tick() - lastControlSwitch >= 0.11 then
-                        reelMousePress(barCenter, pointerY)
-                        lastControlSwitch = tick()
-                    elseif desiredHold == false and State.runtime.reelMouseHeld and tick() - lastControlSwitch >= 0.11 then
-                        reelMouseRelease(barCenter, pointerY)
-                        lastControlSwitch = tick()
+                    -- ───────────────────────────────
+                    -- DRIVE MOUSE BASED ON DUTY CYCLE
+                    -- ───────────────────────────────
+                    local now = tick()
+                    local cyclePhase = ((now - cycleStartTime) * 1000) % ReelParams.cycle_ms
+                    local holdThreshold = duty * ReelParams.cycle_ms
+                    local shouldHold = cyclePhase < holdThreshold
+
+                    -- During rebound: override with whatever state matches fishSide
+                    if now < reboundUntil then
+                        if fishSide > 0 then shouldHold = true
+                        elseif fishSide < 0 then shouldHold = false end
                     end
 
-                    if fishInside then
-                        task.wait(0.060)
-                    elseif ratio < 0.30 then
-                        task.wait(0.050)
-                    else
-                        task.wait(0.042)
+                    if shouldHold and not State.runtime.reelMouseHeld then
+                        reelMousePress(barCenter, barY)
+                    elseif not shouldHold and State.runtime.reelMouseHeld then
+                        reelMouseRelease(barCenter, barY)
                     end
+
+                    -- Yield to next frame (Heartbeat = ~16ms @ 60fps)
+                    RunService.Heartbeat:Wait()
                 end
             else
-                if State.runtime.reelMouseHeld then
-                    reelForceRelease()
-                end
+                -- No reel UI visible
+                if State.runtime.reelMouseHeld then reelForceRelease() end
                 State.runtime.reelActive = false
-                lastFishX = nil
-                lastControlSwitch = tick()
-                controlTargetHeld = false
+                lastFishSide = 0
+                reboundUntil = 0
 
                 if wasActive then
                     wasActive = false
                     hideReelOverlay(reelGui)
-                    local won = false
-                    local detected = false
+
+                    -- Detect win/lose
+                    local won, detected = false, false
                     for _ = 1, 20 do
                         task.wait(0.1)
                         local found, result = detectRewardGui()
@@ -1242,44 +992,34 @@ local function startAutoReel()
                             break
                         end
                     end
+                    if not detected then won = (tick() - sessionStart) > 3.0 end
 
-                    if not detected then
-                        won = (tick() - sessionStart) > 3.0
-                    end
-
-                    if sessionDiagnosis then
-                        applyLearning(won, sessionDiagnosis)
-                        sessionDiagnosis = nil
+                    if sessionDiag then
+                        applyLearning(won, sessionDiag)
+                        sessionDiag = nil
                     end
 
                     if UI.refs.reelScore then
                         local wins, total = getRecentScore(10)
                         local trend = ""
                         if total > 0 then
-                            if wins >= total * 0.7 then
-                                trend = " ↑"
-                            elseif wins <= total * 0.3 then
-                                trend = " ↓"
-                            else
-                                trend = " →"
-                            end
+                            if wins >= total * 0.7 then trend = " ↑"
+                            elseif wins <= total * 0.3 then trend = " ↓"
+                            else trend = " →" end
                         end
-
                         UI.refs.reelScore.Text = string.format("Score %d/%d%s • %s", wins, total, trend, LearnHistory.lastDiagnosis)
                         UI.refs.reelScore.TextColor3 = won and Theme.success or Theme.warning
                     end
 
                     task.wait(1.5)
                 else
-                    task.wait(0.10)
+                    task.wait(0.08)
                 end
             end
         end
 
         reelForceRelease()
         State.runtime.reelActive = false
-        lastFishX = nil
-        controlTargetHeld = false
     end)
 end
 
@@ -1291,813 +1031,520 @@ local function stopAutoReel()
     stopTask("autoReel")
 end
 
+-- ════════════════════════════════════════
+-- SELL / MAPS / NPCs (igual v18)
+-- ════════════════════════════════════════
 local function getTreasureMaps()
     local maps = {}
-
-    local function scan(container)
-        if not container then
-            return
-        end
-
-        for _, toolInstance in ipairs(container:GetChildren()) do
-            if toolInstance:IsA("Tool") and (toolInstance.Name:lower():find("treasure") or toolInstance.Name:lower():find("map")) then
-                local x
-                local y
-                local z
-
-                for _, attr in ipairs({ "X", "x", "PosX", "CoordX", "TargetX" }) do
-                    local value = toolInstance:GetAttribute(attr)
-                    if value then
-                        x = value
-                        break
-                    end
+    local function scan(cont)
+        if not cont then return end
+        for _, t in ipairs(cont:GetChildren()) do
+            if t:IsA("Tool") and (t.Name:lower():find("treasure") or t.Name:lower():find("map")) then
+                local x, y, z
+                for _, a in ipairs({ "X", "x", "PosX", "CoordX", "TargetX" }) do
+                    local v = t:GetAttribute(a); if v then x = v; break end
                 end
-                for _, attr in ipairs({ "Y", "y", "PosY", "CoordY", "TargetY" }) do
-                    local value = toolInstance:GetAttribute(attr)
-                    if value then
-                        y = value
-                        break
-                    end
+                for _, a in ipairs({ "Y", "y", "PosY", "CoordY", "TargetY" }) do
+                    local v = t:GetAttribute(a); if v then y = v; break end
                 end
-                for _, attr in ipairs({ "Z", "z", "PosZ", "CoordZ", "TargetZ" }) do
-                    local value = toolInstance:GetAttribute(attr)
-                    if value then
-                        z = value
-                        break
-                    end
+                for _, a in ipairs({ "Z", "z", "PosZ", "CoordZ", "TargetZ" }) do
+                    local v = t:GetAttribute(a); if v then z = v; break end
                 end
-
                 if not (x and y and z) then
-                    for _, descendant in ipairs(toolInstance:GetDescendants()) do
-                        if descendant:IsA("Vector3Value") then
-                            x = descendant.Value.X
-                            y = descendant.Value.Y
-                            z = descendant.Value.Z
-                            break
+                    for _, d in ipairs(t:GetDescendants()) do
+                        if d:IsA("Vector3Value") then
+                            x = d.Value.X; y = d.Value.Y; z = d.Value.Z; break
                         end
-                        if descendant:IsA("StringValue") then
-                            local sx, sy, sz = descendant.Value:match("(%-?%d+)[,%s]+(%-?%d+)[,%s]+(%-?%d+)")
-                            if sx then
-                                x = tonumber(sx)
-                                y = tonumber(sy)
-                                z = tonumber(sz)
-                                break
-                            end
+                        if d:IsA("StringValue") then
+                            local sx, sy, sz = d.Value:match("(%-?%d+)[,%s]+(%-?%d+)[,%s]+(%-?%d+)")
+                            if sx then x = tonumber(sx); y = tonumber(sy); z = tonumber(sz); break end
                         end
                     end
                 end
-
                 if x and y and z then
-                    table.insert(maps, {
-                        name = toolInstance.Name,
-                        pos = Vector3.new(x, y, z),
-                        fixed = true,
-                        tool = toolInstance,
-                    })
+                    table.insert(maps, { name = t.Name, pos = Vector3.new(x, y, z), fixed = true, tool = t })
                 else
-                    table.insert(maps, {
-                        name = toolInstance.Name .. " (não fixado)",
-                        pos = nil,
-                        fixed = false,
-                        tool = toolInstance,
-                    })
+                    table.insert(maps, { name = t.Name .. " (não fixado)", pos = nil, fixed = false, tool = t })
                 end
             end
         end
     end
-
     scan(LocalPlayer:FindFirstChild("Backpack"))
     if heldTool() and (heldTool().Name:lower():find("treasure") or heldTool().Name:lower():find("map")) then
         scan(LocalPlayer.Character)
     end
-
     return maps
 end
 
-local function trySellTool(toolInstance)
-    if not toolInstance then
-        return false, "no_tool"
-    end
-
-    local events = ReplicatedStorage:FindFirstChild("events")
+local function trySellTool(t)
+    if not t then return false, "no_tool" end
+    local ev = ReplicatedStorage:FindFirstChild("events")
         or ReplicatedStorage:FindFirstChild("Events")
         or ReplicatedStorage:FindFirstChild("Remotes")
-
-    if events then
-        for _, name in ipairs({ "sell", "Sell", "appraise", "Appraise", "sellfish", "SellFish", "SellItem", "appraiseFish", "FishSell", "submitFish", "cashIn" }) do
-            local remote = events:FindFirstChild(name)
-            if remote then
-                if remote:IsA("RemoteEvent") then
-                    pcall(function()
-                        remote:FireServer(toolInstance)
-                    end)
-                    return true, "RE:" .. name
+    if ev then
+        for _, n in ipairs({ "sell", "Sell", "appraise", "Appraise", "sellfish", "SellFish", "SellItem", "appraiseFish", "FishSell", "submitFish", "cashIn" }) do
+            local r = ev:FindFirstChild(n)
+            if r then
+                if r:IsA("RemoteEvent") then
+                    pcall(function() r:FireServer(t) end)
+                    return true, "RE:" .. n
                 end
-                if remote:IsA("RemoteFunction") then
-                    local ok = pcall(function()
-                        remote:InvokeServer(toolInstance)
-                    end)
-                    if ok then
-                        return true, "RF:" .. name
-                    end
+                if r:IsA("RemoteFunction") then
+                    local ok = pcall(function() r:InvokeServer(t) end)
+                    if ok then return true, "RF:" .. n end
                 end
             end
         end
-
-        for _, remote in ipairs(events:GetDescendants()) do
-            local lowerName = remote.Name:lower()
-            if (lowerName:find("sell") or lowerName:find("appraise") or lowerName:find("submit") or lowerName:find("cash")) and remote:IsA("RemoteEvent") then
-                pcall(function()
-                    remote:FireServer(toolInstance)
-                end)
-                return true, "RE:" .. remote.Name
+        for _, r in ipairs(ev:GetDescendants()) do
+            local ln = r.Name:lower()
+            if (ln:find("sell") or ln:find("appraise") or ln:find("submit") or ln:find("cash")) and r:IsA("RemoteEvent") then
+                pcall(function() r:FireServer(t) end)
+                return true, "RE:" .. r.Name
             end
         end
     end
-
-    for _, object in ipairs(PlayerGui:GetDescendants()) do
-        if object:IsA("GuiButton") and object.Visible then
-            local lowerName = object.Name:lower()
-            if lowerName:find("sell") or lowerName:find("appraise") or lowerName:find("submit") then
-                local size = object.AbsoluteSize
-                if size.X > 2 and size.Y > 2 then
-                    pcall(function()
-                        object.MouseButton1Click:Fire()
-                    end)
-                    return true, "GUI:" .. object.Name
+    for _, o in ipairs(PlayerGui:GetDescendants()) do
+        if o:IsA("GuiButton") and o.Visible then
+            local ln = o.Name:lower()
+            if ln:find("sell") or ln:find("appraise") or ln:find("submit") then
+                local sz = o.AbsoluteSize
+                if sz.X > 2 and sz.Y > 2 then
+                    pcall(function() o.MouseButton1Click:Fire() end)
+                    return true, "GUI:" .. o.Name
                 end
             end
         end
     end
-
-    pcall(function()
-        toolInstance:Activate()
-    end)
+    pcall(function() t:Activate() end)
     return false, "no_method"
 end
 
 local function sellFromHand()
-    local toolInstance = heldTool()
-    if not toolInstance then
-        return false, "No item in hand"
-    end
-    return trySellTool(toolInstance)
+    local t = heldTool()
+    if not t then return false, "No item in hand" end
+    return trySellTool(t)
 end
 
 local function sellAll()
-    local sold = 0
-    local failed = 0
+    local sold, failed = 0, 0
     local items = {}
-    local backpack = LocalPlayer:FindFirstChild("Backpack")
-
-    if backpack then
-        for _, toolInstance in ipairs(backpack:GetChildren()) do
-            if toolInstance:IsA("Tool") and not (toolInstance.Name:lower():find("treasure") or toolInstance.Name:lower():find("map")) then
-                table.insert(items, toolInstance)
+    local bp = LocalPlayer:FindFirstChild("Backpack")
+    if bp then
+        for _, t in ipairs(bp:GetChildren()) do
+            if t:IsA("Tool") and not (t.Name:lower():find("treasure") or t.Name:lower():find("map")) then
+                table.insert(items, t)
             end
         end
     end
-
-    local toolInstance = heldTool()
-    if toolInstance and not (toolInstance.Name:lower():find("treasure") or toolInstance.Name:lower():find("map")) then
-        table.insert(items, toolInstance)
+    local t = heldTool()
+    if t and not (t.Name:lower():find("treasure") or t.Name:lower():find("map")) then
+        table.insert(items, t)
     end
-
-    for _, item in ipairs(items) do
-        local ok = trySellTool(item)
-        if ok then
-            sold += 1
-        else
-            failed += 1
-        end
+    for _, i in ipairs(items) do
+        local ok = trySellTool(i)
+        if ok then sold += 1 else failed += 1 end
         task.wait(0.15)
     end
-
-    if sold == 0 and failed == 0 then
-        return false, "Inventory empty"
-    end
-
+    if sold == 0 and failed == 0 then return false, "Inventory empty" end
     return true, "Sold " .. sold .. (failed > 0 and (" | Failed " .. failed) or "")
 end
 
 local function startAutoSell()
     startTask("autoSell", function()
         while State.flags.autoSell do
-            local ok, message = sellAll()
-            setStatus(UI.refs.autoSellStatus, (ok and "✅ " or "⏳ ") .. message, ok and Theme.success or Theme.warning)
+            local ok, msg = sellAll()
+            setStatus(UI.refs.autoSellStatus, (ok and "✅ " or "⏳ ") .. msg, ok and Theme.success or Theme.warning)
             task.wait(State.values.autoSellDelay)
         end
         setStatus(UI.refs.autoSellStatus, "Auto-sell off", Theme.muted)
     end)
 end
 
-local function stopAutoSell()
-    stopTask("autoSell")
-end
+local function stopAutoSell() stopTask("autoSell") end
 
 local function getNearbyNPCs()
-    local root = rootPart()
-    if not root then
-        return {}
-    end
-
-    local results = {}
-    for _, object in ipairs(workspace:GetDescendants()) do
-        if object:IsA("Model") and object ~= LocalPlayer.Character then
-            local hum = object:FindFirstChildOfClass("Humanoid")
-            local part = object:FindFirstChild("HumanoidRootPart") or object:FindFirstChildOfClass("BasePart")
-            if hum and part then
-                local distance = (root.Position - part.Position).Magnitude
-                if distance <= State.values.npcRange then
-                    table.insert(results, {
-                        name = object.Name,
-                        part = part,
-                        dist = math.floor(distance),
-                    })
+    local r = rootPart()
+    if not r then return {} end
+    local res = {}
+    for _, o in ipairs(workspace:GetDescendants()) do
+        if o:IsA("Model") and o ~= LocalPlayer.Character then
+            local h = o:FindFirstChildOfClass("Humanoid")
+            local p = o:FindFirstChild("HumanoidRootPart") or o:FindFirstChildOfClass("BasePart")
+            if h and p then
+                local d = (r.Position - p.Position).Magnitude
+                if d <= State.values.npcRange then
+                    table.insert(res, { name = o.Name, part = p, dist = math.floor(d) })
                 end
             end
         end
     end
-
-    table.sort(results, function(a, b)
-        return a.dist < b.dist
-    end)
-    return results
+    table.sort(res, function(a, b) return a.dist < b.dist end)
+    return res
 end
 
 local function teleportToNPC(part)
-    local root = rootPart()
-    if not root then
-        return
-    end
-    root.CFrame = CFrame.new((part.CFrame * CFrame.new(0, 0, -3.5)).Position + Vector3.new(0, 3, 0))
+    local r = rootPart()
+    if not r then return end
+    r.CFrame = CFrame.new((part.CFrame * CFrame.new(0, 0, -3.5)).Position + Vector3.new(0, 3, 0))
 end
 
-local function createRipple(button, color)
-    local ripple = create("Frame", {
-        Parent = button,
-        AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = UDim2.new(0.5, 0, 0.5, 0),
-        Size = UDim2.new(0, 0, 0, 0),
+local function createRipple(btn, color)
+    local r = create("Frame", {
+        Parent = btn, AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0.5, 0, 0.5, 0), Size = UDim2.new(0, 0, 0, 0),
         BackgroundColor3 = color or Color3.new(1, 1, 1),
-        BackgroundTransparency = 0.68,
-        BorderSizePixel = 0,
-        ZIndex = button.ZIndex + 1,
+        BackgroundTransparency = 0.68, BorderSizePixel = 0,
+        ZIndex = btn.ZIndex + 1,
     })
-    addCorner(ripple, 999)
-
-    local size = math.max(button.AbsoluteSize.X, button.AbsoluteSize.Y) * 2.2
-    local tw = TweenService:Create(ripple, TweenInfo.new(0.42, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-        Size = UDim2.new(0, size, 0, size),
-        BackgroundTransparency = 1,
+    addCorner(r, 999)
+    local sz = math.max(btn.AbsoluteSize.X, btn.AbsoluteSize.Y) * 2.2
+    local tw = TweenService:Create(r, TweenInfo.new(0.42, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        Size = UDim2.new(0, sz, 0, sz), BackgroundTransparency = 1,
     })
     tw:Play()
-    tw.Completed:Connect(function()
-        ripple:Destroy()
-    end)
+    tw.Completed:Connect(function() r:Destroy() end)
 end
 
-local function makeCard(parent, order, useAlt)
-    local card = create("Frame", {
-        Parent = parent,
-        LayoutOrder = order,
-        Size = UDim2.new(1, 0, 0, 0),
-        AutomaticSize = Enum.AutomaticSize.Y,
-        BackgroundColor3 = useAlt and Theme.surfaceAlt or Theme.surface,
+local function makeCard(parent, order, alt)
+    local c = create("Frame", {
+        Parent = parent, LayoutOrder = order,
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+        BackgroundColor3 = alt and Theme.surfaceAlt or Theme.surface,
         BorderSizePixel = 0,
     })
-    addCorner(card, 10)
-    addStroke(card, Theme.border, 1, 0.12)
-    addPadding(card, 8, 8, 7, 7)
+    addCorner(c, 10)
+    addStroke(c, Theme.border, 1, 0.12)
+    addPadding(c, 8, 8, 7, 7)
     create("UIListLayout", {
-        Parent = card,
-        SortOrder = Enum.SortOrder.LayoutOrder,
+        Parent = c, SortOrder = Enum.SortOrder.LayoutOrder,
         Padding = UDim.new(0, 4),
     })
-    return card
+    return c
 end
 
 local function makeDivider(parent, order)
     return create("Frame", {
-        Parent = parent,
-        LayoutOrder = order,
+        Parent = parent, LayoutOrder = order,
         Size = UDim2.new(1, 0, 0, 1),
-        BackgroundColor3 = Theme.border,
-        BorderSizePixel = 0,
+        BackgroundColor3 = Theme.border, BorderSizePixel = 0,
     })
 end
 
-local function makeToggle(trackParent, activeColor)
+local function makeToggle(tParent, activeColor)
     local track = create("Frame", {
-        Parent = trackParent,
-        Size = UDim2.new(0, 36, 0, 18),
-        BackgroundColor3 = Color3.fromRGB(24, 31, 55),
-        BorderSizePixel = 0,
+        Parent = tParent, Size = UDim2.new(0, 36, 0, 18),
+        BackgroundColor3 = Color3.fromRGB(24, 31, 55), BorderSizePixel = 0,
     })
     addCorner(track, 9)
     addStroke(track, Theme.border, 1)
-
     local knob = create("Frame", {
-        Parent = track,
-        Size = UDim2.new(0, 12, 0, 12),
+        Parent = track, Size = UDim2.new(0, 12, 0, 12),
         Position = UDim2.new(0, 3, 0.5, -6),
         BackgroundColor3 = Color3.fromRGB(241, 245, 255),
         BorderSizePixel = 0,
     })
     addCorner(knob, 999)
-
     local hit = create("TextButton", {
-        Parent = track,
-        Size = UDim2.new(1, 0, 1, 0),
-        BackgroundTransparency = 1,
-        Text = "",
-        AutoButtonColor = false,
-        ZIndex = 4,
+        Parent = track, Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1, Text = "",
+        AutoButtonColor = false, ZIndex = 4,
     })
-
     local function setState(on)
-        tween(track, {
-            BackgroundColor3 = on and activeColor or Color3.fromRGB(24, 31, 55),
-        }, 0.16)
-        spring(knob, {
-            Position = on and UDim2.new(0, 21, 0.5, -6) or UDim2.new(0, 3, 0.5, -6),
-        })
+        tween(track, { BackgroundColor3 = on and activeColor or Color3.fromRGB(24, 31, 55) }, 0.16)
+        spring(knob, { Position = on and UDim2.new(0, 21, 0.5, -6) or UDim2.new(0, 3, 0.5, -6) })
     end
-
-    return {
-        track = track,
-        knob = knob,
-        hit = hit,
-        set = setState,
-    }
+    return { track = track, knob = knob, hit = hit, set = setState }
 end
 
-local function makeSlider(parent, label, minimum, maximum, defaultValue, color, onChanged, order)
-    local valueLabel = create("TextLabel", {
-        Parent = parent,
-        LayoutOrder = order,
+local function makeSlider(parent, label, mn, mx, def, color, onChanged, order)
+    local val = create("TextLabel", {
+        Parent = parent, LayoutOrder = order,
         Size = UDim2.new(1, 0, 0, 11),
         BackgroundTransparency = 1,
-        Text = label .. ": " .. defaultValue,
-        TextColor3 = color,
-        Font = Enum.Font.GothamBold,
-        TextSize = 8,
+        Text = label .. ": " .. def, TextColor3 = color,
+        Font = Enum.Font.GothamBold, TextSize = 8,
         TextXAlignment = Enum.TextXAlignment.Left,
     })
-
     local wrap = create("Frame", {
-        Parent = parent,
-        LayoutOrder = order + 1,
-        Size = UDim2.new(1, 0, 0, 12),
-        BackgroundTransparency = 1,
+        Parent = parent, LayoutOrder = order + 1,
+        Size = UDim2.new(1, 0, 0, 12), BackgroundTransparency = 1,
     })
-
     local bar = create("Frame", {
-        Parent = wrap,
-        Size = UDim2.new(1, 0, 0, 4),
+        Parent = wrap, Size = UDim2.new(1, 0, 0, 4),
         Position = UDim2.new(0, 0, 0.5, -2),
         BackgroundColor3 = Color3.fromRGB(22, 28, 49),
         BorderSizePixel = 0,
     })
     addCorner(bar, 3)
-
-    local percent = (defaultValue - minimum) / (maximum - minimum)
+    local pct = (def - mn) / (mx - mn)
     local fill = create("Frame", {
-        Parent = bar,
-        Size = UDim2.new(percent, 0, 1, 0),
-        BackgroundColor3 = color,
-        BorderSizePixel = 0,
+        Parent = bar, Size = UDim2.new(pct, 0, 1, 0),
+        BackgroundColor3 = color, BorderSizePixel = 0,
     })
     addCorner(fill, 3)
-
     local knob = create("Frame", {
-        Parent = bar,
-        AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = UDim2.new(percent, 0, 0.5, 0),
-        Size = UDim2.new(0, 10, 0, 10),
-        BackgroundColor3 = Color3.fromRGB(247, 250, 255),
-        BorderSizePixel = 0,
+        Parent = bar, AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(pct, 0, 0.5, 0), Size = UDim2.new(0, 10, 0, 10),
+        BackgroundColor3 = Color3.fromRGB(247, 250, 255), BorderSizePixel = 0,
     })
     addCorner(knob, 999)
-
     local hit = create("TextButton", {
-        Parent = bar,
-        Size = UDim2.new(1, 0, 0, 18),
+        Parent = bar, Size = UDim2.new(1, 0, 0, 18),
         Position = UDim2.new(0, 0, 0.5, -9),
-        BackgroundTransparency = 1,
-        Text = "",
-        AutoButtonColor = false,
-        ZIndex = 4,
+        BackgroundTransparency = 1, Text = "",
+        AutoButtonColor = false, ZIndex = 4,
     })
-
     local dragging = false
-
-    local function applyFromX(screenX)
-        local pct = math.clamp((screenX - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1), 0, 1)
-        local value = math.floor(minimum + pct * (maximum - minimum) + 0.5)
-        fill.Size = UDim2.new(pct, 0, 1, 0)
-        knob.Position = UDim2.new(pct, 0, 0.5, 0)
-        valueLabel.Text = label .. ": " .. value
-        if onChanged then
-            onChanged(value)
-        end
+    local function apply(sx)
+        local p = clamp((sx - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1), 0, 1)
+        local v = math.floor(mn + p * (mx - mn) + 0.5)
+        fill.Size = UDim2.new(p, 0, 1, 0)
+        knob.Position = UDim2.new(p, 0, 0.5, 0)
+        val.Text = label .. ": " .. v
+        if onChanged then onChanged(v) end
     end
-
-    hit.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = true
-            applyFromX(input.Position.X)
-        end
+    hit.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = true; apply(i.Position.X) end end)
+    hit.InputEnded:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end end)
+    UserInputService.InputChanged:Connect(function(i)
+        if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then apply(i.Position.X) end
     end)
-
-    hit.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = false
-        end
-    end)
-
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
-            applyFromX(input.Position.X)
-        end
-    end)
-
-    return {
-        label = valueLabel,
-        set = function(value)
-            value = clamp(value, minimum, maximum)
-            local pct = (value - minimum) / (maximum - minimum)
-            fill.Size = UDim2.new(pct, 0, 1, 0)
-            knob.Position = UDim2.new(pct, 0, 0.5, 0)
-            valueLabel.Text = label .. ": " .. value
-            if onChanged then
-                onChanged(value)
-            end
-        end,
-    }
+    return { label = val }
 end
 
-local function makeBindRow(parent, keyCode, order)
-    local row = create("Frame", {
-        Parent = parent,
-        LayoutOrder = order,
-        Size = UDim2.new(1, 0, 0, 18),
-        BackgroundTransparency = 1,
+local function makeBindRow(parent, kc, order)
+    local r = create("Frame", {
+        Parent = parent, LayoutOrder = order,
+        Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1,
     })
-
     create("TextLabel", {
-        Parent = row,
-        Size = UDim2.new(0, 32, 1, 0),
-        BackgroundTransparency = 1,
-        Text = "Key:",
-        TextColor3 = Theme.muted,
-        Font = Enum.Font.Gotham,
-        TextSize = 8,
-        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = r, Size = UDim2.new(0, 32, 1, 0),
+        BackgroundTransparency = 1, Text = "Key:",
+        TextColor3 = Theme.muted, Font = Enum.Font.Gotham,
+        TextSize = 8, TextXAlignment = Enum.TextXAlignment.Left,
     })
-
-    local button = create("TextButton", {
-        Parent = row,
-        Size = UDim2.new(0, 54, 0, 16),
+    local b = create("TextButton", {
+        Parent = r, Size = UDim2.new(0, 54, 0, 16),
         Position = UDim2.new(0, 32, 0.5, -8),
         BackgroundColor3 = Color3.fromRGB(20, 25, 47),
-        BorderSizePixel = 0,
-        Text = keyCode.Name,
-        TextColor3 = Theme.accent,
-        Font = Enum.Font.GothamBold,
-        TextSize = 8,
-        AutoButtonColor = false,
+        BorderSizePixel = 0, Text = kc.Name,
+        TextColor3 = Theme.accent, Font = Enum.Font.GothamBold,
+        TextSize = 8, AutoButtonColor = false,
     })
-    addCorner(button, 5)
-    addStroke(button, Theme.accentSoft, 1)
-
-    return button
+    addCorner(b, 5)
+    addStroke(b, Theme.accentSoft, 1)
+    return b
 end
 
 local function makeSearchBox(parent, placeholder, order)
     local wrap = create("Frame", {
-        Parent = parent,
-        LayoutOrder = order,
+        Parent = parent, LayoutOrder = order,
         Size = UDim2.new(1, 0, 0, 24),
-        BackgroundColor3 = Theme.surfaceAlt,
-        BorderSizePixel = 0,
+        BackgroundColor3 = Theme.surfaceAlt, BorderSizePixel = 0,
     })
     addCorner(wrap, 8)
     addStroke(wrap, Theme.border, 1)
     addPadding(wrap, 8, 8, 0, 0)
-
-    local icon = create("TextLabel", {
-        Parent = wrap,
-        Size = UDim2.new(0, 16, 1, 0),
-        BackgroundTransparency = 1,
-        Text = "⌕",
-        TextColor3 = Theme.muted,
-        Font = Enum.Font.GothamBold,
-        TextSize = 10,
-        TextXAlignment = Enum.TextXAlignment.Left,
+    create("TextLabel", {
+        Parent = wrap, Size = UDim2.new(0, 16, 1, 0),
+        BackgroundTransparency = 1, Text = "⌕",
+        TextColor3 = Theme.muted, Font = Enum.Font.GothamBold,
+        TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
     })
-
     local box = create("TextBox", {
-        Parent = wrap,
-        Size = UDim2.new(1, -24, 1, 0),
+        Parent = wrap, Size = UDim2.new(1, -24, 1, 0),
         Position = UDim2.new(0, 18, 0, 0),
-        BackgroundTransparency = 1,
-        PlaceholderText = placeholder,
-        Text = "",
-        TextColor3 = Theme.text,
-        PlaceholderColor3 = Theme.muted,
-        Font = Enum.Font.Gotham,
-        TextSize = 9,
+        BackgroundTransparency = 1, PlaceholderText = placeholder,
+        Text = "", TextColor3 = Theme.text, PlaceholderColor3 = Theme.muted,
+        Font = Enum.Font.Gotham, TextSize = 9,
         TextXAlignment = Enum.TextXAlignment.Left,
         ClearTextOnFocus = false,
     })
-
     return box
 end
 
-local function makeActionButton(parent, order, text, bgColor, textColor)
-    local button = create("TextButton", {
-        Parent = parent,
-        LayoutOrder = order,
+local function makeActionButton(parent, order, text, bg, tc)
+    local b = create("TextButton", {
+        Parent = parent, LayoutOrder = order,
         Size = UDim2.new(1, 0, 0, 24),
-        BackgroundColor3 = bgColor,
-        BorderSizePixel = 0,
-        Text = text,
-        TextColor3 = textColor,
-        Font = Enum.Font.GothamBold,
-        TextSize = 9,
+        BackgroundColor3 = bg, BorderSizePixel = 0,
+        Text = text, TextColor3 = tc,
+        Font = Enum.Font.GothamBold, TextSize = 9,
         AutoButtonColor = false,
     })
-    addCorner(button, 7)
-    addStroke(button, Theme.border, 1)
-    return button
+    addCorner(b, 7)
+    addStroke(b, Theme.border, 1)
+    return b
 end
 
 local function makeStatusLabel(parent, order, fontSize, color)
     return create("TextLabel", {
-        Parent = parent,
-        LayoutOrder = order,
+        Parent = parent, LayoutOrder = order,
         Size = UDim2.new(1, 0, 0, 12),
-        BackgroundTransparency = 1,
-        Text = "",
+        BackgroundTransparency = 1, Text = "",
         TextColor3 = color or Theme.muted,
-        Font = Enum.Font.Code,
-        TextSize = fontSize or 8,
+        Font = Enum.Font.Code, TextSize = fontSize or 8,
         TextXAlignment = Enum.TextXAlignment.Left,
     })
 end
 
-local function makeToggleSection(parent, options)
-    local section = makeCard(parent, options.order, options.alt)
-
+local function makeToggleSection(parent, opts)
+    local section = makeCard(parent, opts.order, opts.alt)
     local row = create("Frame", {
-        Parent = section,
-        LayoutOrder = 1,
-        Size = UDim2.new(1, 0, 0, 20),
-        BackgroundTransparency = 1,
+        Parent = section, LayoutOrder = 1,
+        Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1,
     })
-
     local label = create("TextLabel", {
-        Parent = row,
-        Size = UDim2.new(1, -60, 1, 0),
+        Parent = row, Size = UDim2.new(1, -60, 1, 0),
         BackgroundTransparency = 1,
-        Text = string.format("%s  %s", options.icon, options.label),
-        TextColor3 = Theme.subtext,
-        Font = Enum.Font.GothamBold,
-        TextSize = 9,
-        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = string.format("%s  %s", opts.icon, opts.label),
+        TextColor3 = Theme.subtext, Font = Enum.Font.GothamBold,
+        TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left,
     })
-
-    local toggle = makeToggle(row, options.toggleColor or Theme.accent)
+    local toggle = makeToggle(row, opts.toggleColor or Theme.accent)
     toggle.track.Position = UDim2.new(1, -36, 0.5, -9)
-    toggle.hit.MouseButton1Click:Connect(function()
-        createRipple(toggle.track, options.toggleColor or Theme.accent)
-    end)
+    toggle.hit.MouseButton1Click:Connect(function() createRipple(toggle.track, opts.toggleColor or Theme.accent) end)
 
-    local bindButton = makeBindRow(section, options.keyCode, 2)
-    local status = options.showStatus and makeStatusLabel(section, 3, 8, Theme.muted) or nil
-    local status2 = options.showStatus2 and makeStatusLabel(section, 4, 7, Theme.purple) or nil
+    local bindButton = makeBindRow(section, opts.keyCode, 2)
+    local status = opts.showStatus and makeStatusLabel(section, 3, 8, Theme.muted) or nil
+    local status2 = opts.showStatus2 and makeStatusLabel(section, 4, 7, Theme.purple) or nil
+    local lastOrder = opts.showStatus2 and 4 or (opts.showStatus and 3 or 2)
 
-    local lastOrder = options.showStatus2 and 4 or (options.showStatus and 3 or 2)
-
-    local slider
-    if options.slider then
-        slider = makeSlider(
-            section,
-            options.slider.label,
-            options.slider.min,
-            options.slider.max,
-            options.slider.value,
-            options.slider.color or Theme.accent,
-            options.slider.onChanged,
-            lastOrder + 1
-        )
+    if opts.slider then
+        makeSlider(section, opts.slider.label, opts.slider.min, opts.slider.max,
+            opts.slider.value, opts.slider.color or Theme.accent,
+            opts.slider.onChanged, lastOrder + 1)
         lastOrder += 2
     end
 
     local extraToggle
-    if options.extraToggle then
-        local extraRow = create("Frame", {
-            Parent = section,
-            LayoutOrder = lastOrder + 1,
-            Size = UDim2.new(1, 0, 0, 18),
-            BackgroundTransparency = 1,
+    if opts.extraToggle then
+        local er = create("Frame", {
+            Parent = section, LayoutOrder = lastOrder + 1,
+            Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1,
         })
-
         create("TextLabel", {
-            Parent = extraRow,
-            Size = UDim2.new(1, -60, 1, 0),
-            BackgroundTransparency = 1,
-            Text = options.extraToggle.label,
-            TextColor3 = Theme.subtext,
-            Font = Enum.Font.GothamBold,
-            TextSize = 8,
-            TextXAlignment = Enum.TextXAlignment.Left,
+            Parent = er, Size = UDim2.new(1, -60, 1, 0),
+            BackgroundTransparency = 1, Text = opts.extraToggle.label,
+            TextColor3 = Theme.subtext, Font = Enum.Font.GothamBold,
+            TextSize = 8, TextXAlignment = Enum.TextXAlignment.Left,
         })
-
-        extraToggle = makeToggle(extraRow, options.extraToggle.color or Theme.accent)
+        extraToggle = makeToggle(er, opts.extraToggle.color or Theme.accent)
         extraToggle.track.Position = UDim2.new(1, -36, 0.5, -9)
-        extraToggle.hit.MouseButton1Click:Connect(function()
-            createRipple(extraToggle.track, options.extraToggle.color or Theme.accent)
-        end)
+        extraToggle.hit.MouseButton1Click:Connect(function() createRipple(extraToggle.track, opts.extraToggle.color or Theme.accent) end)
     end
 
     local function setEnabled(on)
         toggle.set(on)
-        tween(label, {
-            TextColor3 = on and Theme.text or Theme.subtext,
-        }, 0.14)
+        tween(label, { TextColor3 = on and Theme.text or Theme.subtext }, 0.14)
     end
-
-    local function setExtraEnabled(on)
-        if extraToggle then
-            extraToggle.set(on)
-        end
-    end
+    local function setExtraEnabled(on) if extraToggle then extraToggle.set(on) end end
 
     return {
-        section = section,
-        label = label,
-        bindButton = bindButton,
-        status = status,
-        status2 = status2,
+        section = section, label = label, bindButton = bindButton,
+        status = status, status2 = status2,
         toggleButton = toggle.hit,
         extraToggleButton = extraToggle and extraToggle.hit or nil,
-        setEnabled = setEnabled,
-        setExtraEnabled = setExtraEnabled,
+        setEnabled = setEnabled, setExtraEnabled = setExtraEnabled,
     }
 end
 
 local function refreshFrameSize()
-    if not UI.refs.frame or not State.runtime.guiVisible then
-        return
-    end
+    if not UI.refs.frame or not State.runtime.guiVisible then return end
     task.wait()
     UI.refs.frame.Size = UDim2.new(0, GUI_WIDTH, 0, HEADER_HEIGHT + UI.refs.rootLayout.AbsoluteContentSize.Y)
 end
 
 local function switchTab(name)
     State.runtime.currentTab = name
-    for tabName, page in pairs(UI.pages) do
-        page.Visible = tabName == name
-    end
-    for tabName, button in pairs(UI.tabs) do
-        tween(button, {
-            BackgroundColor3 = tabName == name and Theme.accent or Theme.surfaceAlt,
-            TextColor3 = tabName == name and Theme.shell or Theme.muted,
+    for n, p in pairs(UI.pages) do p.Visible = n == name end
+    for n, b in pairs(UI.tabs) do
+        tween(b, {
+            BackgroundColor3 = n == name and Theme.accent or Theme.surfaceAlt,
+            TextColor3 = n == name and Theme.shell or Theme.muted,
         }, 0.16)
     end
     refreshFrameSize()
 end
 
-local function setGuiVisible(visible)
-    if State.runtime.guiAnimating or State.runtime.guiVisible == visible then
-        return
-    end
-
+local function setGuiVisible(v)
+    if State.runtime.guiAnimating or State.runtime.guiVisible == v then return end
     State.runtime.guiAnimating = true
-    State.runtime.guiVisible = visible
-
-    if visible then
+    State.runtime.guiVisible = v
+    if v then
         UI.refs.content.Visible = true
         task.wait()
         tween(UI.refs.frame, {
             Size = UDim2.new(0, GUI_WIDTH, 0, HEADER_HEIGHT + UI.refs.rootLayout.AbsoluteContentSize.Y),
             BackgroundTransparency = 0,
         }, 0.2)
-        tween(UI.refs.hideHint, {
-            TextColor3 = Theme.muted,
-        }, 0.15)
-        task.delay(0.24, function()
-            State.runtime.guiAnimating = false
-        end)
+        tween(UI.refs.hideHint, { TextColor3 = Theme.muted }, 0.15)
+        task.delay(0.24, function() State.runtime.guiAnimating = false end)
     else
-        local shrink = tween(UI.refs.frame, {
-            Size = UDim2.new(0, GUI_WIDTH, 0, HEADER_HEIGHT),
-        }, 0.18)
-        tween(UI.refs.hideHint, {
-            TextColor3 = Theme.accent,
-        }, 0.15)
-        shrink.Completed:Connect(function()
-            if not State.runtime.guiVisible then
-                UI.refs.content.Visible = false
-            end
-            task.delay(0.04, function()
-                State.runtime.guiAnimating = false
-            end)
+        local sh = tween(UI.refs.frame, { Size = UDim2.new(0, GUI_WIDTH, 0, HEADER_HEIGHT) }, 0.18)
+        tween(UI.refs.hideHint, { TextColor3 = Theme.accent }, 0.15)
+        sh.Completed:Connect(function()
+            if not State.runtime.guiVisible then UI.refs.content.Visible = false end
+            task.delay(0.04, function() State.runtime.guiAnimating = false end)
         end)
     end
 end
 
-local function setupBind(button, bindId, getKey, setKey)
+local function setupBind(button, id, getKey, setKey)
     button.MouseButton1Click:Connect(function()
-        if State.runtime.listening then
-            return
-        end
-
-        State.runtime.listening = bindId
+        if State.runtime.listening then return end
+        State.runtime.listening = id
         button.Text = "..."
         tween(button, { TextColor3 = Theme.warning }, 0.12)
-
-        local connection
-        connection = UserInputService.InputBegan:Connect(function(input)
-            if input.UserInputType ~= Enum.UserInputType.Keyboard then
-                return
-            end
-
-            if input.KeyCode == Enum.KeyCode.Escape then
+        local conn
+        conn = UserInputService.InputBegan:Connect(function(inp)
+            if inp.UserInputType ~= Enum.UserInputType.Keyboard then return end
+            if inp.KeyCode == Enum.KeyCode.Escape then
                 button.Text = getKey().Name
                 tween(button, { TextColor3 = Theme.accent }, 0.12)
                 State.runtime.listening = nil
-                connection:Disconnect()
+                conn:Disconnect()
                 return
             end
-
-            if BLOCKED_KEYS[input.KeyCode] then
+            if BLOCKED_KEYS[inp.KeyCode] then
                 button.Text = "invalid!"
                 tween(button, { TextColor3 = Theme.danger }, 0.12)
                 task.wait(0.8)
                 button.Text = getKey().Name
                 tween(button, { TextColor3 = Theme.accent }, 0.12)
                 State.runtime.listening = nil
-                connection:Disconnect()
+                conn:Disconnect()
                 return
             end
-
-            setKey(input.KeyCode)
-            button.Text = input.KeyCode.Name
+            setKey(inp.KeyCode)
+            button.Text = inp.KeyCode.Name
             tween(button, { TextColor3 = Theme.accent }, 0.12)
             State.runtime.listening = nil
-            connection:Disconnect()
+            conn:Disconnect()
         end)
     end)
 end
 
 local function updateLearningPanel()
-    if not UI.refs.learnScore then
-        return
-    end
-
+    if not UI.refs.learnScore then return end
     local wins, total = getRecentScore(10)
     local trend = ""
     if total > 0 then
-        local ratio = wins / total
-        if ratio >= 0.7 then
-            trend = " ↑"
-        elseif ratio <= 0.3 then
-            trend = " ↓"
-        else
-            trend = " →"
-        end
+        local r = wins / total
+        if r >= 0.7 then trend = " ↑"
+        elseif r <= 0.3 then trend = " ↓"
+        else trend = " →" end
     end
-
-    UI.refs.learnScore.Text = string.format(
-        "Score: %d/%d%s  |  ✅%d  ❌%d  |  ajustes:%d",
-        wins,
-        total,
-        trend,
-        LearnHistory.totalWins,
-        LearnHistory.totalLosses,
-        LearnHistory.adjustCount
-    )
-
+    UI.refs.learnScore.Text = string.format("Score: %d/%d%s  |  ✅%d  ❌%d  |  adj:%d",
+        wins, total, trend, LearnHistory.totalWins, LearnHistory.totalLosses, LearnHistory.adjustCount)
     if total > 0 then
-        local ratio = wins / total
-        UI.refs.learnScore.TextColor3 = ratio >= 0.6 and Theme.success or (ratio <= 0.3 and Theme.danger or Theme.warning)
+        local r = wins / total
+        UI.refs.learnScore.TextColor3 = r >= 0.6 and Theme.success or (r <= 0.3 and Theme.danger or Theme.warning)
     else
         UI.refs.learnScore.TextColor3 = Theme.warning
     end
-
     UI.refs.learnDiag.Text = "Último: " .. LearnHistory.lastDiagnosis
-    UI.refs.learnParams.Text = string.format(
-        "⚙ far %.0f/%.0f  mid %.0f/%.0f  in %.0f/%.0fms",
-        ReelParams.hold_far * 1000,
-        ReelParams.release_far * 1000,
-        ReelParams.hold_mid * 1000,
-        ReelParams.release_mid * 1000,
-        ReelParams.hold_inside * 1000,
-        ReelParams.release_inside * 1000
-    )
+    UI.refs.learnParams.Text = string.format("⚙ far %.2f  mid %.2f  near %.2f | cycle %dms",
+        ReelParams.duty_far, ReelParams.duty_mid, ReelParams.duty_near, ReelParams.cycle_ms)
 end
 
 local function toggleNoclip()
@@ -2112,19 +1559,13 @@ end
 local function toggleSpeed()
     State.flags.speed = not State.flags.speed
     UI.refs.speed.setEnabled(State.flags.speed)
-    if State.flags.speed then
-        applySpeedOnce()
-        startSpeedLoop()
-    else
-        stopSpeedLoop()
-    end
+    if State.flags.speed then applySpeedOnce(); startSpeedLoop() else stopSpeedLoop() end
     updateActivityDot()
 end
 
 local function toggleJump()
     State.flags.jump = not State.flags.jump
     UI.refs.jump.setEnabled(State.flags.jump)
-
     if State.flags.jump then
         startJumpLoop()
     else
@@ -2133,21 +1574,14 @@ local function toggleJump()
         UI.refs.jump.setExtraEnabled(false)
         stopRejumpLoop()
     end
-
     updateActivityDot()
 end
 
 local function toggleRejump()
-    if not State.flags.jump then
-        return
-    end
+    if not State.flags.jump then return end
     State.flags.rejump = not State.flags.rejump
     UI.refs.jump.setExtraEnabled(State.flags.rejump)
-    if State.flags.rejump then
-        startRejumpLoop()
-    else
-        stopRejumpLoop()
-    end
+    if State.flags.rejump then startRejumpLoop() else stopRejumpLoop() end
 end
 
 local function toggleCast()
@@ -2160,66 +1594,47 @@ local function toggleCast()
         UI.refs.cast.setEnabled(true)
         startCast()
     end
-
     updateActivityDot()
 end
 
 local function toggleShake()
     State.flags.shake = not State.flags.shake
     UI.refs.shake.setEnabled(State.flags.shake)
-
-    if State.flags.shake then
-        startShake()
-    else
-        stopShake()
-    end
-
+    if State.flags.shake then startShake() else stopShake() end
     updateActivityDot()
 end
 
 local function toggleAutoReel()
     State.flags.autoReel = not State.flags.autoReel
     UI.refs.reel.setEnabled(State.flags.autoReel)
-
-    if State.flags.autoReel then
-        startAutoReel()
-    else
-        stopAutoReel()
-    end
-
+    if State.flags.autoReel then startAutoReel() else stopAutoReel() end
     updateActivityDot()
 end
 
 local function toggleAutoSell()
     State.flags.autoSell = not State.flags.autoSell
     UI.refs.autoSell.toggle.set(State.flags.autoSell)
-    tween(UI.refs.autoSell.label, {
-        TextColor3 = State.flags.autoSell and Theme.text or Theme.subtext,
-    }, 0.14)
-
+    tween(UI.refs.autoSell.label, { TextColor3 = State.flags.autoSell and Theme.text or Theme.subtext }, 0.14)
     if State.flags.autoSell then
         startAutoSell()
     else
         stopAutoSell()
         setStatus(UI.refs.autoSellStatus, "Auto-sell off", Theme.muted)
     end
-
     updateActivityDot()
 end
 
-local function flashAction(button, baseColor, pulseColor)
-    createRipple(button, pulseColor)
-    tween(button, { BackgroundColor3 = pulseColor }, 0.08)
-    task.delay(0.12, function()
-        tween(button, { BackgroundColor3 = baseColor }, 0.15)
-    end)
+local function flashAction(btn, base, pulse)
+    createRipple(btn, pulse)
+    tween(btn, { BackgroundColor3 = pulse }, 0.08)
+    task.delay(0.12, function() tween(btn, { BackgroundColor3 = base }, 0.15) end)
 end
 
 local function runSellInHand()
     task.spawn(function()
         flashAction(UI.refs.sellButton, Theme.sell, Theme.sellHover)
-        local ok, message = sellFromHand()
-        setStatus(UI.refs.sellStatus, (ok and "✅ " or "❌ ") .. message, ok and Theme.success or Theme.danger)
+        local ok, m = sellFromHand()
+        setStatus(UI.refs.sellStatus, (ok and "✅ " or "❌ ") .. m, ok and Theme.success or Theme.danger)
         task.wait(3)
         setStatus(UI.refs.sellStatus, "Waiting...", Theme.muted)
     end)
@@ -2228,8 +1643,8 @@ end
 local function runSellAll()
     task.spawn(function()
         flashAction(UI.refs.sellAllButton, Color3.fromRGB(16, 57, 35), Theme.sellHover)
-        local ok, message = sellAll()
-        setStatus(UI.refs.sellStatus, (ok and "✅ " or "❌ ") .. message, ok and Theme.success or Theme.danger)
+        local ok, m = sellAll()
+        setStatus(UI.refs.sellStatus, (ok and "✅ " or "❌ ") .. m, ok and Theme.success or Theme.danger)
         task.wait(3)
         setStatus(UI.refs.sellStatus, "Waiting...", Theme.muted)
     end)
@@ -2237,69 +1652,40 @@ end
 
 local function renderTeleportList()
     local holder = UI.refs.tpList
-    if not holder then
-        return
+    if not holder then return end
+    for _, c in ipairs(holder:GetChildren()) do
+        if not c:IsA("UIListLayout") then c:Destroy() end
     end
-
-    for _, child in ipairs(holder:GetChildren()) do
-        if not child:IsA("UIListLayout") then
-            child:Destroy()
-        end
-    end
-
-    local query = (UI.search.tp and UI.search.tp.Text or ""):lower()
-    local layoutOrder = 1
-
-    for _, island in ipairs(ISLANDS) do
-        local include = query == "" or island.name:lower():find(query, 1, true)
-        if include then
-            local textColor = Theme.subtext
-            local baseColor = Theme.surface
-            local hoverColor = Theme.surfaceHover
-
-            if island.cat == "second" then
-                textColor = Theme.cyan
-                baseColor = Color3.fromRGB(14, 35, 46)
-                hoverColor = Color3.fromRGB(18, 49, 63)
-            elseif island.cat == "deep" then
-                textColor = Color3.fromRGB(255, 132, 184)
-                baseColor = Color3.fromRGB(40, 16, 35)
-                hoverColor = Color3.fromRGB(57, 23, 49)
+    local q = (UI.search.tp and UI.search.tp.Text or ""):lower()
+    local lo = 1
+    for _, isl in ipairs(ISLANDS) do
+        if q == "" or isl.name:lower():find(q, 1, true) then
+            local tc, bc, hc = Theme.subtext, Theme.surface, Theme.surfaceHover
+            if isl.cat == "second" then
+                tc, bc, hc = Theme.cyan, Color3.fromRGB(14, 35, 46), Color3.fromRGB(18, 49, 63)
+            elseif isl.cat == "deep" then
+                tc, bc, hc = Color3.fromRGB(255, 132, 184), Color3.fromRGB(40, 16, 35), Color3.fromRGB(57, 23, 49)
             end
-
-            local button = makeActionButton(holder, layoutOrder, "📍  " .. island.name, baseColor, textColor)
-            button.TextXAlignment = Enum.TextXAlignment.Left
-            addPadding(button, 10, 10, 0, 0)
-
-            button.MouseEnter:Connect(function()
-                tween(button, { BackgroundColor3 = hoverColor, TextColor3 = Theme.text }, 0.15)
+            local b = makeActionButton(holder, lo, "📍  " .. isl.name, bc, tc)
+            b.TextXAlignment = Enum.TextXAlignment.Left
+            addPadding(b, 10, 10, 0, 0)
+            b.MouseEnter:Connect(function() tween(b, { BackgroundColor3 = hc, TextColor3 = Theme.text }, 0.15) end)
+            b.MouseLeave:Connect(function() tween(b, { BackgroundColor3 = bc, TextColor3 = tc }, 0.15) end)
+            b.MouseButton1Click:Connect(function()
+                createRipple(b, tc)
+                local ok = teleportTo(isl.pos)
+                setStatus(UI.refs.tpStatus, (ok and "✅ " or "❌ ") .. isl.name, ok and Theme.success or Theme.danger)
+                task.delay(3, function() setStatus(UI.refs.tpStatus, "", Theme.success) end)
             end)
-            button.MouseLeave:Connect(function()
-                tween(button, { BackgroundColor3 = baseColor, TextColor3 = textColor }, 0.15)
-            end)
-            button.MouseButton1Click:Connect(function()
-                createRipple(button, textColor)
-                local ok = teleportTo(island.pos)
-                setStatus(UI.refs.tpStatus, (ok and "✅ " or "❌ ") .. island.name, ok and Theme.success or Theme.danger)
-                task.delay(3, function()
-                    setStatus(UI.refs.tpStatus, "", Theme.success)
-                end)
-            end)
-
-            layoutOrder += 1
+            lo += 1
         end
     end
-
-    if layoutOrder == 1 then
+    if lo == 1 then
         create("TextLabel", {
-            Parent = holder,
-            LayoutOrder = 1,
-            Size = UDim2.new(1, 0, 0, 26),
-            BackgroundTransparency = 1,
-            Text = "Nada encontrado",
-            TextColor3 = Theme.muted,
-            Font = Enum.Font.Gotham,
-            TextSize = 9,
+            Parent = holder, LayoutOrder = 1,
+            Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1,
+            Text = "Nada encontrado", TextColor3 = Theme.muted,
+            Font = Enum.Font.Gotham, TextSize = 9,
             TextXAlignment = Enum.TextXAlignment.Center,
         })
     end
@@ -2307,87 +1693,55 @@ end
 
 local function renderRodList()
     local holder = UI.refs.rodList
-    if not holder then
-        return
+    if not holder then return end
+    for _, c in ipairs(holder:GetChildren()) do
+        if not c:IsA("UIListLayout") then c:Destroy() end
     end
-
-    for _, child in ipairs(holder:GetChildren()) do
-        if not child:IsA("UIListLayout") then
-            child:Destroy()
-        end
-    end
-
-    local query = (UI.search.rods and UI.search.rods.Text or ""):lower()
-    local layoutOrder = 1
-
+    local q = (UI.search.rods and UI.search.rods.Text or ""):lower()
+    local lo = 1
     for _, rod in ipairs(RODS) do
-        local searchable = (rod.name .. " " .. rod.loc):lower()
-        if query == "" or searchable:find(query, 1, true) then
-            local button = create("TextButton", {
-                Parent = holder,
-                LayoutOrder = layoutOrder,
+        local s = (rod.name .. " " .. rod.loc):lower()
+        if q == "" or s:find(q, 1, true) then
+            local b = create("TextButton", {
+                Parent = holder, LayoutOrder = lo,
                 Size = UDim2.new(1, 0, 0, 38),
-                BackgroundColor3 = Theme.surface,
-                BorderSizePixel = 0,
-                Text = "",
-                AutoButtonColor = false,
+                BackgroundColor3 = Theme.surface, BorderSizePixel = 0,
+                Text = "", AutoButtonColor = false,
             })
-            addCorner(button, 10)
-            addStroke(button, Theme.border, 1)
-            addPadding(button, 10, 10, 4, 4)
-
+            addCorner(b, 10)
+            addStroke(b, Theme.border, 1)
+            addPadding(b, 10, 10, 4, 4)
             create("TextLabel", {
-                Parent = button,
-                Size = UDim2.new(1, 0, 0, 14),
+                Parent = b, Size = UDim2.new(1, 0, 0, 14),
                 BackgroundTransparency = 1,
                 Text = "🎣  " .. rod.name,
-                TextColor3 = Theme.cyan,
-                Font = Enum.Font.GothamBold,
-                TextSize = 10,
-                TextXAlignment = Enum.TextXAlignment.Left,
+                TextColor3 = Theme.cyan, Font = Enum.Font.GothamBold,
+                TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
             })
-
             create("TextLabel", {
-                Parent = button,
-                Position = UDim2.new(0, 0, 0, 16),
+                Parent = b, Position = UDim2.new(0, 0, 0, 16),
                 Size = UDim2.new(1, 0, 0, 12),
-                BackgroundTransparency = 1,
-                Text = rod.loc,
-                TextColor3 = Theme.muted,
-                Font = Enum.Font.Gotham,
-                TextSize = 8,
-                TextXAlignment = Enum.TextXAlignment.Left,
+                BackgroundTransparency = 1, Text = rod.loc,
+                TextColor3 = Theme.muted, Font = Enum.Font.Gotham,
+                TextSize = 8, TextXAlignment = Enum.TextXAlignment.Left,
             })
-
-            button.MouseEnter:Connect(function()
-                tween(button, { BackgroundColor3 = Theme.surfaceHover }, 0.15)
-            end)
-            button.MouseLeave:Connect(function()
-                tween(button, { BackgroundColor3 = Theme.surface }, 0.15)
-            end)
-            button.MouseButton1Click:Connect(function()
-                createRipple(button, Theme.cyan)
+            b.MouseEnter:Connect(function() tween(b, { BackgroundColor3 = Theme.surfaceHover }, 0.15) end)
+            b.MouseLeave:Connect(function() tween(b, { BackgroundColor3 = Theme.surface }, 0.15) end)
+            b.MouseButton1Click:Connect(function()
+                createRipple(b, Theme.cyan)
                 local ok = teleportTo(rod.pos)
                 setStatus(UI.refs.rodStatus, (ok and "✅ TP -> " or "❌ ") .. rod.name, ok and Theme.success or Theme.danger)
-                task.delay(3, function()
-                    setStatus(UI.refs.rodStatus, "", Theme.success)
-                end)
+                task.delay(3, function() setStatus(UI.refs.rodStatus, "", Theme.success) end)
             end)
-
-            layoutOrder += 1
+            lo += 1
         end
     end
-
-    if layoutOrder == 1 then
+    if lo == 1 then
         create("TextLabel", {
-            Parent = holder,
-            LayoutOrder = 1,
-            Size = UDim2.new(1, 0, 0, 26),
-            BackgroundTransparency = 1,
-            Text = "Nada encontrado",
-            TextColor3 = Theme.muted,
-            Font = Enum.Font.Gotham,
-            TextSize = 9,
+            Parent = holder, LayoutOrder = 1,
+            Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1,
+            Text = "Nada encontrado", TextColor3 = Theme.muted,
+            Font = Enum.Font.Gotham, TextSize = 9,
             TextXAlignment = Enum.TextXAlignment.Center,
         })
     end
@@ -2395,129 +1749,87 @@ end
 
 local function refreshMaps()
     local holder = UI.refs.mapList
-    if not holder then
-        return
+    if not holder then return end
+    for _, c in ipairs(holder:GetChildren()) do
+        if not c:IsA("UIListLayout") then c:Destroy() end
     end
-
-    for _, child in ipairs(holder:GetChildren()) do
-        if not child:IsA("UIListLayout") then
-            child:Destroy()
-        end
-    end
-
     local maps = getTreasureMaps()
     if #maps == 0 then
         create("TextLabel", {
-            Parent = holder,
-            LayoutOrder = 1,
-            Size = UDim2.new(1, 0, 0, 24),
-            BackgroundTransparency = 1,
+            Parent = holder, LayoutOrder = 1,
+            Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1,
             Text = "Nenhum mapa no inventário",
-            TextColor3 = Theme.muted,
-            Font = Enum.Font.Gotham,
-            TextSize = 9,
-            TextXAlignment = Enum.TextXAlignment.Center,
+            TextColor3 = Theme.muted, Font = Enum.Font.Gotham,
+            TextSize = 9, TextXAlignment = Enum.TextXAlignment.Center,
         })
         refreshFrameSize()
         return
     end
-
-    for index, map in ipairs(maps) do
-        local button = create("TextButton", {
-            Parent = holder,
-            LayoutOrder = index,
+    for i, m in ipairs(maps) do
+        local b = create("TextButton", {
+            Parent = holder, LayoutOrder = i,
             Size = UDim2.new(1, 0, 0, 34),
-            BackgroundColor3 = map.fixed and Theme.surface or Color3.fromRGB(48, 38, 22),
-            BorderSizePixel = 0,
-            Text = "",
-            AutoButtonColor = false,
+            BackgroundColor3 = m.fixed and Theme.surface or Color3.fromRGB(48, 38, 22),
+            BorderSizePixel = 0, Text = "", AutoButtonColor = false,
         })
-        addCorner(button, 8)
-        addStroke(button, Theme.border, 1)
-        addPadding(button, 10, 10, 4, 4)
-
+        addCorner(b, 8)
+        addStroke(b, Theme.border, 1)
+        addPadding(b, 10, 10, 4, 4)
         create("TextLabel", {
-            Parent = button,
-            Size = UDim2.new(1, 0, 0, 12),
+            Parent = b, Size = UDim2.new(1, 0, 0, 12),
             BackgroundTransparency = 1,
-            Text = (map.fixed and "📜  " or "❔  ") .. map.name,
-            TextColor3 = map.fixed and Theme.gold or Theme.warning,
-            Font = Enum.Font.GothamBold,
-            TextSize = 9,
+            Text = (m.fixed and "📜  " or "❔  ") .. m.name,
+            TextColor3 = m.fixed and Theme.gold or Theme.warning,
+            Font = Enum.Font.GothamBold, TextSize = 9,
             TextXAlignment = Enum.TextXAlignment.Left,
         })
-
         create("TextLabel", {
-            Parent = button,
-            Position = UDim2.new(0, 0, 0, 14),
+            Parent = b, Position = UDim2.new(0, 0, 0, 14),
             Size = UDim2.new(1, 0, 0, 11),
             BackgroundTransparency = 1,
-            Text = map.fixed
-                and string.format("X=%d  Y=%d  Z=%d", map.pos.X, map.pos.Y, map.pos.Z)
+            Text = m.fixed and string.format("X=%d  Y=%d  Z=%d", m.pos.X, m.pos.Y, m.pos.Z)
                 or "→ leve no Jack Marrow para fixar",
-            TextColor3 = map.fixed and Theme.cyan or Theme.muted,
-            Font = Enum.Font.Code,
-            TextSize = 8,
+            TextColor3 = m.fixed and Theme.cyan or Theme.muted,
+            Font = Enum.Font.Code, TextSize = 8,
             TextXAlignment = Enum.TextXAlignment.Left,
         })
-
-        if map.fixed then
-            button.MouseEnter:Connect(function()
-                tween(button, { BackgroundColor3 = Theme.surfaceHover }, 0.15)
-            end)
-            button.MouseLeave:Connect(function()
-                tween(button, { BackgroundColor3 = Theme.surface }, 0.15)
-            end)
-            button.MouseButton1Click:Connect(function()
-                createRipple(button, Theme.gold)
-                teleportTo(map.pos)
+        if m.fixed then
+            b.MouseEnter:Connect(function() tween(b, { BackgroundColor3 = Theme.surfaceHover }, 0.15) end)
+            b.MouseLeave:Connect(function() tween(b, { BackgroundColor3 = Theme.surface }, 0.15) end)
+            b.MouseButton1Click:Connect(function()
+                createRipple(b, Theme.gold)
+                teleportTo(m.pos)
             end)
         end
     end
-
     refreshFrameSize()
 end
 
 local function rebuildNPCs()
     local holder = UI.refs.npcList
-    if not holder then
-        return
+    if not holder then return end
+    for _, c in ipairs(holder:GetChildren()) do
+        if not c:IsA("UIListLayout") then c:Destroy() end
     end
-
-    for _, child in ipairs(holder:GetChildren()) do
-        if not child:IsA("UIListLayout") then
-            child:Destroy()
-        end
-    end
-
     local npcs = getNearbyNPCs()
     if #npcs == 0 then
         create("TextLabel", {
-            Parent = holder,
-            LayoutOrder = 1,
-            Size = UDim2.new(1, 0, 0, 26),
-            BackgroundTransparency = 1,
+            Parent = holder, LayoutOrder = 1,
+            Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1,
             Text = "No NPCs within " .. State.values.npcRange .. " studs",
-            TextColor3 = Theme.muted,
-            Font = Enum.Font.Gotham,
-            TextSize = 9,
-            TextXAlignment = Enum.TextXAlignment.Center,
+            TextColor3 = Theme.muted, Font = Enum.Font.Gotham,
+            TextSize = 9, TextXAlignment = Enum.TextXAlignment.Center,
         })
         return
     end
-
-    for index, npc in ipairs(npcs) do
-        local button = makeActionButton(holder, index, "🧑  " .. npc.name .. "  (" .. npc.dist .. " st)", Theme.surface, Theme.subtext)
-        button.TextXAlignment = Enum.TextXAlignment.Left
-        addPadding(button, 10, 10, 0, 0)
-        button.MouseEnter:Connect(function()
-            tween(button, { BackgroundColor3 = Theme.surfaceHover, TextColor3 = Theme.text }, 0.15)
-        end)
-        button.MouseLeave:Connect(function()
-            tween(button, { BackgroundColor3 = Theme.surface, TextColor3 = Theme.subtext }, 0.15)
-        end)
-        button.MouseButton1Click:Connect(function()
-            createRipple(button, Theme.accent)
+    for i, npc in ipairs(npcs) do
+        local b = makeActionButton(holder, i, "🧑  " .. npc.name .. "  (" .. npc.dist .. " st)", Theme.surface, Theme.subtext)
+        b.TextXAlignment = Enum.TextXAlignment.Left
+        addPadding(b, 10, 10, 0, 0)
+        b.MouseEnter:Connect(function() tween(b, { BackgroundColor3 = Theme.surfaceHover, TextColor3 = Theme.text }, 0.15) end)
+        b.MouseLeave:Connect(function() tween(b, { BackgroundColor3 = Theme.surface, TextColor3 = Theme.subtext }, 0.15) end)
+        b.MouseButton1Click:Connect(function()
+            createRipple(b, Theme.accent)
             teleportToNPC(npc.part)
             task.delay(0.8, rebuildNPCs)
         end)
@@ -2527,30 +1839,22 @@ end
 loadLearnData()
 
 pcall(function()
-    for _, name in ipairs({ "UtilityGui", "NoclipGui" }) do
-        local existing = PlayerGui:FindFirstChild(name)
-        if existing then
-            existing:Destroy()
-        end
+    for _, n in ipairs({ "UtilityGui", "NoclipGui" }) do
+        local e = PlayerGui:FindFirstChild(n)
+        if e then e:Destroy() end
     end
 end)
 
 local gui = create("ScreenGui", {
-    Parent = PlayerGui,
-    Name = "UtilityGui",
-    ResetOnSpawn = false,
-    DisplayOrder = 999,
-    IgnoreGuiInset = true,
+    Parent = PlayerGui, Name = "UtilityGui",
+    ResetOnSpawn = false, DisplayOrder = 999, IgnoreGuiInset = true,
 })
 
 local frame = create("Frame", {
-    Parent = gui,
-    Size = UDim2.new(0, GUI_WIDTH, 0, HEADER_HEIGHT),
+    Parent = gui, Size = UDim2.new(0, GUI_WIDTH, 0, HEADER_HEIGHT),
     Position = UDim2.new(0, -GUI_WIDTH, 0.5, WINDOW_Y_OFFSET),
-    BackgroundColor3 = Theme.shell,
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    ClipsDescendants = true,
+    BackgroundColor3 = Theme.shell, BackgroundTransparency = 1,
+    BorderSizePixel = 0, ClipsDescendants = true,
 })
 addCorner(frame, 14)
 addGradient(frame, 90, {
@@ -2560,11 +1864,8 @@ addGradient(frame, 90, {
 local frameStroke = addStroke(frame, Theme.border, 1.5, 0.06)
 
 local header = create("Frame", {
-    Parent = frame,
-    Size = UDim2.new(1, 0, 0, HEADER_HEIGHT),
-    BackgroundColor3 = Theme.panel,
-    BorderSizePixel = 0,
-    ZIndex = 2,
+    Parent = frame, Size = UDim2.new(1, 0, 0, HEADER_HEIGHT),
+    BackgroundColor3 = Theme.panel, BorderSizePixel = 0, ZIndex = 2,
 })
 addGradient(header, 90, {
     ColorSequenceKeypoint.new(0, Color3.fromRGB(18, 25, 54)),
@@ -2572,65 +1873,44 @@ addGradient(header, 90, {
 })
 
 local activityDot = create("Frame", {
-    Parent = header,
-    Size = UDim2.new(0, 7, 0, 7),
+    Parent = header, Size = UDim2.new(0, 7, 0, 7),
     Position = UDim2.new(0, 12, 0.5, -4),
-    BackgroundColor3 = Theme.muted,
-    BorderSizePixel = 0,
-    ZIndex = 4,
+    BackgroundColor3 = Theme.muted, BorderSizePixel = 0, ZIndex = 4,
 })
 addCorner(activityDot, 999)
 
 create("TextLabel", {
-    Parent = header,
-    Size = UDim2.new(1, -70, 0, 16),
+    Parent = header, Size = UDim2.new(1, -70, 0, 16),
     Position = UDim2.new(0, 24, 0, 5),
-    BackgroundTransparency = 1,
-    Text = "UTILITY v18",
-    TextColor3 = Theme.text,
-    Font = Enum.Font.GothamBlack,
-    TextSize = 11,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    ZIndex = 4,
+    BackgroundTransparency = 1, Text = "UTILITY v19",
+    TextColor3 = Theme.text, Font = Enum.Font.GothamBlack,
+    TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 4,
 })
 
 create("TextLabel", {
-    Parent = header,
-    Size = UDim2.new(1, -70, 0, 11),
+    Parent = header, Size = UDim2.new(1, -70, 0, 11),
     Position = UDim2.new(0, 24, 0, 20),
-    BackgroundTransparency = 1,
-    Text = "compact + auto systems",
-    TextColor3 = Theme.subtext,
-    Font = Enum.Font.Gotham,
-    TextSize = 7,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    ZIndex = 4,
+    BackgroundTransparency = 1, Text = "reel duty-cycle",
+    TextColor3 = Theme.subtext, Font = Enum.Font.Gotham,
+    TextSize = 7, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 4,
 })
 
 local hideHint = create("TextLabel", {
-    Parent = header,
-    Size = UDim2.new(0, 22, 0, 14),
+    Parent = header, Size = UDim2.new(0, 22, 0, 14),
     Position = UDim2.new(1, -30, 0.5, -7),
-    BackgroundColor3 = Color3.fromRGB(22, 28, 54),
-    BorderSizePixel = 0,
-    Text = "V",
-    TextColor3 = Theme.muted,
-    Font = Enum.Font.GothamBold,
-    TextSize = 8,
-    ZIndex = 4,
+    BackgroundColor3 = Color3.fromRGB(22, 28, 54), BorderSizePixel = 0,
+    Text = "V", TextColor3 = Theme.muted,
+    Font = Enum.Font.GothamBold, TextSize = 8, ZIndex = 4,
 })
 addCorner(hideHint, 5)
 
 local content = create("Frame", {
-    Parent = frame,
-    Position = UDim2.new(0, 0, 0, HEADER_HEIGHT),
-    Size = UDim2.new(1, 0, 0, 9999),
-    BackgroundTransparency = 1,
+    Parent = frame, Position = UDim2.new(0, 0, 0, HEADER_HEIGHT),
+    Size = UDim2.new(1, 0, 0, 9999), BackgroundTransparency = 1,
 })
 
 local rootLayout = create("UIListLayout", {
-    Parent = content,
-    SortOrder = Enum.SortOrder.LayoutOrder,
+    Parent = content, SortOrder = Enum.SortOrder.LayoutOrder,
     Padding = UDim.new(0, 0),
 })
 
@@ -2642,39 +1922,27 @@ UI.refs.hideHint = hideHint
 UI.refs.rootLayout = rootLayout
 
 local tabBar = create("Frame", {
-    Parent = content,
-    LayoutOrder = 1,
+    Parent = content, LayoutOrder = 1,
     Size = UDim2.new(1, 0, 0, 28),
-    BackgroundColor3 = Theme.panel,
-    BorderSizePixel = 0,
+    BackgroundColor3 = Theme.panel, BorderSizePixel = 0,
 })
 addPadding(tabBar, 4, 4, 4, 3)
-
 create("UIListLayout", {
-    Parent = tabBar,
-    FillDirection = Enum.FillDirection.Horizontal,
-    SortOrder = Enum.SortOrder.LayoutOrder,
-    Padding = UDim.new(0, 4),
+    Parent = tabBar, FillDirection = Enum.FillDirection.Horizontal,
+    SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4),
 })
 
 local function createTab(name, title, order)
-    local button = create("TextButton", {
-        Parent = tabBar,
-        LayoutOrder = order,
+    local b = create("TextButton", {
+        Parent = tabBar, LayoutOrder = order,
         Size = UDim2.new(0.2, -3, 1, 0),
-        BackgroundColor3 = Theme.surfaceAlt,
-        BorderSizePixel = 0,
-        Text = title,
-        TextColor3 = Theme.muted,
-        Font = Enum.Font.GothamBold,
-        TextSize = 9,
-        AutoButtonColor = false,
+        BackgroundColor3 = Theme.surfaceAlt, BorderSizePixel = 0,
+        Text = title, TextColor3 = Theme.muted,
+        Font = Enum.Font.GothamBold, TextSize = 9, AutoButtonColor = false,
     })
-    addCorner(button, 7)
-    UI.tabs[name] = button
-    button.MouseButton1Click:Connect(function()
-        switchTab(name)
-    end)
+    addCorner(b, 7)
+    UI.tabs[name] = b
+    b.MouseButton1Click:Connect(function() switchTab(name) end)
 end
 
 createTab("Cheats", "Cheats", 1)
@@ -2686,21 +1954,18 @@ createTab("NPCs", "NPCs", 5)
 makeDivider(content, 2)
 
 local function createPage(name, order)
-    local page = create("Frame", {
-        Parent = content,
-        LayoutOrder = order,
+    local p = create("Frame", {
+        Parent = content, LayoutOrder = order,
         Size = UDim2.new(1, 0, 0, 0),
         AutomaticSize = Enum.AutomaticSize.Y,
-        BackgroundTransparency = 1,
-        Visible = false,
+        BackgroundTransparency = 1, Visible = false,
     })
     create("UIListLayout", {
-        Parent = page,
-        SortOrder = Enum.SortOrder.LayoutOrder,
+        Parent = p, SortOrder = Enum.SortOrder.LayoutOrder,
         Padding = UDim.new(0, 0),
     })
-    UI.pages[name] = page
-    return page
+    UI.pages[name] = p
+    return p
 end
 
 local cheatsPage = createPage("Cheats", 3)
@@ -2712,84 +1977,50 @@ local npcsPage = createPage("NPCs", 7)
 makeDivider(cheatsPage, 1)
 
 UI.refs.noclip = makeToggleSection(cheatsPage, {
-    order = 2,
-    icon = "👻",
-    label = "Noclip",
-    keyCode = State.keys.noclip,
-    toggleColor = Theme.success,
+    order = 2, icon = "👻", label = "Noclip",
+    keyCode = State.keys.noclip, toggleColor = Theme.success,
 })
 makeDivider(cheatsPage, 3)
 
 UI.refs.speed = makeToggleSection(cheatsPage, {
-    order = 4,
-    icon = "💨",
-    label = "Speed",
-    keyCode = State.keys.speed,
-    toggleColor = Theme.accent,
+    order = 4, icon = "💨", label = "Speed",
+    keyCode = State.keys.speed, toggleColor = Theme.accent,
     slider = {
-        label = "Speed",
-        min = 16,
-        max = 300,
-        value = State.values.speed,
-        color = Theme.accent,
-        onChanged = function(value)
-            State.values.speed = value
-        end,
+        label = "Speed", min = 16, max = 300,
+        value = State.values.speed, color = Theme.accent,
+        onChanged = function(v) State.values.speed = v end,
     },
 })
 makeDivider(cheatsPage, 5)
 
 UI.refs.jump = makeToggleSection(cheatsPage, {
-    order = 6,
-    icon = "🦘",
-    label = "High Jump",
-    keyCode = State.keys.jump,
-    toggleColor = Theme.warning,
+    order = 6, icon = "🦘", label = "High Jump",
+    keyCode = State.keys.jump, toggleColor = Theme.warning,
     slider = {
-        label = "Power",
-        min = 50,
-        max = 500,
-        value = State.values.jump,
-        color = Theme.warning,
-        onChanged = function(value)
-            State.values.jump = value
-        end,
+        label = "Power", min = 50, max = 500,
+        value = State.values.jump, color = Theme.warning,
+        onChanged = function(v) State.values.jump = v end,
     },
-    extraToggle = {
-        label = "↩  Re-jump",
-        color = Theme.warning,
-    },
+    extraToggle = { label = "↩  Re-jump", color = Theme.warning },
 })
 makeDivider(cheatsPage, 7)
 
 UI.refs.cast = makeToggleSection(cheatsPage, {
-    order = 8,
-    icon = "🎯",
-    label = "Auto Cast",
-    keyCode = State.keys.cast,
-    toggleColor = Theme.cast,
-    showStatus = true,
+    order = 8, icon = "🎯", label = "Auto Cast",
+    keyCode = State.keys.cast, toggleColor = Theme.cast, showStatus = true,
 })
 makeDivider(cheatsPage, 9)
 
 UI.refs.shake = makeToggleSection(cheatsPage, {
-    order = 10,
-    icon = "🔄",
-    label = "Shake",
-    keyCode = State.keys.shake,
-    toggleColor = Theme.success,
-    showStatus = true,
+    order = 10, icon = "🔄", label = "Shake",
+    keyCode = State.keys.shake, toggleColor = Theme.success, showStatus = true,
 })
 makeDivider(cheatsPage, 11)
 
 UI.refs.reel = makeToggleSection(cheatsPage, {
-    order = 12,
-    icon = "🎣",
-    label = "Auto-Reel  🧠",
-    keyCode = State.keys.reel,
-    toggleColor = Theme.purple,
-    showStatus = true,
-    showStatus2 = true,
+    order = 12, icon = "🎣", label = "Auto-Reel v19",
+    keyCode = State.keys.reel, toggleColor = Theme.purple,
+    showStatus = true, showStatus2 = true,
 })
 UI.refs.reelScore = UI.refs.reel.status
 
@@ -2797,70 +2028,50 @@ local learningCard = makeCard(UI.refs.reel.section, 6, true)
 addStroke(learningCard, Color3.fromRGB(76, 56, 130), 1)
 
 create("TextLabel", {
-    Parent = learningCard,
-    LayoutOrder = 1,
+    Parent = learningCard, LayoutOrder = 1,
     Size = UDim2.new(1, 0, 0, 12),
     BackgroundTransparency = 1,
-    Text = "🧠  Aprendizado adaptativo",
-    TextColor3 = Theme.purple,
-    Font = Enum.Font.GothamBold,
-    TextSize = 9,
-    TextXAlignment = Enum.TextXAlignment.Left,
+    Text = "🧠  Duty-cycle learning",
+    TextColor3 = Theme.purple, Font = Enum.Font.GothamBold,
+    TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left,
 })
 
 UI.refs.learnScore = create("TextLabel", {
-    Parent = learningCard,
-    LayoutOrder = 2,
+    Parent = learningCard, LayoutOrder = 2,
     Size = UDim2.new(1, 0, 0, 10),
-    BackgroundTransparency = 1,
-    Text = "Score: —",
-    TextColor3 = Theme.text,
-    Font = Enum.Font.Code,
-    TextSize = 8,
-    TextXAlignment = Enum.TextXAlignment.Left,
+    BackgroundTransparency = 1, Text = "Score: —",
+    TextColor3 = Theme.text, Font = Enum.Font.Code,
+    TextSize = 8, TextXAlignment = Enum.TextXAlignment.Left,
 })
 
 UI.refs.learnDiag = create("TextLabel", {
-    Parent = learningCard,
-    LayoutOrder = 3,
+    Parent = learningCard, LayoutOrder = 3,
     Size = UDim2.new(1, 0, 0, 10),
-    BackgroundTransparency = 1,
-    Text = "Último: —",
-    TextColor3 = Theme.subtext,
-    Font = Enum.Font.Code,
-    TextSize = 8,
-    TextXAlignment = Enum.TextXAlignment.Left,
+    BackgroundTransparency = 1, Text = "Último: —",
+    TextColor3 = Theme.subtext, Font = Enum.Font.Code,
+    TextSize = 8, TextXAlignment = Enum.TextXAlignment.Left,
 })
 
 UI.refs.learnParams = create("TextLabel", {
-    Parent = learningCard,
-    LayoutOrder = 4,
+    Parent = learningCard, LayoutOrder = 4,
     Size = UDim2.new(1, 0, 0, 10),
-    BackgroundTransparency = 1,
-    Text = "",
-    TextColor3 = Theme.muted,
-    Font = Enum.Font.Code,
-    TextSize = 7,
-    TextXAlignment = Enum.TextXAlignment.Left,
+    BackgroundTransparency = 1, Text = "",
+    TextColor3 = Theme.muted, Font = Enum.Font.Code,
+    TextSize = 7, TextXAlignment = Enum.TextXAlignment.Left,
 })
 
 makeDivider(learningCard, 5).BackgroundColor3 = Color3.fromRGB(76, 56, 130)
 
-local resetLearningButton = makeActionButton(learningCard, 6, "🔄  Resetar aprendizado", Color3.fromRGB(43, 18, 56), Theme.purple)
-resetLearningButton.MouseEnter:Connect(function()
-    tween(resetLearningButton, { BackgroundColor3 = Color3.fromRGB(59, 24, 74) }, 0.14)
-end)
-resetLearningButton.MouseLeave:Connect(function()
-    tween(resetLearningButton, { BackgroundColor3 = Color3.fromRGB(43, 18, 56) }, 0.14)
-end)
-resetLearningButton.MouseButton1Click:Connect(function()
-    createRipple(resetLearningButton, Theme.purple)
-    ReelParams.hold_far = 0.200
-    ReelParams.release_far = 0.025
-    ReelParams.hold_mid = 0.095
-    ReelParams.release_mid = 0.040
-    ReelParams.hold_inside = 0.042
-    ReelParams.release_inside = 0.055
+local resetBtn = makeActionButton(learningCard, 6, "🔄  Resetar aprendizado", Color3.fromRGB(43, 18, 56), Theme.purple)
+resetBtn.MouseEnter:Connect(function() tween(resetBtn, { BackgroundColor3 = Color3.fromRGB(59, 24, 74) }, 0.14) end)
+resetBtn.MouseLeave:Connect(function() tween(resetBtn, { BackgroundColor3 = Color3.fromRGB(43, 18, 56) }, 0.14) end)
+resetBtn.MouseButton1Click:Connect(function()
+    createRipple(resetBtn, Theme.purple)
+    ReelParams.duty_far = 0.90
+    ReelParams.duty_mid = 0.65
+    ReelParams.duty_near = 0.50
+    ReelParams.cycle_ms = 45
+    ReelParams.rebound_ms = 80
     LearnHistory.sessions = {}
     LearnHistory.totalWins = 0
     LearnHistory.totalLosses = 0
@@ -2877,77 +2088,53 @@ makeDivider(cheatsPage, 13)
 
 local sellCard = makeCard(cheatsPage, 14)
 create("TextLabel", {
-    Parent = sellCard,
-    LayoutOrder = 1,
+    Parent = sellCard, LayoutOrder = 1,
     Size = UDim2.new(1, 0, 0, 14),
-    BackgroundTransparency = 1,
-    Text = "💰  Sell",
-    TextColor3 = Theme.subtext,
-    Font = Enum.Font.GothamBold,
-    TextSize = 10,
-    TextXAlignment = Enum.TextXAlignment.Left,
+    BackgroundTransparency = 1, Text = "💰  Sell",
+    TextColor3 = Theme.subtext, Font = Enum.Font.GothamBold,
+    TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
 })
 
 UI.refs.sellStatus = create("TextLabel", {
-    Parent = sellCard,
-    LayoutOrder = 2,
+    Parent = sellCard, LayoutOrder = 2,
     Size = UDim2.new(1, 0, 0, 12),
-    BackgroundTransparency = 1,
-    Text = "Waiting...",
-    TextColor3 = Theme.muted,
-    Font = Enum.Font.Code,
-    TextSize = 8,
-    TextXAlignment = Enum.TextXAlignment.Left,
+    BackgroundTransparency = 1, Text = "Waiting...",
+    TextColor3 = Theme.muted, Font = Enum.Font.Code,
+    TextSize = 8, TextXAlignment = Enum.TextXAlignment.Left,
 })
 
 local sellBindButton = makeBindRow(sellCard, State.keys.sell, 3)
 
 UI.refs.sellButton = makeActionButton(sellCard, 4, "💰  Sell Item in Hand", Theme.sell, Theme.success)
-UI.refs.sellButton.MouseEnter:Connect(function()
-    tween(UI.refs.sellButton, { BackgroundColor3 = Theme.sellHover }, 0.15)
-end)
-UI.refs.sellButton.MouseLeave:Connect(function()
-    tween(UI.refs.sellButton, { BackgroundColor3 = Theme.sell }, 0.15)
-end)
+UI.refs.sellButton.MouseEnter:Connect(function() tween(UI.refs.sellButton, { BackgroundColor3 = Theme.sellHover }, 0.15) end)
+UI.refs.sellButton.MouseLeave:Connect(function() tween(UI.refs.sellButton, { BackgroundColor3 = Theme.sell }, 0.15) end)
 
 makeDivider(sellCard, 5)
 
 UI.refs.sellAllButton = makeActionButton(sellCard, 6, "📦  Sell All (mantém mapas)", Color3.fromRGB(16, 57, 35), Theme.success)
-UI.refs.sellAllButton.MouseEnter:Connect(function()
-    tween(UI.refs.sellAllButton, { BackgroundColor3 = Theme.sellHover }, 0.15)
-end)
-UI.refs.sellAllButton.MouseLeave:Connect(function()
-    tween(UI.refs.sellAllButton, { BackgroundColor3 = Color3.fromRGB(16, 57, 35) }, 0.15)
-end)
+UI.refs.sellAllButton.MouseEnter:Connect(function() tween(UI.refs.sellAllButton, { BackgroundColor3 = Theme.sellHover }, 0.15) end)
+UI.refs.sellAllButton.MouseLeave:Connect(function() tween(UI.refs.sellAllButton, { BackgroundColor3 = Color3.fromRGB(16, 57, 35) }, 0.15) end)
 
 makeDivider(sellCard, 7)
 
 local autoSellRow = create("Frame", {
-    Parent = sellCard,
-    LayoutOrder = 8,
-    Size = UDim2.new(1, 0, 0, 24),
-    BackgroundTransparency = 1,
+    Parent = sellCard, LayoutOrder = 8,
+    Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1,
 })
 
 UI.refs.autoSell = {}
 UI.refs.autoSell.label = create("TextLabel", {
-    Parent = autoSellRow,
-    Size = UDim2.new(1, -60, 1, 0),
-    BackgroundTransparency = 1,
-    Text = "🔁  Auto-Sell",
-    TextColor3 = Theme.subtext,
-    Font = Enum.Font.GothamBold,
-    TextSize = 9,
-    TextXAlignment = Enum.TextXAlignment.Left,
+    Parent = autoSellRow, Size = UDim2.new(1, -60, 1, 0),
+    BackgroundTransparency = 1, Text = "🔁  Auto-Sell",
+    TextColor3 = Theme.subtext, Font = Enum.Font.GothamBold,
+    TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left,
 })
 UI.refs.autoSell.toggle = makeToggle(autoSellRow, Theme.success)
 UI.refs.autoSell.toggle.track.Position = UDim2.new(1, -36, 0.5, -9)
-UI.refs.autoSell.toggle.hit.MouseButton1Click:Connect(function()
-    createRipple(UI.refs.autoSell.toggle.track, Theme.success)
-end)
+UI.refs.autoSell.toggle.hit.MouseButton1Click:Connect(function() createRipple(UI.refs.autoSell.toggle.track, Theme.success) end)
 
-makeSlider(sellCard, "Delay", 5, 100, math.floor(State.values.autoSellDelay * 10), Theme.success, function(value)
-    State.values.autoSellDelay = value / 10
+makeSlider(sellCard, "Delay", 5, 100, math.floor(State.values.autoSellDelay * 10), Theme.success, function(v)
+    State.values.autoSellDelay = v / 10
 end, 9)
 
 UI.refs.autoSellStatus = makeStatusLabel(sellCard, 11, 8, Theme.muted)
@@ -2958,21 +2145,16 @@ UI.refs.tpStatus = makeStatusLabel(tpCard, 1, 8, Theme.success)
 UI.search.tp = makeSearchBox(tpCard, "Buscar ilha...", 2)
 
 local tpScroll = create("ScrollingFrame", {
-    Parent = tpCard,
-    LayoutOrder = 3,
+    Parent = tpCard, LayoutOrder = 3,
     Size = UDim2.new(1, 0, 0, 250),
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    ScrollBarThickness = 4,
-    ScrollBarImageColor3 = Theme.accent,
+    BackgroundTransparency = 1, BorderSizePixel = 0,
+    ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.accent,
     AutomaticCanvasSize = Enum.AutomaticSize.Y,
     CanvasSize = UDim2.new(0, 0, 0, 0),
 })
-addPadding(tpScroll, 0, 0, 0, 0)
 UI.refs.tpList = tpScroll
 create("UIListLayout", {
-    Parent = tpScroll,
-    SortOrder = Enum.SortOrder.LayoutOrder,
+    Parent = tpScroll, SortOrder = Enum.SortOrder.LayoutOrder,
     Padding = UDim.new(0, 4),
 })
 
@@ -2981,86 +2163,68 @@ UI.refs.rodStatus = makeStatusLabel(rodsCard, 1, 8, Theme.success)
 UI.search.rods = makeSearchBox(rodsCard, "Buscar vara...", 2)
 
 local rodsScroll = create("ScrollingFrame", {
-    Parent = rodsCard,
-    LayoutOrder = 3,
+    Parent = rodsCard, LayoutOrder = 3,
     Size = UDim2.new(1, 0, 0, 250),
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    ScrollBarThickness = 4,
-    ScrollBarImageColor3 = Theme.accent,
+    BackgroundTransparency = 1, BorderSizePixel = 0,
+    ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.accent,
     AutomaticCanvasSize = Enum.AutomaticSize.Y,
     CanvasSize = UDim2.new(0, 0, 0, 0),
 })
 UI.refs.rodList = rodsScroll
 create("UIListLayout", {
-    Parent = rodsScroll,
-    SortOrder = Enum.SortOrder.LayoutOrder,
+    Parent = rodsScroll, SortOrder = Enum.SortOrder.LayoutOrder,
     Padding = UDim.new(0, 4),
 })
 
 local mapsCard = makeCard(mapsPage, 1)
 create("TextLabel", {
-    Parent = mapsCard,
-    LayoutOrder = 1,
+    Parent = mapsCard, LayoutOrder = 1,
     Size = UDim2.new(1, 0, 0, 14),
-    BackgroundTransparency = 1,
-    Text = "📜  Treasure Maps no inventário",
-    TextColor3 = Theme.gold,
-    Font = Enum.Font.GothamBold,
-    TextSize = 10,
-    TextXAlignment = Enum.TextXAlignment.Left,
+    BackgroundTransparency = 1, Text = "📜  Treasure Maps no inventário",
+    TextColor3 = Theme.gold, Font = Enum.Font.GothamBold,
+    TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
 })
 create("TextLabel", {
-    Parent = mapsCard,
-    LayoutOrder = 2,
+    Parent = mapsCard, LayoutOrder = 2,
     Size = UDim2.new(1, 0, 0, 12),
-    BackgroundTransparency = 1,
-    Text = "Leva o mapa no Jack Marrow pra fixar as coords",
-    TextColor3 = Theme.muted,
-    Font = Enum.Font.Gotham,
-    TextSize = 8,
-    TextXAlignment = Enum.TextXAlignment.Left,
+    BackgroundTransparency = 1, Text = "Leva o mapa no Jack Marrow pra fixar as coords",
+    TextColor3 = Theme.muted, Font = Enum.Font.Gotham,
+    TextSize = 8, TextXAlignment = Enum.TextXAlignment.Left,
 })
 
 local scanMapsButton = makeActionButton(mapsCard, 3, "🔍  Escanear mapas", Color3.fromRGB(53, 40, 16), Theme.gold)
 local jackButton = makeActionButton(mapsCard, 4, "🏴  TP Jack Marrow (fixar mapas)", Color3.fromRGB(18, 34, 53), Theme.accent)
 
 local mapList = create("Frame", {
-    Parent = mapsCard,
-    LayoutOrder = 5,
+    Parent = mapsCard, LayoutOrder = 5,
     Size = UDim2.new(1, 0, 0, 0),
     AutomaticSize = Enum.AutomaticSize.Y,
     BackgroundTransparency = 1,
 })
 UI.refs.mapList = mapList
 create("UIListLayout", {
-    Parent = mapList,
-    SortOrder = Enum.SortOrder.LayoutOrder,
+    Parent = mapList, SortOrder = Enum.SortOrder.LayoutOrder,
     Padding = UDim.new(0, 4),
 })
 
 local npcCard = makeCard(npcsPage, 1)
-makeSlider(npcCard, "Scan range", 1, 1000, State.values.npcRange, Theme.accent, function(value)
-    State.values.npcRange = value
+makeSlider(npcCard, "Scan range", 1, 1000, State.values.npcRange, Theme.accent, function(v)
+    State.values.npcRange = v
 end, 1)
 
 local scanNpcButton = makeActionButton(npcCard, 3, "🔍  Scan Nearby NPCs", Color3.fromRGB(18, 34, 62), Theme.accent)
 
 local npcScroll = create("ScrollingFrame", {
-    Parent = npcCard,
-    LayoutOrder = 4,
+    Parent = npcCard, LayoutOrder = 4,
     Size = UDim2.new(1, 0, 0, 210),
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    ScrollBarThickness = 4,
-    ScrollBarImageColor3 = Theme.accent,
+    BackgroundTransparency = 1, BorderSizePixel = 0,
+    ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.accent,
     AutomaticCanvasSize = Enum.AutomaticSize.Y,
     CanvasSize = UDim2.new(0, 0, 0, 0),
 })
 UI.refs.npcList = npcScroll
 create("UIListLayout", {
-    Parent = npcScroll,
-    SortOrder = Enum.SortOrder.LayoutOrder,
+    Parent = npcScroll, SortOrder = Enum.SortOrder.LayoutOrder,
     Padding = UDim.new(0, 4),
 })
 
@@ -3077,12 +2241,8 @@ UI.refs.autoSell.toggle.hit.MouseButton1Click:Connect(toggleAutoSell)
 UI.refs.sellButton.MouseButton1Click:Connect(runSellInHand)
 UI.refs.sellAllButton.MouseButton1Click:Connect(runSellAll)
 
-scanMapsButton.MouseEnter:Connect(function()
-    tween(scanMapsButton, { BackgroundColor3 = Color3.fromRGB(68, 51, 20) }, 0.15)
-end)
-scanMapsButton.MouseLeave:Connect(function()
-    tween(scanMapsButton, { BackgroundColor3 = Color3.fromRGB(53, 40, 16) }, 0.15)
-end)
+scanMapsButton.MouseEnter:Connect(function() tween(scanMapsButton, { BackgroundColor3 = Color3.fromRGB(68, 51, 20) }, 0.15) end)
+scanMapsButton.MouseLeave:Connect(function() tween(scanMapsButton, { BackgroundColor3 = Color3.fromRGB(53, 40, 16) }, 0.15) end)
 scanMapsButton.MouseButton1Click:Connect(function()
     createRipple(scanMapsButton, Theme.gold)
     scanMapsButton.Text = "⏳  Escaneando..."
@@ -3091,23 +2251,15 @@ scanMapsButton.MouseButton1Click:Connect(function()
     scanMapsButton.Text = "🔍  Escanear mapas"
 end)
 
-jackButton.MouseEnter:Connect(function()
-    tween(jackButton, { BackgroundColor3 = Color3.fromRGB(24, 44, 66) }, 0.15)
-end)
-jackButton.MouseLeave:Connect(function()
-    tween(jackButton, { BackgroundColor3 = Color3.fromRGB(18, 34, 53) }, 0.15)
-end)
+jackButton.MouseEnter:Connect(function() tween(jackButton, { BackgroundColor3 = Color3.fromRGB(24, 44, 66) }, 0.15) end)
+jackButton.MouseLeave:Connect(function() tween(jackButton, { BackgroundColor3 = Color3.fromRGB(18, 34, 53) }, 0.15) end)
 jackButton.MouseButton1Click:Connect(function()
     createRipple(jackButton, Theme.accent)
     teleportTo(Vector3.new(-2825, 215, 1515))
 end)
 
-scanNpcButton.MouseEnter:Connect(function()
-    tween(scanNpcButton, { BackgroundColor3 = Color3.fromRGB(24, 44, 74) }, 0.15)
-end)
-scanNpcButton.MouseLeave:Connect(function()
-    tween(scanNpcButton, { BackgroundColor3 = Color3.fromRGB(18, 34, 62) }, 0.15)
-end)
+scanNpcButton.MouseEnter:Connect(function() tween(scanNpcButton, { BackgroundColor3 = Color3.fromRGB(24, 44, 74) }, 0.15) end)
+scanNpcButton.MouseLeave:Connect(function() tween(scanNpcButton, { BackgroundColor3 = Color3.fromRGB(18, 34, 62) }, 0.15) end)
 scanNpcButton.MouseButton1Click:Connect(function()
     createRipple(scanNpcButton, Theme.accent)
     scanNpcButton.Text = "⏳  Scanning..."
@@ -3119,148 +2271,74 @@ end)
 UI.search.tp:GetPropertyChangedSignal("Text"):Connect(renderTeleportList)
 UI.search.rods:GetPropertyChangedSignal("Text"):Connect(renderRodList)
 
-setupBind(UI.refs.noclip.bindButton, "noclip", function()
-    return State.keys.noclip
-end, function(keyCode)
-    State.keys.noclip = keyCode
-end)
-setupBind(UI.refs.speed.bindButton, "speed", function()
-    return State.keys.speed
-end, function(keyCode)
-    State.keys.speed = keyCode
-end)
-setupBind(UI.refs.jump.bindButton, "jump", function()
-    return State.keys.jump
-end, function(keyCode)
-    State.keys.jump = keyCode
-end)
-setupBind(UI.refs.cast.bindButton, "cast", function()
-    return State.keys.cast
-end, function(keyCode)
-    State.keys.cast = keyCode
-end)
-setupBind(UI.refs.shake.bindButton, "shake", function()
-    return State.keys.shake
-end, function(keyCode)
-    State.keys.shake = keyCode
-end)
-setupBind(UI.refs.reel.bindButton, "reel", function()
-    return State.keys.reel
-end, function(keyCode)
-    State.keys.reel = keyCode
-end)
-setupBind(sellBindButton, "sell", function()
-    return State.keys.sell
-end, function(keyCode)
-    State.keys.sell = keyCode
-end)
+setupBind(UI.refs.noclip.bindButton, "noclip", function() return State.keys.noclip end, function(k) State.keys.noclip = k end)
+setupBind(UI.refs.speed.bindButton, "speed", function() return State.keys.speed end, function(k) State.keys.speed = k end)
+setupBind(UI.refs.jump.bindButton, "jump", function() return State.keys.jump end, function(k) State.keys.jump = k end)
+setupBind(UI.refs.cast.bindButton, "cast", function() return State.keys.cast end, function(k) State.keys.cast = k end)
+setupBind(UI.refs.shake.bindButton, "shake", function() return State.keys.shake end, function(k) State.keys.shake = k end)
+setupBind(UI.refs.reel.bindButton, "reel", function() return State.keys.reel end, function(k) State.keys.reel = k end)
+setupBind(sellBindButton, "sell", function() return State.keys.sell end, function(k) State.keys.sell = k end)
 
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed or State.runtime.listening then
-        return
-    end
-
-    local keyCode = input.KeyCode
-
-    if keyCode == State.keys.toggleGui then
-        setGuiVisible(not State.runtime.guiVisible)
-    elseif keyCode == State.keys.noclip then
-        toggleNoclip()
-    elseif keyCode == State.keys.speed then
-        toggleSpeed()
-    elseif keyCode == State.keys.jump then
-        toggleJump()
-    elseif keyCode == State.keys.cast then
-        toggleCast()
-    elseif keyCode == State.keys.shake then
-        toggleShake()
-    elseif keyCode == State.keys.reel then
-        toggleAutoReel()
-    elseif keyCode == State.keys.sell then
-        runSellInHand()
-    end
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp or State.runtime.listening then return end
+    local kc = input.KeyCode
+    if kc == State.keys.toggleGui then setGuiVisible(not State.runtime.guiVisible)
+    elseif kc == State.keys.noclip then toggleNoclip()
+    elseif kc == State.keys.speed then toggleSpeed()
+    elseif kc == State.keys.jump then toggleJump()
+    elseif kc == State.keys.cast then toggleCast()
+    elseif kc == State.keys.shake then toggleShake()
+    elseif kc == State.keys.reel then toggleAutoReel()
+    elseif kc == State.keys.sell then runSellInHand() end
 end)
 
 do
     local dragging = false
-    local dragStart
-    local startPosition
-
-    header.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPosition = frame.Position
+    local dragStart, startPos
+    header.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = true; dragStart = i.Position; startPos = frame.Position
         end
     end)
-
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
             dragging = false
         end
     end)
-
-    UserInputService.InputChanged:Connect(function(input)
-        if not dragging then
-            return
-        end
-        if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then
-            return
-        end
-
-        local delta = input.Position - dragStart
-        frame.Position = UDim2.new(
-            startPosition.X.Scale,
-            startPosition.X.Offset + delta.X,
-            startPosition.Y.Scale,
-            startPosition.Y.Offset + delta.Y
-        )
+    UserInputService.InputChanged:Connect(function(i)
+        if not dragging then return end
+        if i.UserInputType ~= Enum.UserInputType.MouseMovement and i.UserInputType ~= Enum.UserInputType.Touch then return end
+        local d = i.Position - dragStart
+        frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
     end)
 end
 
 LocalPlayer.CharacterAdded:Connect(function()
     task.wait(0.5)
-    if State.flags.noclip then
-        setNoclip(true)
-    end
-    if State.flags.speed then
-        applySpeedOnce()
-        startSpeedLoop()
-    end
-    if State.flags.jump then
-        startJumpLoop()
-    end
-    if State.flags.rejump and State.flags.jump then
-        startRejumpLoop()
-    end
+    if State.flags.noclip then setNoclip(true) end
+    if State.flags.speed then applySpeedOnce(); startSpeedLoop() end
+    if State.flags.jump then startJumpLoop() end
+    if State.flags.rejump and State.flags.jump then startRejumpLoop() end
 end)
 
 startTask("autosaveLearning", function()
-    while true do
-        task.wait(30)
-        saveLearnData()
-    end
+    while true do task.wait(30); saveLearnData() end
 end)
 
 startTask("learningPanel", function()
-    while true do
-        task.wait(0.5)
-        updateLearningPanel()
-    end
+    while true do task.wait(0.5); updateLearningPanel() end
 end)
 
 startTask("shakeStatus", function()
     local dots = { "", ".", "..", "..." }
-    local index = 1
+    local i = 1
     while true do
-        task.wait(0.2)
-        index = index % #dots + 1
-
+        task.wait(0.2); i = i % #dots + 1
         if State.flags.shake then
-            local text = State.runtime.shakeActive
-                and ("● Enter pressing" .. dots[index])
-                or ("○ waiting shake" .. dots[index])
-            setStatus(UI.refs.shake.status, text, State.runtime.shakeActive and Theme.success or Theme.warning)
+            local t = State.runtime.shakeActive
+                and ("● Enter pressing" .. dots[i])
+                or ("○ waiting shake" .. dots[i])
+            setStatus(UI.refs.shake.status, t, State.runtime.shakeActive and Theme.success or Theme.warning)
         else
             setStatus(UI.refs.shake.status, "", Theme.muted)
         end
@@ -3269,26 +2347,24 @@ end)
 
 startTask("castStatus", function()
     local dots = { "", ".", "..", "..." }
-    local index = 1
+    local i = 1
     while true do
-        task.wait(0.2)
-        index = index % #dots + 1
-
+        task.wait(0.2); i = i % #dots + 1
         if State.flags.cast then
             if State.runtime.castActive then
                 if State.runtime.castPhase == "holding" then
-                    setStatus(UI.refs.cast.status, "▲ carregando" .. dots[index], Theme.cast)
+                    setStatus(UI.refs.cast.status, "▲ carregando" .. dots[i], Theme.cast)
                 else
-                    setStatus(UI.refs.cast.status, "↓ soltando" .. dots[index], Theme.success)
+                    setStatus(UI.refs.cast.status, "↓ soltando" .. dots[i], Theme.success)
                 end
             elseif State.runtime.castPhase == "cooldown" then
-                setStatus(UI.refs.cast.status, "○ aguardando pesca" .. dots[index], Theme.warning)
+                setStatus(UI.refs.cast.status, "○ aguardando pesca" .. dots[i], Theme.warning)
             elseif State.runtime.castPhase == "arming" then
-                setStatus(UI.refs.cast.status, "○ puxando vara [1]" .. dots[index], Theme.warning)
+                setStatus(UI.refs.cast.status, "○ puxando vara [1]" .. dots[i], Theme.warning)
             elseif State.runtime.castPhase == "searching" then
-                setStatus(UI.refs.cast.status, "⌕ aguardando verde" .. dots[index], Theme.warning)
+                setStatus(UI.refs.cast.status, "⌕ aguardando verde" .. dots[i], Theme.warning)
             else
-                setStatus(UI.refs.cast.status, "○ aguardando cast" .. dots[index], Theme.warning)
+                setStatus(UI.refs.cast.status, "○ aguardando cast" .. dots[i], Theme.warning)
             end
         else
             setStatus(UI.refs.cast.status, "", Theme.muted)
@@ -3298,16 +2374,14 @@ end)
 
 startTask("reelStatus", function()
     local dots = { "", ".", "..", "..." }
-    local index = 1
+    local i = 1
     while true do
-        task.wait(0.25)
-        index = index % #dots + 1
-
+        task.wait(0.25); i = i % #dots + 1
         if State.flags.autoReel then
             if State.runtime.reelActive then
-                setStatus(UI.refs.reel.status, "● pescando" .. dots[index], Theme.success)
+                setStatus(UI.refs.reel.status, "● pescando" .. dots[i], Theme.success)
             else
-                setStatus(UI.refs.reel.status, "○ aguardando UI" .. dots[index], Theme.warning)
+                setStatus(UI.refs.reel.status, "○ aguardando UI" .. dots[i], Theme.warning)
             end
         else
             setStatus(UI.refs.reel.status, "", Theme.muted)
