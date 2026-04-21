@@ -59,6 +59,7 @@ local State = {
         castPhase = "idle",
         reelMouseHeld = false,
         castMouseHeld = false,
+        lastCastEquipAttempt = 0,
     },
     tasks = {},
     connections = {},
@@ -182,6 +183,10 @@ local Theme = {
     sell = Color3.fromRGB(22, 68, 45),
     sellHover = Color3.fromRGB(28, 84, 54),
 }
+
+local GUI_WIDTH = 226
+local HEADER_HEIGHT = 38
+local WINDOW_Y_OFFSET = -180
 
 local BLOCKED_KEYS = {
     [Enum.KeyCode.Return] = true,
@@ -567,14 +572,22 @@ local function shakeUiVisible()
     return shakeGui and shakeGui.Enabled ~= false
 end
 
-local function pressEnter()
+local function tapKey(keyCode)
     pcall(function()
-        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Return, false, game)
+        VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
     end)
     task.wait(0.02)
     pcall(function()
-        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+        VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
     end)
+end
+
+local function pressEnter()
+    tapKey(Enum.KeyCode.Return)
+end
+
+local function equipRodSlot()
+    tapKey(Enum.KeyCode.One)
 end
 
 local function startShake()
@@ -755,6 +768,7 @@ end
 
 local function startCast()
     forceCastRelease()
+    State.runtime.lastCastEquipAttempt = 0
     State.runtime.castActive = false
     State.runtime.castPhase = "idle"
 
@@ -764,7 +778,7 @@ local function startCast()
 
             if castGui and castGui.Enabled then
                 local outerBar, greenFill = findCastBar(castGui)
-                if outerBar then
+                if outerBar and greenFill then
                     local centerX = outerBar.AbsolutePosition.X + outerBar.AbsoluteSize.X * 0.5
                     local centerY = outerBar.AbsolutePosition.Y + outerBar.AbsoluteSize.Y * 0.5
 
@@ -795,7 +809,7 @@ local function startCast()
                     sendMouseUp(centerX, centerY)
                     State.runtime.castActive = false
                     State.runtime.castPhase = "idle"
-                    task.wait(0.35 + math.random() * 0.25)
+                    task.wait(0.45 + math.random() * 0.20)
                 else
                     forceCastRelease()
                     State.runtime.castActive = false
@@ -805,8 +819,15 @@ local function startCast()
             else
                 forceCastRelease()
                 State.runtime.castActive = false
-                State.runtime.castPhase = "idle"
-                task.wait(0.10)
+                State.runtime.castPhase = "arming"
+
+                if tick() - State.runtime.lastCastEquipAttempt >= 0.75 then
+                    State.runtime.lastCastEquipAttempt = tick()
+                    equipRodSlot()
+                    task.wait(0.22)
+                else
+                    task.wait(0.08)
+                end
             end
         end
 
@@ -817,77 +838,50 @@ local function startCast()
 end
 
 local function stopCast()
+    State.flags.cast = false
     forceCastRelease()
+    State.runtime.lastCastEquipAttempt = 0
     State.runtime.castActive = false
     State.runtime.castPhase = "idle"
     stopTask("cast")
 end
 
 local function findReelUI()
-    return findGuiByPatterns(
-        { "reelui", "ReelUI", "fishingrod", "FishingRod", "reelbar", "ReelBar", "Fishing", "FishingBar", "FishingUI" },
-        { "reel", "fish" },
-        { "shake" }
-    )
-end
-
-local function scoreGuiCandidate(guiObject, kind)
-    if not guiObject.Visible then
-        return -math.huge
-    end
-
-    local name = guiObject.Name:lower()
-    local size = guiObject.AbsoluteSize
-    local score = 0
-
-    if kind == "player" then
-        if name == "playerbar" or name:find("playerbar") then
-            score += 16
-        elseif name:find("player") then
-            score += 10
-        elseif name:find("bar") then
-            score += 3
-        end
-        if size.X > size.Y then
-            score += 3
-        end
-    else
-        if name == "fish" or name == "fishbar" or name == "fishicon" then
-            score += 16
-        elseif name:find("fish") or name:find("target") then
-            score += 10
-        elseif name:find("icon") then
-            score += 4
+    for _, name in ipairs({ "reelui", "ReelUI", "fishingrod", "FishingRod", "reelbar", "ReelBar", "Fishing", "FishingBar", "FishingUI" }) do
+        local gui = PlayerGui:FindFirstChild(name)
+        if gui and gui.Enabled ~= false then
+            return gui
         end
     end
 
-    score += size.X * 0.02 + size.Y * 0.01
-    return score
+    for _, gui in ipairs(PlayerGui:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui.Enabled then
+            local lowerName = gui.Name:lower()
+            if (lowerName:find("reel") or lowerName:find("fish")) and not lowerName:find("shake") then
+                return gui
+            end
+        end
+    end
+
+    return nil
 end
 
 local function findReelElements(reelGui)
-    local bestPlayer
-    local bestFish
-    local bestPlayerScore = -math.huge
-    local bestFishScore = -math.huge
+    local playerBar
+    local fishBar
 
     for _, descendant in ipairs(reelGui:GetDescendants()) do
         if descendant:IsA("GuiObject") and descendant.Visible then
-            local playerScore = scoreGuiCandidate(descendant, "player")
-            if playerScore > bestPlayerScore then
-                bestPlayer = descendant
-                bestPlayerScore = playerScore
-            end
-
-            local fishScore = scoreGuiCandidate(descendant, "fish")
-            if fishScore > bestFishScore then
-                bestFish = descendant
-                bestFishScore = fishScore
+            local lowerName = descendant.Name:lower()
+            if not playerBar and (lowerName == "playerbar" or lowerName == "player" or lowerName:find("playerbar")) then
+                playerBar = descendant
+            elseif not fishBar and (lowerName == "fish" or lowerName == "fishbar" or lowerName == "fishicon" or lowerName:find("fish") or lowerName:find("target")) then
+                fishBar = descendant
             end
         end
     end
 
-    return bestPlayer, bestFish
+    return playerBar, fishBar
 end
 
 local function detectRewardGui()
@@ -1066,14 +1060,11 @@ local function startAutoReel()
                             end
                         end
 
-                        setStatus(
-                            UI.refs.reelScore,
-                            string.format("Score %d/%d%s • %s", wins, total, trend, LearnHistory.lastDiagnosis),
-                            won and Theme.success or Theme.warning
-                        )
+                        UI.refs.reelScore.Text = string.format("Score %d/%d%s • %s", wins, total, trend, LearnHistory.lastDiagnosis)
+                        UI.refs.reelScore.TextColor3 = won and Theme.success or Theme.warning
                     end
 
-                    task.wait(1.2)
+                    task.wait(1.5)
                 else
                     task.wait(0.10)
                 end
@@ -1086,6 +1077,7 @@ local function startAutoReel()
 end
 
 local function stopAutoReel()
+    State.flags.autoReel = false
     State.runtime.reelActive = false
     reelForceRelease()
     stopTask("autoReel")
@@ -1366,13 +1358,13 @@ local function makeCard(parent, order, useAlt)
         BackgroundColor3 = useAlt and Theme.surfaceAlt or Theme.surface,
         BorderSizePixel = 0,
     })
-    addCorner(card, 14)
-    addStroke(card, Theme.border, 1.2, 0.1)
-    addPadding(card, 12, 12, 10, 10)
+    addCorner(card, 10)
+    addStroke(card, Theme.border, 1, 0.12)
+    addPadding(card, 8, 8, 7, 7)
     create("UIListLayout", {
         Parent = card,
         SortOrder = Enum.SortOrder.LayoutOrder,
-        Padding = UDim.new(0, 6),
+        Padding = UDim.new(0, 4),
     })
     return card
 end
@@ -1390,17 +1382,17 @@ end
 local function makeToggle(trackParent, activeColor)
     local track = create("Frame", {
         Parent = trackParent,
-        Size = UDim2.new(0, 42, 0, 20),
+        Size = UDim2.new(0, 36, 0, 18),
         BackgroundColor3 = Color3.fromRGB(24, 31, 55),
         BorderSizePixel = 0,
     })
-    addCorner(track, 10)
+    addCorner(track, 9)
     addStroke(track, Theme.border, 1)
 
     local knob = create("Frame", {
         Parent = track,
-        Size = UDim2.new(0, 16, 0, 16),
-        Position = UDim2.new(0, 2, 0.5, -8),
+        Size = UDim2.new(0, 12, 0, 12),
+        Position = UDim2.new(0, 3, 0.5, -6),
         BackgroundColor3 = Color3.fromRGB(241, 245, 255),
         BorderSizePixel = 0,
     })
@@ -1420,7 +1412,7 @@ local function makeToggle(trackParent, activeColor)
             BackgroundColor3 = on and activeColor or Color3.fromRGB(24, 31, 55),
         }, 0.16)
         spring(knob, {
-            Position = on and UDim2.new(0, 24, 0.5, -8) or UDim2.new(0, 2, 0.5, -8),
+            Position = on and UDim2.new(0, 21, 0.5, -6) or UDim2.new(0, 3, 0.5, -6),
         })
     end
 
@@ -1436,25 +1428,25 @@ local function makeSlider(parent, label, minimum, maximum, defaultValue, color, 
     local valueLabel = create("TextLabel", {
         Parent = parent,
         LayoutOrder = order,
-        Size = UDim2.new(1, 0, 0, 14),
+        Size = UDim2.new(1, 0, 0, 11),
         BackgroundTransparency = 1,
         Text = label .. ": " .. defaultValue,
         TextColor3 = color,
         Font = Enum.Font.GothamBold,
-        TextSize = 9,
+        TextSize = 8,
         TextXAlignment = Enum.TextXAlignment.Left,
     })
 
     local wrap = create("Frame", {
         Parent = parent,
         LayoutOrder = order + 1,
-        Size = UDim2.new(1, 0, 0, 16),
+        Size = UDim2.new(1, 0, 0, 12),
         BackgroundTransparency = 1,
     })
 
     local bar = create("Frame", {
         Parent = wrap,
-        Size = UDim2.new(1, 0, 0, 5),
+        Size = UDim2.new(1, 0, 0, 4),
         Position = UDim2.new(0, 0, 0.5, -2),
         BackgroundColor3 = Color3.fromRGB(22, 28, 49),
         BorderSizePixel = 0,
@@ -1474,7 +1466,7 @@ local function makeSlider(parent, label, minimum, maximum, defaultValue, color, 
         Parent = bar,
         AnchorPoint = Vector2.new(0.5, 0.5),
         Position = UDim2.new(percent, 0, 0.5, 0),
-        Size = UDim2.new(0, 12, 0, 12),
+        Size = UDim2.new(0, 10, 0, 10),
         BackgroundColor3 = Color3.fromRGB(247, 250, 255),
         BorderSizePixel = 0,
     })
@@ -1482,8 +1474,8 @@ local function makeSlider(parent, label, minimum, maximum, defaultValue, color, 
 
     local hit = create("TextButton", {
         Parent = bar,
-        Size = UDim2.new(1, 0, 0, 24),
-        Position = UDim2.new(0, 0, 0.5, -12),
+        Size = UDim2.new(1, 0, 0, 18),
+        Position = UDim2.new(0, 0, 0.5, -9),
         BackgroundTransparency = 1,
         Text = "",
         AutoButtonColor = false,
@@ -1541,34 +1533,34 @@ local function makeBindRow(parent, keyCode, order)
     local row = create("Frame", {
         Parent = parent,
         LayoutOrder = order,
-        Size = UDim2.new(1, 0, 0, 22),
+        Size = UDim2.new(1, 0, 0, 18),
         BackgroundTransparency = 1,
     })
 
     create("TextLabel", {
         Parent = row,
-        Size = UDim2.new(0, 40, 1, 0),
+        Size = UDim2.new(0, 32, 1, 0),
         BackgroundTransparency = 1,
         Text = "Key:",
         TextColor3 = Theme.muted,
         Font = Enum.Font.Gotham,
-        TextSize = 9,
+        TextSize = 8,
         TextXAlignment = Enum.TextXAlignment.Left,
     })
 
     local button = create("TextButton", {
         Parent = row,
-        Size = UDim2.new(0, 72, 0, 20),
-        Position = UDim2.new(0, 40, 0.5, -10),
+        Size = UDim2.new(0, 54, 0, 16),
+        Position = UDim2.new(0, 32, 0.5, -8),
         BackgroundColor3 = Color3.fromRGB(20, 25, 47),
         BorderSizePixel = 0,
         Text = keyCode.Name,
         TextColor3 = Theme.accent,
         Font = Enum.Font.GothamBold,
-        TextSize = 9,
+        TextSize = 8,
         AutoButtonColor = false,
     })
-    addCorner(button, 6)
+    addCorner(button, 5)
     addStroke(button, Theme.accentSoft, 1)
 
     return button
@@ -1578,13 +1570,13 @@ local function makeSearchBox(parent, placeholder, order)
     local wrap = create("Frame", {
         Parent = parent,
         LayoutOrder = order,
-        Size = UDim2.new(1, 0, 0, 30),
+        Size = UDim2.new(1, 0, 0, 24),
         BackgroundColor3 = Theme.surfaceAlt,
         BorderSizePixel = 0,
     })
-    addCorner(wrap, 10)
+    addCorner(wrap, 8)
     addStroke(wrap, Theme.border, 1)
-    addPadding(wrap, 10, 10, 0, 0)
+    addPadding(wrap, 8, 8, 0, 0)
 
     local icon = create("TextLabel", {
         Parent = wrap,
@@ -1593,7 +1585,7 @@ local function makeSearchBox(parent, placeholder, order)
         Text = "⌕",
         TextColor3 = Theme.muted,
         Font = Enum.Font.GothamBold,
-        TextSize = 11,
+        TextSize = 10,
         TextXAlignment = Enum.TextXAlignment.Left,
     })
 
@@ -1607,7 +1599,7 @@ local function makeSearchBox(parent, placeholder, order)
         TextColor3 = Theme.text,
         PlaceholderColor3 = Theme.muted,
         Font = Enum.Font.Gotham,
-        TextSize = 10,
+        TextSize = 9,
         TextXAlignment = Enum.TextXAlignment.Left,
         ClearTextOnFocus = false,
     })
@@ -1619,16 +1611,16 @@ local function makeActionButton(parent, order, text, bgColor, textColor)
     local button = create("TextButton", {
         Parent = parent,
         LayoutOrder = order,
-        Size = UDim2.new(1, 0, 0, 30),
+        Size = UDim2.new(1, 0, 0, 24),
         BackgroundColor3 = bgColor,
         BorderSizePixel = 0,
         Text = text,
         TextColor3 = textColor,
         Font = Enum.Font.GothamBold,
-        TextSize = 10,
+        TextSize = 9,
         AutoButtonColor = false,
     })
-    addCorner(button, 8)
+    addCorner(button, 7)
     addStroke(button, Theme.border, 1)
     return button
 end
@@ -1653,7 +1645,7 @@ local function makeToggleSection(parent, options)
     local row = create("Frame", {
         Parent = section,
         LayoutOrder = 1,
-        Size = UDim2.new(1, 0, 0, 24),
+        Size = UDim2.new(1, 0, 0, 20),
         BackgroundTransparency = 1,
     })
 
@@ -1664,12 +1656,12 @@ local function makeToggleSection(parent, options)
         Text = string.format("%s  %s", options.icon, options.label),
         TextColor3 = Theme.subtext,
         Font = Enum.Font.GothamBold,
-        TextSize = 10,
+        TextSize = 9,
         TextXAlignment = Enum.TextXAlignment.Left,
     })
 
     local toggle = makeToggle(row, options.toggleColor or Theme.accent)
-    toggle.track.Position = UDim2.new(1, -42, 0.5, -10)
+    toggle.track.Position = UDim2.new(1, -36, 0.5, -9)
     toggle.hit.MouseButton1Click:Connect(function()
         createRipple(toggle.track, options.toggleColor or Theme.accent)
     end)
@@ -1700,7 +1692,7 @@ local function makeToggleSection(parent, options)
         local extraRow = create("Frame", {
             Parent = section,
             LayoutOrder = lastOrder + 1,
-            Size = UDim2.new(1, 0, 0, 22),
+            Size = UDim2.new(1, 0, 0, 18),
             BackgroundTransparency = 1,
         })
 
@@ -1711,12 +1703,12 @@ local function makeToggleSection(parent, options)
             Text = options.extraToggle.label,
             TextColor3 = Theme.subtext,
             Font = Enum.Font.GothamBold,
-            TextSize = 9,
+            TextSize = 8,
             TextXAlignment = Enum.TextXAlignment.Left,
         })
 
         extraToggle = makeToggle(extraRow, options.extraToggle.color or Theme.accent)
-        extraToggle.track.Position = UDim2.new(1, -42, 0.5, -10)
+        extraToggle.track.Position = UDim2.new(1, -36, 0.5, -9)
         extraToggle.hit.MouseButton1Click:Connect(function()
             createRipple(extraToggle.track, options.extraToggle.color or Theme.accent)
         end)
@@ -1753,7 +1745,7 @@ local function refreshFrameSize()
         return
     end
     task.wait()
-    UI.refs.frame.Size = UDim2.new(0, 286, 0, 48 + UI.refs.rootLayout.AbsoluteContentSize.Y)
+    UI.refs.frame.Size = UDim2.new(0, GUI_WIDTH, 0, HEADER_HEIGHT + UI.refs.rootLayout.AbsoluteContentSize.Y)
 end
 
 local function switchTab(name)
@@ -1782,7 +1774,7 @@ local function setGuiVisible(visible)
         UI.refs.content.Visible = true
         task.wait()
         tween(UI.refs.frame, {
-            Size = UDim2.new(0, 286, 0, 48 + UI.refs.rootLayout.AbsoluteContentSize.Y),
+            Size = UDim2.new(0, GUI_WIDTH, 0, HEADER_HEIGHT + UI.refs.rootLayout.AbsoluteContentSize.Y),
             BackgroundTransparency = 0,
         }, 0.2)
         tween(UI.refs.hideHint, {
@@ -1793,7 +1785,7 @@ local function setGuiVisible(visible)
         end)
     else
         local shrink = tween(UI.refs.frame, {
-            Size = UDim2.new(0, 286, 0, 48),
+            Size = UDim2.new(0, GUI_WIDTH, 0, HEADER_HEIGHT),
         }, 0.18)
         tween(UI.refs.hideHint, {
             TextColor3 = Theme.accent,
@@ -1951,14 +1943,14 @@ local function toggleRejump()
 end
 
 local function toggleCast()
-    State.flags.cast = not State.flags.cast
-    UI.refs.cast.setEnabled(State.flags.cast)
-
     if State.flags.cast then
-        startCast()
-    else
         stopCast()
+        UI.refs.cast.setEnabled(false)
         setStatus(UI.refs.cast.status, "", Theme.muted)
+    else
+        State.flags.cast = true
+        UI.refs.cast.setEnabled(true)
+        startCast()
     end
 
     updateActivityDot()
@@ -2345,14 +2337,14 @@ local gui = create("ScreenGui", {
 
 local frame = create("Frame", {
     Parent = gui,
-    Size = UDim2.new(0, 286, 0, 48),
-    Position = UDim2.new(0, -286, 0.5, -190),
+    Size = UDim2.new(0, GUI_WIDTH, 0, HEADER_HEIGHT),
+    Position = UDim2.new(0, -GUI_WIDTH, 0.5, WINDOW_Y_OFFSET),
     BackgroundColor3 = Theme.shell,
     BackgroundTransparency = 1,
     BorderSizePixel = 0,
     ClipsDescendants = true,
 })
-addCorner(frame, 18)
+addCorner(frame, 14)
 addGradient(frame, 90, {
     ColorSequenceKeypoint.new(0, Color3.fromRGB(10, 14, 24)),
     ColorSequenceKeypoint.new(1, Theme.shell),
@@ -2361,7 +2353,7 @@ local frameStroke = addStroke(frame, Theme.border, 1.5, 0.06)
 
 local header = create("Frame", {
     Parent = frame,
-    Size = UDim2.new(1, 0, 0, 48),
+    Size = UDim2.new(1, 0, 0, HEADER_HEIGHT),
     BackgroundColor3 = Theme.panel,
     BorderSizePixel = 0,
     ZIndex = 2,
@@ -2373,8 +2365,8 @@ addGradient(header, 90, {
 
 local activityDot = create("Frame", {
     Parent = header,
-    Size = UDim2.new(0, 8, 0, 8),
-    Position = UDim2.new(0, 14, 0.5, -8),
+    Size = UDim2.new(0, 7, 0, 7),
+    Position = UDim2.new(0, 12, 0.5, -4),
     BackgroundColor3 = Theme.muted,
     BorderSizePixel = 0,
     ZIndex = 4,
@@ -2383,47 +2375,47 @@ addCorner(activityDot, 999)
 
 create("TextLabel", {
     Parent = header,
-    Size = UDim2.new(1, -90, 0, 18),
-    Position = UDim2.new(0, 28, 0, 8),
+    Size = UDim2.new(1, -70, 0, 16),
+    Position = UDim2.new(0, 24, 0, 5),
     BackgroundTransparency = 1,
     Text = "UTILITY v18",
     TextColor3 = Theme.text,
     Font = Enum.Font.GothamBlack,
-    TextSize = 12,
+    TextSize = 11,
     TextXAlignment = Enum.TextXAlignment.Left,
     ZIndex = 4,
 })
 
 create("TextLabel", {
     Parent = header,
-    Size = UDim2.new(1, -90, 0, 14),
-    Position = UDim2.new(0, 28, 0, 24),
+    Size = UDim2.new(1, -70, 0, 11),
+    Position = UDim2.new(0, 24, 0, 20),
     BackgroundTransparency = 1,
-    Text = "Refactor + GUI polish + auto systems",
+    Text = "compact + auto systems",
     TextColor3 = Theme.subtext,
     Font = Enum.Font.Gotham,
-    TextSize = 8,
+    TextSize = 7,
     TextXAlignment = Enum.TextXAlignment.Left,
     ZIndex = 4,
 })
 
 local hideHint = create("TextLabel", {
     Parent = header,
-    Size = UDim2.new(0, 26, 0, 16),
-    Position = UDim2.new(1, -34, 0.5, -8),
+    Size = UDim2.new(0, 22, 0, 14),
+    Position = UDim2.new(1, -30, 0.5, -7),
     BackgroundColor3 = Color3.fromRGB(22, 28, 54),
     BorderSizePixel = 0,
     Text = "V",
     TextColor3 = Theme.muted,
     Font = Enum.Font.GothamBold,
-    TextSize = 9,
+    TextSize = 8,
     ZIndex = 4,
 })
-addCorner(hideHint, 6)
+addCorner(hideHint, 5)
 
 local content = create("Frame", {
     Parent = frame,
-    Position = UDim2.new(0, 0, 0, 48),
+    Position = UDim2.new(0, 0, 0, HEADER_HEIGHT),
     Size = UDim2.new(1, 0, 0, 9999),
     BackgroundTransparency = 1,
 })
@@ -2444,11 +2436,11 @@ UI.refs.rootLayout = rootLayout
 local tabBar = create("Frame", {
     Parent = content,
     LayoutOrder = 1,
-    Size = UDim2.new(1, 0, 0, 34),
+    Size = UDim2.new(1, 0, 0, 28),
     BackgroundColor3 = Theme.panel,
     BorderSizePixel = 0,
 })
-addPadding(tabBar, 6, 6, 6, 4)
+addPadding(tabBar, 4, 4, 4, 3)
 
 create("UIListLayout", {
     Parent = tabBar,
@@ -2461,16 +2453,16 @@ local function createTab(name, title, order)
     local button = create("TextButton", {
         Parent = tabBar,
         LayoutOrder = order,
-        Size = UDim2.new(0.2, -4, 1, 0),
+        Size = UDim2.new(0.2, -3, 1, 0),
         BackgroundColor3 = Theme.surfaceAlt,
         BorderSizePixel = 0,
         Text = title,
         TextColor3 = Theme.muted,
         Font = Enum.Font.GothamBold,
-        TextSize = 10,
+        TextSize = 9,
         AutoButtonColor = false,
     })
-    addCorner(button, 8)
+    addCorner(button, 7)
     UI.tabs[name] = button
     button.MouseButton1Click:Connect(function()
         switchTab(name)
@@ -2611,7 +2603,7 @@ create("TextLabel", {
 UI.refs.learnScore = create("TextLabel", {
     Parent = learningCard,
     LayoutOrder = 2,
-    Size = UDim2.new(1, 0, 0, 11),
+    Size = UDim2.new(1, 0, 0, 10),
     BackgroundTransparency = 1,
     Text = "Score: —",
     TextColor3 = Theme.text,
@@ -2623,7 +2615,7 @@ UI.refs.learnScore = create("TextLabel", {
 UI.refs.learnDiag = create("TextLabel", {
     Parent = learningCard,
     LayoutOrder = 3,
-    Size = UDim2.new(1, 0, 0, 11),
+    Size = UDim2.new(1, 0, 0, 10),
     BackgroundTransparency = 1,
     Text = "Último: —",
     TextColor3 = Theme.subtext,
@@ -2635,7 +2627,7 @@ UI.refs.learnDiag = create("TextLabel", {
 UI.refs.learnParams = create("TextLabel", {
     Parent = learningCard,
     LayoutOrder = 4,
-    Size = UDim2.new(1, 0, 0, 11),
+    Size = UDim2.new(1, 0, 0, 10),
     BackgroundTransparency = 1,
     Text = "",
     TextColor3 = Theme.muted,
@@ -2737,11 +2729,11 @@ UI.refs.autoSell.label = create("TextLabel", {
     Text = "🔁  Auto-Sell",
     TextColor3 = Theme.subtext,
     Font = Enum.Font.GothamBold,
-    TextSize = 10,
+    TextSize = 9,
     TextXAlignment = Enum.TextXAlignment.Left,
 })
 UI.refs.autoSell.toggle = makeToggle(autoSellRow, Theme.success)
-UI.refs.autoSell.toggle.track.Position = UDim2.new(1, -42, 0.5, -10)
+UI.refs.autoSell.toggle.track.Position = UDim2.new(1, -36, 0.5, -9)
 UI.refs.autoSell.toggle.hit.MouseButton1Click:Connect(function()
     createRipple(UI.refs.autoSell.toggle.track, Theme.success)
 end)
@@ -2760,7 +2752,7 @@ UI.search.tp = makeSearchBox(tpCard, "Buscar ilha...", 2)
 local tpScroll = create("ScrollingFrame", {
     Parent = tpCard,
     LayoutOrder = 3,
-    Size = UDim2.new(1, 0, 0, 310),
+    Size = UDim2.new(1, 0, 0, 250),
     BackgroundTransparency = 1,
     BorderSizePixel = 0,
     ScrollBarThickness = 4,
@@ -2783,7 +2775,7 @@ UI.search.rods = makeSearchBox(rodsCard, "Buscar vara...", 2)
 local rodsScroll = create("ScrollingFrame", {
     Parent = rodsCard,
     LayoutOrder = 3,
-    Size = UDim2.new(1, 0, 0, 310),
+    Size = UDim2.new(1, 0, 0, 250),
     BackgroundTransparency = 1,
     BorderSizePixel = 0,
     ScrollBarThickness = 4,
@@ -2849,7 +2841,7 @@ local scanNpcButton = makeActionButton(npcCard, 3, "🔍  Scan Nearby NPCs", Col
 local npcScroll = create("ScrollingFrame", {
     Parent = npcCard,
     LayoutOrder = 4,
-    Size = UDim2.new(1, 0, 0, 240),
+    Size = UDim2.new(1, 0, 0, 210),
     BackgroundTransparency = 1,
     BorderSizePixel = 0,
     ScrollBarThickness = 4,
@@ -3081,8 +3073,10 @@ startTask("castStatus", function()
                 else
                     setStatus(UI.refs.cast.status, "↓ soltando" .. dots[index], Theme.success)
                 end
+            elseif State.runtime.castPhase == "arming" then
+                setStatus(UI.refs.cast.status, "○ puxando vara [1]" .. dots[index], Theme.warning)
             elseif State.runtime.castPhase == "searching" then
-                setStatus(UI.refs.cast.status, "⌕ procurando barra" .. dots[index], Theme.warning)
+                setStatus(UI.refs.cast.status, "⌕ aguardando verde" .. dots[index], Theme.warning)
             else
                 setStatus(UI.refs.cast.status, "○ aguardando cast" .. dots[index], Theme.warning)
             end
@@ -3121,6 +3115,6 @@ updateActivityDot()
 
 task.delay(0.08, refreshFrameSize)
 TweenService:Create(frame, TweenInfo.new(0.45, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-    Position = UDim2.new(0, 18, 0.5, -190),
+    Position = UDim2.new(0, 18, 0.5, WINDOW_Y_OFFSET),
     BackgroundTransparency = 0,
 }):Play()
