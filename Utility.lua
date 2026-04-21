@@ -13,6 +13,50 @@ local RunSvc    = game:GetService("RunService")
 local UIS       = game:GetService("UserInputService")
 local TweenSvc  = game:GetService("TweenService")
 local RS        = game:GetService("ReplicatedStorage")
+local compatUnpack = table.unpack or unpack
+
+local rawTask = task
+local rawWait = wait
+local task = rawTask or {}
+
+if not task.wait then
+    task.wait = function(sec)
+        sec = sec or 0
+        if rawWait then
+            return rawWait(sec)
+        end
+        local started = os.clock()
+        repeat RunSvc.Heartbeat:Wait() until (os.clock() - started) >= sec
+    end
+end
+
+if not task.spawn then
+    task.spawn = function(fn, ...)
+        local args = {...}
+        local co = coroutine.create(function()
+            fn(compatUnpack(args))
+        end)
+        local ok, err = coroutine.resume(co)
+        if not ok then warn(err) end
+        return co
+    end
+end
+
+if not task.delay then
+    task.delay = function(sec, fn, ...)
+        local args = {...}
+        return task.spawn(function()
+            task.wait(sec)
+            fn(compatUnpack(args))
+        end)
+    end
+end
+
+if not task.cancel then
+    task.cancel = function(_thread)
+        return nil
+    end
+end
 
 local LP = Players.LocalPlayer
 local PG = LP:WaitForChild("PlayerGui")
