@@ -772,12 +772,39 @@ local function startCast()
     State.runtime.castActive = false
     State.runtime.castPhase = "idle"
     local primeStartedAt = 0
+    local cycleLocked = false
+    local clearSince = 0
+
+    local function hasFishingPhaseUI()
+        if shakeUiVisible() then
+            return true
+        end
+
+        for _, name in ipairs({ "reelui", "ReelUI", "fishingrod", "FishingRod", "reelbar", "ReelBar", "Fishing", "FishingBar", "FishingUI" }) do
+            local gui = PlayerGui:FindFirstChild(name)
+            if gui and gui.Enabled ~= false then
+                return true
+            end
+        end
+
+        for _, gui in ipairs(PlayerGui:GetChildren()) do
+            if gui:IsA("ScreenGui") and gui.Enabled then
+                local lowerName = gui.Name:lower()
+                if (lowerName:find("reel") or lowerName:find("fish")) and not lowerName:find("shake") and not lowerName:find("cast") then
+                    return true
+                end
+            end
+        end
+
+        return false
+    end
 
     startTask("cast", function()
         while State.flags.cast do
             local castGui = findCastUI()
+            local busyWithFishing = hasFishingPhaseUI()
 
-            if castGui and castGui.Enabled then
+            if castGui and castGui.Enabled and not cycleLocked then
                 local outerBar, greenFill = findCastBar(castGui)
                 if outerBar and greenFill then
                     local centerX = outerBar.AbsolutePosition.X + outerBar.AbsoluteSize.X * 0.5
@@ -809,7 +836,9 @@ local function startCast()
                     State.runtime.castPhase = "releasing"
                     sendMouseUp(centerX, centerY)
                     State.runtime.castActive = false
-                    State.runtime.castPhase = "idle"
+                    State.runtime.castPhase = "cooldown"
+                    cycleLocked = true
+                    clearSince = 0
                     task.wait(0.45 + math.random() * 0.20)
                 else
                     forceCastRelease()
@@ -817,6 +846,23 @@ local function startCast()
                     State.runtime.castPhase = "searching"
                     task.wait(0.08)
                 end
+            elseif cycleLocked or busyWithFishing then
+                forceCastRelease()
+                State.runtime.castActive = false
+                State.runtime.castPhase = "cooldown"
+
+                if busyWithFishing or (castGui and castGui.Enabled) then
+                    clearSince = 0
+                    cycleLocked = true
+                else
+                    clearSince += 0.10
+                    if clearSince >= 1.20 then
+                        cycleLocked = false
+                        State.runtime.castPhase = "idle"
+                    end
+                end
+
+                task.wait(0.10)
             else
                 State.runtime.castActive = false
                 State.runtime.castPhase = "arming"
@@ -1108,45 +1154,44 @@ local function startAutoReel()
                     end
                     lastFishX = fishCenterX
 
-                    local predictedFishX = fishCenterX + fishVelocity * 2.2
-                    local targetOffset = (predictedFishX - barCenter) / barWidth
-                    local edgeMargin = math.max(barWidth * 0.16, 10)
-                    local hardBand = 0.12
-                    local softBand = 0.045
+                    local targetOffset = (fishCenterX - barCenter) / barWidth
+                    local edgeMargin = math.max(barWidth * 0.18, 10)
+                    local leftTrigger = barLeft + edgeMargin
+                    local rightTrigger = barRight - edgeMargin
                     local timeInState = tick() - lastControlSwitch
                     local desiredHold = controlTargetHeld
 
-                    if predictedFishX >= (barRight - edgeMargin) then
+                    if fishCenterX >= rightTrigger then
                         desiredHold = true
-                    elseif predictedFishX <= (barLeft + edgeMargin) then
+                    elseif fishCenterX <= leftTrigger then
                         desiredHold = false
-                    elseif targetOffset > hardBand then
-                        desiredHold = true
-                    elseif targetOffset < -hardBand then
-                        desiredHold = false
-                    else
-                        if State.runtime.reelMouseHeld then
-                            if targetOffset < -softBand then
-                                desiredHold = false
-                            elseif timeInState > 0.14 and targetOffset <= 0.02 then
-                                desiredHold = false
-                            else
-                                desiredHold = true
-                            end
+                    elseif not fishInside then
+                        desiredHold = fishCenterX > barRight
+                    elseif State.runtime.reelMouseHeld then
+                        if fishCenterX <= (barLeft + barWidth * 0.62) then
+                            desiredHold = false
+                        elseif fishVelocity <= -0.35 and fishCenterX <= (barLeft + barWidth * 0.72) then
+                            desiredHold = false
+                        elseif timeInState > 0.16 and targetOffset <= 0.06 then
+                            desiredHold = false
                         else
-                            if targetOffset > softBand then
-                                desiredHold = true
-                            elseif timeInState > 0.16 and targetOffset >= 0.01 and fishVelocity >= -0.3 then
-                                desiredHold = true
-                            else
-                                desiredHold = false
-                            end
+                            desiredHold = true
+                        end
+                    else
+                        if fishCenterX >= (barLeft + barWidth * 0.74) then
+                            desiredHold = true
+                        elseif fishVelocity >= 0.55 and fishCenterX >= (barLeft + barWidth * 0.62) then
+                            desiredHold = true
+                        elseif timeInState > 0.18 and targetOffset > 0.10 then
+                            desiredHold = true
+                        else
+                            desiredHold = false
                         end
                     end
 
                     controlTargetHeld = desiredHold
 
-                    local switchDelay = State.runtime.reelMouseHeld and 0.115 or 0.095
+                    local switchDelay = State.runtime.reelMouseHeld and 0.13 or 0.10
                     local pointerY = playerBar.AbsolutePosition.Y + playerBar.AbsoluteSize.Y * 0.5
 
                     if desiredHold ~= nil and desiredHold ~= State.runtime.reelMouseHeld then
@@ -1167,11 +1212,11 @@ local function startAutoReel()
                     end
 
                     if fishInside then
-                        task.wait(0.050)
+                        task.wait(0.060)
                     elseif ratio < 0.30 then
-                        task.wait(0.042)
+                        task.wait(0.050)
                     else
-                        task.wait(0.035)
+                        task.wait(0.042)
                     end
                 end
             else
@@ -3236,6 +3281,8 @@ startTask("castStatus", function()
                 else
                     setStatus(UI.refs.cast.status, "↓ soltando" .. dots[index], Theme.success)
                 end
+            elseif State.runtime.castPhase == "cooldown" then
+                setStatus(UI.refs.cast.status, "○ aguardando pesca" .. dots[index], Theme.warning)
             elseif State.runtime.castPhase == "arming" then
                 setStatus(UI.refs.cast.status, "○ puxando vara [1]" .. dots[index], Theme.warning)
             elseif State.runtime.castPhase == "searching" then
