@@ -25,14 +25,23 @@ local VIM_OK = false
 local VIM = nil
 pcall(function()
     VIM = game:GetService("VirtualInputManager")
-    -- Testa se realmente funciona
-    VIM_OK = VIM ~= nil and type(VIM.SendMouseButtonEvent) == "function"
+    VIM_OK = VIM ~= nil
 end)
+
+local function hasExecutorMouse()
+    return type(mouse1press) == "function" and type(mouse1release) == "function"
+end
+
+local function hasExecutorKey()
+    return type(keypress) == "function" and type(keyrelease) == "function"
+end
 
 local function safeMousePress(x, y, held_ref_set)
     if held_ref_set and held_ref_set[1] then return end
     if VIM_OK then
         pcall(function() VIM:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, true, game, 0) end)
+    elseif hasExecutorMouse() then
+        pcall(mouse1press)
     end
     if held_ref_set then held_ref_set[1] = true end
 end
@@ -41,6 +50,8 @@ local function safeMouseRelease(x, y, held_ref_set)
     if held_ref_set and not held_ref_set[1] then return end
     if VIM_OK then
         pcall(function() VIM:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, false, game, 0) end)
+    elseif hasExecutorMouse() then
+        pcall(mouse1release)
     end
     if held_ref_set then held_ref_set[1] = false end
 end
@@ -48,6 +59,8 @@ end
 local function safeMouseForceRelease()
     if VIM_OK then
         pcall(function() VIM:SendMouseButtonEvent(0, 0, 0, false, game, 0) end)
+    elseif hasExecutorMouse() then
+        pcall(mouse1release)
     end
 end
 
@@ -56,7 +69,32 @@ local function safeKeyPress(keyCode)
         pcall(function() VIM:SendKeyEvent(true,  keyCode, false, game) end)
         task.wait(0.02)
         pcall(function() VIM:SendKeyEvent(false, keyCode, false, game) end)
+    elseif hasExecutorKey() then
+        local code = keyCode.Value or 0
+        pcall(function() keypress(code) end)
+        task.wait(0.02)
+        pcall(function() keyrelease(code) end)
     end
+end
+
+local function safeGuiClick(btn)
+    if not btn then return false end
+
+    local ok = pcall(function()
+        btn:Activate()
+    end)
+    if ok then return true end
+
+    if VIM_OK then
+        local cx = btn.AbsolutePosition.X + btn.AbsoluteSize.X * 0.5
+        local cy = btn.AbsolutePosition.Y + btn.AbsoluteSize.Y * 0.5
+        pcall(function() VIM:SendMouseButtonEvent(math.floor(cx), math.floor(cy), 0, true, game, 0) end)
+        task.wait(0.015)
+        pcall(function() VIM:SendMouseButtonEvent(math.floor(cx), math.floor(cy), 0, false, game, 0) end)
+        return true
+    end
+
+    return false
 end
 
 -- ═══════════════════════════════════════
@@ -244,16 +282,7 @@ local function startShake()
                 local now=tick()
                 if now-lastClick>=0.08 then
                     lastClick=now
-                    -- Método 1: Fire do evento do botão (mais confiável)
-                    pcall(function() btn.MouseButton1Click:Fire() end)
-                    -- Método 2: VIM se disponível
-                    if VIM_OK then
-                        local cx=btn.AbsolutePosition.X+btn.AbsoluteSize.X*0.5
-                        local cy=btn.AbsolutePosition.Y+btn.AbsoluteSize.Y*0.5
-                        pcall(function() VIM:SendMouseButtonEvent(math.floor(cx),math.floor(cy),0,true,game,0) end)
-                        task.wait(0.015)
-                        pcall(function() VIM:SendMouseButtonEvent(math.floor(cx),math.floor(cy),0,false,game,0) end)
-                    end
+                    safeGuiClick(btn)
                 end
                 task.wait(0.06+math.random()*0.03)
             else
@@ -534,7 +563,7 @@ local function trySellTool(t)
         if obj:IsA("GuiButton") and obj.Visible then
             local n=obj.Name:lower()
             if n:find("sell") or n:find("appraise") or n:find("submit") then
-                local sz=obj.AbsoluteSize; if sz.X>2 and sz.Y>2 then pcall(function() obj.MouseButton1Click:Fire() end); return true,"GUI:"..obj.Name end
+                local sz=obj.AbsoluteSize; if sz.X>2 and sz.Y>2 then safeGuiClick(obj); return true,"GUI:"..obj.Name end
             end
         end
     end
@@ -851,7 +880,7 @@ local innerDiv=Instance.new("Frame",sellF); innerDiv.Size=UDim2.new(1,0,0,1); in
 local sellAllBtn=Instance.new("TextButton",sellF); sellAllBtn.Size=UDim2.new(1,0,0,28); sellAllBtn.LayoutOrder=6; sellAllBtn.BackgroundColor3=Color3.fromRGB(14,50,30); sellAllBtn.BorderSizePixel=0; sellAllBtn.Text="📦  Sell All (mantém mapas)"; sellAllBtn.TextColor3=C.grn; sellAllBtn.Font=Enum.Font.GothamBold; sellAllBtn.TextSize=9; sellAllBtn.AutoButtonColor=false; Instance.new("UICorner",sellAllBtn).CornerRadius=UDim.new(0,7); Instance.new("UIStroke",sellAllBtn).Color=Color3.fromRGB(18,70,40)
 sellAllBtn.MouseEnter:Connect(function() tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(18,64,38)}):Play() end); sellAllBtn.MouseLeave:Connect(function() tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(14,50,30)}):Play() end); sellAllBtn.MouseButton1Click:Connect(function() ripple(sellAllBtn,C.grn) end)
 local innerDiv2=Instance.new("Frame",sellF); innerDiv2.Size=UDim2.new(1,0,0,1); innerDiv2.BackgroundColor3=C.bdr; innerDiv2.BorderSizePixel=0; innerDiv2.LayoutOrder=7
-local autoRow=Instance.new("Frame",sellF); autoRow.Size=UDim2.new(1,0,0,20); autoRow.BackgroundTransparency=true; autoRow.LayoutOrder=8
+local autoRow=Instance.new("Frame",sellF); autoRow.Size=UDim2.new(1,0,0,20); autoRow.BackgroundTransparency=1; autoRow.LayoutOrder=8
 local autoLbl=Instance.new("TextLabel",autoRow); autoLbl.Size=UDim2.new(1,-52,1,0); autoLbl.BackgroundTransparency=1; autoLbl.Text="🔁  Auto-Sell"; autoLbl.TextColor3=C.sub; autoLbl.Font=Enum.Font.GothamBold; autoLbl.TextSize=10; autoLbl.TextXAlignment=Enum.TextXAlignment.Left
 local autoTr=Instance.new("Frame",autoRow); autoTr.Size=UDim2.new(0,36,0,18); autoTr.Position=UDim2.new(1,-36,0.5,-9); autoTr.BackgroundColor3=Color3.fromRGB(22,28,50); autoTr.BorderSizePixel=0; Instance.new("UICorner",autoTr).CornerRadius=UDim.new(0,9); Instance.new("UIStroke",autoTr).Color=C.bdr
 local autoKn=Instance.new("Frame",autoTr); autoKn.Size=UDim2.new(0,14,0,14); autoKn.Position=UDim2.new(0,2,0.5,-7); autoKn.BackgroundColor3=Color3.fromRGB(195,205,235); autoKn.BorderSizePixel=0; Instance.new("UICorner",autoKn).CornerRadius=UDim.new(0,7)
