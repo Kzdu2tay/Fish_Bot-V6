@@ -13,31 +13,48 @@ local RunSvc    = game:GetService("RunService")
 local UIS       = game:GetService("UserInputService")
 local TweenSvc  = game:GetService("TweenService")
 local RS        = game:GetService("ReplicatedStorage")
-local task = task or {}
+local unpack = unpack or table.unpack
 
-task.wait = task.wait or function(t)
+local function safeWait(t)
     t = t or 0
-    local s = os.clock()
-    repeat RunSvc.Heartbeat:Wait() until os.clock() - s >= t
+    local s = tick()
+    repeat RunSvc.Heartbeat:Wait() until tick() - s >= t
 end
 
-task.spawn = task.spawn or function(fn,...)
-    local co = coroutine.create(fn)
-    local ok, err = coroutine.resume(co,...)
-    if not ok then warn(err) end
-    return co
+local function safeSpawn(fn,...)
+    local args = {...}
+    local conn
+    conn = RunSvc.Heartbeat:Connect(function()
+        if conn then
+            conn:Disconnect()
+            conn = nil
+        end
+        local ok, err = pcall(function()
+            fn(unpack(args))
+        end)
+        if not ok then warn(err) end
+    end)
+    return conn
 end
 
-task.delay = task.delay or function(t,fn,...)
-    task.spawn(function(...)
-        task.wait(t)
+local function safeDelay(t,fn,...)
+    return safeSpawn(function(...)
+        safeWait(t)
         fn(...)
     end,...)
 end
 
-task.cancel = task.cancel or function() end
+task = {}
+task.wait = safeWait
+task.spawn = safeSpawn
+task.delay = safeDelay
+task.cancel = function(thread)
+    if thread and thread.Disconnect then
+        pcall(function() thread:Disconnect() end)
+    end
+end
 
-local compatUnpack = table.unpack or unpack or function(t)
+local compatUnpack = unpack or function(t)
     return t
 end
 
