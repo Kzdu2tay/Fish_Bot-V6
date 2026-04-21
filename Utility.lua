@@ -284,6 +284,22 @@ local ReelParams = {
     dead_zone = 0.05,
 }
 
+local CastParams = {
+    fallback_release_pct = 0.975,
+    min_hold_time = 0.18,
+    max_hold_time = 3.50,
+    clear_delay = 1.20,
+}
+
+local ReelGuideParams = {
+    lookahead = 0.075,
+    hard_edge_px = 14,
+    center_band_pct = 0.12,
+    settle_band_pct = 0.045,
+    hold_min = 0.055,
+    release_min = 0.045,
+}
+
 local function findReelUI()
     for _,n in ipairs({"reelui","ReelUI","fishingrod","FishingRod","reelbar","ReelBar","Fishing","FishingBar","FishingUI"}) do
         local g=PG:FindFirstChild(n); if g and g.Enabled~=false then return g end
@@ -309,74 +325,168 @@ local function findReelElements(rGui)
     return pb,fb
 end
 
+local function getOrCreateReelOverlay(rGui)
+    local overlay=rGui:FindFirstChild("UtilityReelOverlay")
+    if overlay then return overlay end
+
+    overlay=Instance.new("Frame")
+    overlay.Name="UtilityReelOverlay"
+    overlay.Size=UDim2.new(1,0,1,0)
+    overlay.BackgroundTransparency=1
+    overlay.BorderSizePixel=0
+    overlay.ZIndex=19
+    overlay.Parent=rGui
+
+    local function mk(name,text,col)
+        local t=Instance.new("TextLabel")
+        t.Name=name
+        t.Size=UDim2.new(0,14,0,14)
+        t.BackgroundTransparency=1
+        t.Text=text
+        t.TextColor3=col
+        t.Font=Enum.Font.Code
+        t.TextSize=14
+        t.TextStrokeTransparency=0.4
+        t.TextXAlignment=Enum.TextXAlignment.Center
+        t.TextYAlignment=Enum.TextYAlignment.Center
+        t.Visible=false
+        t.ZIndex=20
+        t.Parent=overlay
+        return t
+    end
+
+    mk("Left","<",Color3.fromRGB(240,190,55))
+    mk("Right",">",Color3.fromRGB(240,190,55))
+    mk("Fish",",",Color3.fromRGB(80,255,180))
+    return overlay
+end
+
+local function hideReelOverlay(rGui)
+    if not rGui then return end
+    local overlay=rGui:FindFirstChild("UtilityReelOverlay")
+    if not overlay then return end
+    for _,ch in ipairs(overlay:GetChildren()) do
+        if ch:IsA("TextLabel") then ch.Visible=false end
+    end
+end
+
+local function updateReelOverlay(rGui,pb,fb)
+    local overlay=getOrCreateReelOverlay(rGui)
+    local l=overlay:FindFirstChild("Left")
+    local r=overlay:FindFirstChild("Right")
+    local f=overlay:FindFirstChild("Fish")
+    if not (l and r and f and pb and fb) then
+        hideReelOverlay(rGui)
+        return
+    end
+
+    local left=pb.AbsolutePosition.X
+    local right=pb.AbsolutePosition.X+pb.AbsoluteSize.X
+    local bottom=pb.AbsolutePosition.Y+pb.AbsoluteSize.Y
+    local fishX=fb.AbsolutePosition.X+fb.AbsoluteSize.X*0.5
+    local fishY=fb.AbsolutePosition.Y+fb.AbsoluteSize.Y
+
+    l.Position=UDim2.fromOffset(math.floor(left-7),math.floor(bottom+1))
+    r.Position=UDim2.fromOffset(math.floor(right-7),math.floor(bottom+1))
+    f.Position=UDim2.fromOffset(math.floor(fishX-7),math.floor(fishY-1))
+    l.Visible=true; r.Visible=true; f.Visible=true
+end
+
 local function startAutoReel()
     if autoReelThread then task.cancel(autoReelThread); autoReelThread=nil end
     reelActive=false; safeMouseForceRelease(); _reelHeld[1]=false
 
     autoReelThread=task.spawn(function()
-        local cycleStart=tick()
+        local lastSwitch=tick()
+        local prevCenter=nil
+        local prevAt=tick()
+        local desiredHold=false
         while autoReelOn do
             local rGui=findReelUI()
             if not rGui then
                 if _reelHeld[1] then safeMouseRelease(0,0,_reelHeld) end
+                hideReelOverlay(rGui)
+                prevCenter=nil
                 reelActive=false; task.wait(0.08)
             else
                 local pb,fb=findReelElements(rGui)
                 if not pb or not fb then
                     if _reelHeld[1] then safeMouseRelease(0,0,_reelHeld) end
+                    hideReelOverlay(rGui)
+                    prevCenter=nil
                     reelActive=false; task.wait(0.05)
                 else
                     reelActive=true
                     local barL  = pb.AbsolutePosition.X
                     local barW  = math.max(pb.AbsoluteSize.X,1)
+                    local barR  = barL+barW
                     local barCX = barL+barW*0.5
                     local barCY = pb.AbsolutePosition.Y+pb.AbsoluteSize.Y*0.5
                     local fishX = fb.AbsolutePosition.X+fb.AbsoluteSize.X*0.5
 
-                    local rawOff = (fishX-barCX)/(barW*0.5)
-                    local offset = clamp(rawOff,-1.2,1.2)
-                    local absOff = math.abs(offset)
-
-                    -- Duty cycle: peixe direita=hold mais, peixe esquerda=hold menos
-                    local duty
-                    if absOff < ReelParams.dead_zone then
-                        duty = ReelParams.duty_near
-                    elseif offset > 0 then
-                        if absOff < 0.35 then
-                            duty = ReelParams.duty_near+(ReelParams.duty_mid-ReelParams.duty_near)*(absOff/0.35)
-                        elseif absOff < 0.75 then
-                            duty = ReelParams.duty_mid+(ReelParams.duty_far-ReelParams.duty_mid)*((absOff-0.35)/0.40)
-                        else duty = ReelParams.duty_far end
-                    else
-                        -- peixe esquerda: inverte duty (soltar mais)
-                        if absOff < 0.35 then
-                            duty = ReelParams.duty_near-(ReelParams.duty_mid-ReelParams.duty_near)*(absOff/0.35)
-                        elseif absOff < 0.75 then
-                            duty = (1-ReelParams.duty_mid)-((ReelParams.duty_far-ReelParams.duty_mid)*((absOff-0.35)/0.40))
-                        else duty = 1-ReelParams.duty_far end
-                    end
-                    duty=clamp(duty,0.02,0.98)
+                    updateReelOverlay(rGui,pb,fb)
 
                     local now=tick()
-                    local phase=((now-cycleStart)*1000)%ReelParams.cycle_ms
-                    local shouldHold=phase < duty*ReelParams.cycle_ms
+                    local dt=math.max(now-prevAt,1/240)
+                    prevAt=now
 
-                    if shouldHold and not _reelHeld[1] then
-                        safeMousePress(barCX,barCY,_reelHeld)
-                    elseif not shouldHold and _reelHeld[1] then
-                        safeMouseRelease(barCX,barCY,_reelHeld)
+                    local vel=0
+                    if prevCenter then
+                        vel=(barCX-prevCenter)/dt
+                    end
+                    prevCenter=barCX
+
+                    local hardEdge=math.max(ReelGuideParams.hard_edge_px,barW*0.12)
+                    local centerBand=math.max(8,barW*ReelGuideParams.center_band_pct)
+                    local settleBand=math.max(4,barW*ReelGuideParams.settle_band_pct)
+                    local predictedCenter=barCX+(vel*ReelGuideParams.lookahead)
+                    local predictedError=fishX-predictedCenter
+                    local liveError=fishX-barCX
+
+                    if fishX >= (barR-hardEdge) then
+                        desiredHold=true
+                    elseif fishX <= (barL+hardEdge) then
+                        desiredHold=false
+                    elseif predictedError > centerBand then
+                        desiredHold=true
+                    elseif predictedError < -centerBand then
+                        desiredHold=false
+                    elseif math.abs(liveError) <= settleBand then
+                        if vel > 42 then
+                            desiredHold=false
+                        elseif vel < -42 then
+                            desiredHold=true
+                        end
+                    else
+                        if liveError > 0 and vel < -18 then
+                            desiredHold=true
+                        elseif liveError < 0 and vel > 18 then
+                            desiredHold=false
+                        end
+                    end
+
+                    local minWindow=desiredHold and ReelGuideParams.hold_min or ReelGuideParams.release_min
+                    if desiredHold ~= _reelHeld[1] and (now-lastSwitch) >= minWindow then
+                        if desiredHold then
+                            safeMousePress(barCX,barCY,_reelHeld)
+                        else
+                            safeMouseRelease(barCX,barCY,_reelHeld)
+                        end
+                        lastSwitch=now
                     end
 
                     RunSvc.Heartbeat:Wait()
                 end
             end
         end
+        hideReelOverlay(findReelUI())
         safeMouseForceRelease(); _reelHeld[1]=false; reelActive=false
     end)
 end
 
 local function stopAutoReel()
     autoReelOn=false; reelActive=false
+    hideReelOverlay(findReelUI())
     safeMouseForceRelease(); _reelHeld[1]=false
     if autoReelThread then task.cancel(autoReelThread); autoReelThread=nil end
 end
@@ -430,10 +540,107 @@ local function findCastUI()
     return nil
 end
 
+local function rectContains(parent,child)
+    if not (parent and child) then return false end
+    local pp,ps=parent.AbsolutePosition,parent.AbsoluteSize
+    local cp,cs=child.AbsolutePosition,child.AbsoluteSize
+    return cp.X >= pp.X-2 and cp.Y >= pp.Y-2
+        and cp.X+cs.X <= pp.X+ps.X+2
+        and cp.Y+cs.Y <= pp.Y+ps.Y+2
+end
+
+local function findCastBar(cGui)
+    local bestBar,bestBarScore=nil,-math.huge
+    local fillCandidates={}
+    local perfectCandidates={}
+
+    for _,d in ipairs(cGui:GetDescendants()) do
+        if d:IsA("Frame") and d.Visible then
+            local sz=d.AbsoluteSize
+            local ln=d.Name:lower()
+            local ratio=sz.Y/math.max(sz.X,1)
+
+            if sz.Y > 36 and sz.X > 5 and sz.X < 100 and ratio > 1.5 then
+                local score=ratio*3+(sz.Y*0.03)
+                if ln:find("bar") or ln:find("meter") or ln:find("power") or ln:find("cast") then score=score+4 end
+                if score > bestBarScore then
+                    bestBarScore=score
+                    bestBar=d
+                end
+            end
+
+            local c=d.BackgroundColor3
+            if c.G > c.R*1.12 and c.G > c.B*1.08 and c.G > 0.22 then
+                table.insert(fillCandidates,d)
+                if (ln:find("perfect") or ln:find("zone") or ln:find("target") or ln:find("cap"))
+                    or (sz.Y <= 14 and sz.X >= 3) then
+                    table.insert(perfectCandidates,d)
+                end
+            elseif ln:find("fill") or ln:find("progress") or ln:find("green") then
+                table.insert(fillCandidates,d)
+            end
+        elseif d:IsA("TextLabel") and d.Visible and d.Text and d.Text ~= "" then
+            local txt=d.Text:lower()
+            if txt:find("perfect") then
+                table.insert(perfectCandidates,d)
+            end
+        end
+    end
+
+    if not bestBar then return nil,nil,nil end
+
+    local bestFill,bestFillScore=nil,-math.huge
+    for _,cand in ipairs(fillCandidates) do
+        if rectContains(bestBar,cand) then
+            local sz=cand.AbsoluteSize
+            local score=sz.Y+(sz.X*0.2)
+            if cand.Parent == bestBar then score=score+20 end
+            if score > bestFillScore then
+                bestFillScore=score
+                bestFill=cand
+            end
+        end
+    end
+
+    local perfectZone,bestPerfectScore=nil,-math.huge
+    for _,cand in ipairs(perfectCandidates) do
+        if rectContains(bestBar,cand) then
+            local sz=cand.AbsoluteSize
+            local score=(bestBar.AbsolutePosition.Y+bestBar.AbsoluteSize.Y)-(cand.AbsolutePosition.Y+(sz.Y*0.5))
+            score=score + math.max(0,18-sz.Y)
+            if cand.Name and cand.Name:lower():find("perfect") then score=score+30 end
+            if cand:IsA("TextLabel") then score=score+25 end
+            if score > bestPerfectScore then
+                bestPerfectScore=score
+                perfectZone=cand
+            end
+        end
+    end
+
+    return bestBar,bestFill,perfectZone
+end
+
+local function getCastProgress(outerBar,fill)
+    if not outerBar or not fill then return 0 end
+    local barH=math.max(outerBar.AbsoluteSize.Y,1)
+    local fillH=fill.AbsoluteSize.Y
+    return clamp(fillH/barH,0,1)
+end
+
+local function getPerfectReleasePct(outerBar,perfectZone)
+    if not (outerBar and perfectZone) then return CastParams.fallback_release_pct,false end
+    local barTop=outerBar.AbsolutePosition.Y
+    local barBottom=barTop+outerBar.AbsoluteSize.Y
+    local zoneCenter=perfectZone.AbsolutePosition.Y+(perfectZone.AbsoluteSize.Y*0.5)
+    local pct=clamp((barBottom-zoneCenter)/math.max(outerBar.AbsoluteSize.Y,1),0,1)
+    return pct,true
+end
+
 local function startCast(statusLbl)
     if castThread then task.cancel(castThread); castThread=nil end
     castActive=false; safeMouseForceRelease(); _castHeld[1]=false
     local clearSince=0; local cycleLocked=false
+    local primeStartedAt=0
 
     castThread=task.spawn(function()
         while castOn do
@@ -445,42 +652,75 @@ local function startCast(statusLbl)
             end
 
             if not cycleLocked then
-                -- Fallback visual: segura mouse
                 local cGui=findCastUI()
                 if cGui then
-                    local cam=workspace.CurrentCamera
-                    local cx=(cam and cam.ViewportSize.X or 800)*0.5
-                    local cy=(cam and cam.ViewportSize.Y or 600)*0.5
-                    castActive=true; castPhase="holding"
-                    safeMousePress(cx,cy,_castHeld)
-                    local waited=0
-                    while castOn and waited<3.5 do
-                        task.wait(0.02); waited=waited+0.02
-                        if not (cGui and cGui.Enabled) then break end
+                    local outerBar,fill,perfectZone=findCastBar(cGui)
+                    if outerBar then
+                        local cx=outerBar.AbsolutePosition.X+outerBar.AbsoluteSize.X*0.5
+                        local cy=outerBar.AbsolutePosition.Y+outerBar.AbsoluteSize.Y*0.5
+                        local targetPct,hasPerfect=getPerfectReleasePct(outerBar,perfectZone)
+
+                        castActive=true
+                        castPhase=hasPerfect and "perfect" or "holding"
+                        safeMousePress(cx,cy,_castHeld)
+
+                        local waited=0
+                        while castOn and waited<CastParams.max_hold_time do
+                            task.wait(0.01)
+                            waited=waited+0.01
+                            outerBar,fill,perfectZone=findCastBar(cGui)
+                            if not (cGui and cGui.Parent and cGui.Enabled) then break end
+                            if not outerBar then break end
+                            targetPct,hasPerfect=getPerfectReleasePct(outerBar,perfectZone)
+                            local progress=getCastProgress(outerBar,fill)
+                            castPhase=hasPerfect and "perfect" or "holding"
+                            if waited >= CastParams.min_hold_time and progress >= targetPct then
+                                break
+                            end
+                        end
+
+                        castPhase="releasing"
+                        safeMouseRelease(cx,cy,_castHeld)
+                        castActive=false
+                        castPhase="cooldown"
+                        cycleLocked=true
+                        clearSince=0
+                        task.wait(0.45+math.random()*0.2)
+                        goto continue
+                    else
+                        castActive=false
+                        castPhase="searching"
+                        task.wait(0.05)
+                        goto continue
                     end
-                    castPhase="releasing"; safeMouseRelease(cx,cy,_castHeld)
-                    castActive=false; castPhase="cooldown"; cycleLocked=true; clearSince=0
-                    task.wait(0.45+math.random()*0.2)
-                    goto continue
                 end
             end
 
-            -- Espera: detecta quando a fase de pesca acabou
             castActive=false
             if cycleLocked then
                 castPhase="cooldown"
                 if not hasFishingActive() then
                     clearSince=clearSince+0.12
-                    if clearSince>=1.5 then cycleLocked=false; castPhase="idle" end
+                    if clearSince>=CastParams.clear_delay then cycleLocked=false; castPhase="idle" end
                 else
                     clearSince=0
                 end
             else
                 castPhase="arming"
-                -- Equipa vara slot 1
+                local cam=workspace.CurrentCamera
+                local cx=(cam and cam.ViewportSize.X or 800)*0.5
+                local cy=(cam and cam.ViewportSize.Y or 600)*0.5
                 if tick()-_lastCastEquipAt>=1.0 then
                     _lastCastEquipAt=tick()
                     safeKeyPress(Enum.KeyCode.One)
+                end
+                if (not _castHeld[1]) or (tick()-primeStartedAt)>=1.35 then
+                    if _castHeld[1] then
+                        safeMouseRelease(cx,cy,_castHeld)
+                        task.wait(0.10)
+                    end
+                    safeMousePress(cx,cy,_castHeld)
+                    primeStartedAt=tick()
                 end
             end
             task.wait(0.12)
@@ -1036,16 +1276,18 @@ task.spawn(function()
             if castOn then
                 local t,col
                 if castPhase=="firing" then t="⚡ FireServer"..d[i];col=C.cast
+                elseif castPhase=="perfect" then t="◎ buscando perfect"..d[i];col=C.cast
                 elseif castPhase=="holding" then t="▲ carregando"..d[i];col=C.cast
                 elseif castPhase=="releasing" then t="↓ soltando"..d[i];col=C.grn
                 elseif castPhase=="cooldown" then t="○ aguardando"..d[i];col=C.yel
                 elseif castPhase=="arming" then t="○ armando vara"..d[i];col=C.yel
+                elseif castPhase=="searching" then t="⌕ lendo barra"..d[i];col=C.yel
                 else t="○ pronto"..d[i];col=C.dim end
                 setS(castSec.statusLbl,t,col)
             else setS(castSec.statusLbl,"",C.dim) end
         end
         if reSec.statusLbl then
-            if autoReelOn then setS(reSec.statusLbl,(reelActive and "● pescando" or "○ aguardando UI")..d[i],reelActive and C.grn or C.yel)
+            if autoReelOn then setS(reSec.statusLbl,(reelActive and "● guiando no ," or "○ aguardando UI")..d[i],reelActive and C.grn or C.yel)
             else setS(reSec.statusLbl,"",C.dim) end
         end
     end
