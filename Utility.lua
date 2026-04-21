@@ -1048,6 +1048,7 @@ local function startAutoReel()
         local sessionDiagnosis
         local lastFishX = nil
         local lastControlSwitch = tick()
+        local controlTargetHeld = false
 
         while State.flags.autoReel do
             local reelGui = findReelUI()
@@ -1071,6 +1072,7 @@ local function startAutoReel()
                     hideReelOverlay(reelGui)
                     State.runtime.reelActive = false
                     lastFishX = nil
+                    controlTargetHeld = false
                     task.wait(0.08)
                 else
                     State.runtime.reelActive = true
@@ -1106,29 +1108,45 @@ local function startAutoReel()
                     end
                     lastFishX = fishCenterX
 
-                    local centerOffset = (fishCenterX - barCenter) / barWidth
-                    local edgeMargin = math.max(barWidth * 0.20, 12)
-                    local strongThreshold = 0.11
-                    local softThreshold = 0.05
-                    local desiredHold = nil
+                    local predictedFishX = fishCenterX + fishVelocity * 2.2
+                    local targetOffset = (predictedFishX - barCenter) / barWidth
+                    local edgeMargin = math.max(barWidth * 0.16, 10)
+                    local hardBand = 0.12
+                    local softBand = 0.045
+                    local timeInState = tick() - lastControlSwitch
+                    local desiredHold = controlTargetHeld
 
-                    if fishCenterX >= (barRight - edgeMargin) then
+                    if predictedFishX >= (barRight - edgeMargin) then
                         desiredHold = true
-                    elseif fishCenterX <= (barLeft + edgeMargin) then
+                    elseif predictedFishX <= (barLeft + edgeMargin) then
                         desiredHold = false
-                    elseif centerOffset > strongThreshold then
+                    elseif targetOffset > hardBand then
                         desiredHold = true
-                    elseif centerOffset < -strongThreshold then
+                    elseif targetOffset < -hardBand then
                         desiredHold = false
-                    elseif centerOffset > softThreshold and fishVelocity >= 0 then
-                        desiredHold = true
-                    elseif centerOffset < -softThreshold and fishVelocity <= 0 then
-                        desiredHold = false
-                    elseif math.abs(centerOffset) <= 0.03 then
-                        desiredHold = false
+                    else
+                        if State.runtime.reelMouseHeld then
+                            if targetOffset < -softBand then
+                                desiredHold = false
+                            elseif timeInState > 0.14 and targetOffset <= 0.02 then
+                                desiredHold = false
+                            else
+                                desiredHold = true
+                            end
+                        else
+                            if targetOffset > softBand then
+                                desiredHold = true
+                            elseif timeInState > 0.16 and targetOffset >= 0.01 and fishVelocity >= -0.3 then
+                                desiredHold = true
+                            else
+                                desiredHold = false
+                            end
+                        end
                     end
 
-                    local switchDelay = State.runtime.reelMouseHeld and 0.095 or 0.080
+                    controlTargetHeld = desiredHold
+
+                    local switchDelay = State.runtime.reelMouseHeld and 0.115 or 0.095
                     local pointerY = playerBar.AbsolutePosition.Y + playerBar.AbsoluteSize.Y * 0.5
 
                     if desiredHold ~= nil and desiredHold ~= State.runtime.reelMouseHeld then
@@ -1163,6 +1181,7 @@ local function startAutoReel()
                 State.runtime.reelActive = false
                 lastFishX = nil
                 lastControlSwitch = tick()
+                controlTargetHeld = false
 
                 if wasActive then
                     wasActive = false
@@ -1215,6 +1234,7 @@ local function startAutoReel()
         reelForceRelease()
         State.runtime.reelActive = false
         lastFishX = nil
+        controlTargetHeld = false
     end)
 end
 
