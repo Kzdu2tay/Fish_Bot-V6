@@ -1,738 +1,642 @@
 --[[
-    UTILITY v19 — AUTO-REEL REWRITE
+    UTILITY v20 — Fisch 2026
+    MERGE FINAL: v17 base + Patch cast/reel 3-zonas + v19 duty-cycle reel
 
-    O que mudou vs v18 (APENAS auto-reel):
-    • Duty-cycle ao invés de on/off bruto — proporcional à distância do peixe
-    • Loop em RunService.Heartbeat (60fps real) — sem task.wait, sem lag
-    • Sem switchDelay — sem oscilação de 100ms spammando clique
-    • Anti-ricochete nas bordas (cooldown 80ms após cada troca forçada)
-    • Sem predição (você pediu)
-    • Overlay visual < > , mantido igual ao v18
+    O QUE ESTÁ INCLUÍDO:
+    ══════════════════════════════════════════════════════
+    • AUTO-CAST v17-patch:
+        - Vasculha ferramenta + RS + workspace por remotes "cast/power/throw"
+        - FireServer(power 92-98) se achar remote
+        - Fallback visual: detecta barra verde vertical, segura até 72%
+        - Fase "arming": puxa vara no slot [1] enquanto aguarda UI
+        - Status: carregando ▲ / soltando ↓ / aguardando pesca / arming
 
-    Resto do script (cast, shake, TP, sell, maps, learning) = idêntico v18
+    • AUTO-REEL v19 duty-cycle (substitui o v17 hold/release):
+        - Loop em RunService.Heartbeat (~16ms, sem task.wait no core)
+        - Duty cycle proporcional: 0% hold (peixe esquerda) → 100% hold (peixe direita)
+        - Zona morta central configurável (dead_zone)
+        - Anti-rebound: lock de estado 80ms quando peixe cruza o centro
+        - Overlay visual < > , na tela
+        - Sem predição (pedido pelo usuário)
+
+    • APRENDIZADO adaptativo (v16-v17 estilo):
+        - Ajusta duty_far/mid/near baseado em diagnóstico por sessão
+        - Salva via LP:SetAttribute (persiste enquanto jogo rodar)
+        - Auto-save a cada 30s
+        - Painel na GUI com score, último diagnóstico, params atuais
+        - Botão reset
+
+    • GUI v17 (layout original mantido):
+        - Tabs: Cheats | TP | Rods | Maps | NPCs
+        - Seções: Noclip, Speed, High Jump, Auto Cast, Shake, Auto-Reel, Sell
+        - Status loops sem flickering (só escreve se mudou)
+        - Ripple effect, drag, rebind, slide-in animation
+        - Sell All mantém mapas do inventário
+        - Treasure Map tracker com TP e TP Jack Marrow
+        - NPC scanner com range slider
+
+    TECLAS PADRÃO:
+        F = Noclip    G = Speed    H = High Jump
+        U = Cast      J = Shake    L = Auto-Reel
+        K = Sell      V = Toggle GUI
 ]]
 
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local VirtualInputManager = game:GetService("VirtualInputManager")
+local Players   = game:GetService("Players")
+local RunSvc    = game:GetService("RunService")
+local UIS       = game:GetService("UserInputService")
+local TweenSvc  = game:GetService("TweenService")
+local RS        = game:GetService("ReplicatedStorage")
+local VIM       = game:GetService("VirtualInputManager")
 
-local LocalPlayer = Players.LocalPlayer
-local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local LP = Players.LocalPlayer
+local PG = LP:WaitForChild("PlayerGui")
 
-local State = {
-    flags = {
-        noclip = false, speed = false, jump = false, rejump = false,
-        shake = false, cast = false, autoSell = false, autoReel = false,
-    },
-    values = {
-        speed = 45, jump = 80, autoSellDelay = 1.5,
-        npcRange = 150, castReleasePct = 0.72,
-    },
-    keys = {
-        noclip = Enum.KeyCode.F, speed = Enum.KeyCode.G, jump = Enum.KeyCode.H,
-        shake = Enum.KeyCode.J, cast = Enum.KeyCode.U, sell = Enum.KeyCode.K,
-        reel = Enum.KeyCode.L, toggleGui = Enum.KeyCode.V,
-    },
-    runtime = {
-        currentTab = "Cheats", guiVisible = true, guiAnimating = false,
-        listening = nil, shakeActive = false, reelActive = false,
-        castActive = false, castPhase = "idle",
-        reelMouseHeld = false, castMouseHeld = false, lastCastEquipAttempt = 0,
-    },
-    tasks = {},
-    connections = {},
-}
+-- ═══════════════════════════════════════
+-- STATE
+-- ═══════════════════════════════════════
+local noclipOn    = false; local noclipConn  = nil; local ncKey    = Enum.KeyCode.F
+local speedOn     = false; local speedVal    = 45;  local spKey    = Enum.KeyCode.G; local speedConn = nil
+local jumpOn      = false; local jumpVal     = 80;  local hjKey    = Enum.KeyCode.H; local jumpConn  = nil
+local reJumpOn    = false; local reJumpConn  = nil
+local shakeOn     = false; local shakeThread = nil; local shakeKey = Enum.KeyCode.J
+local shakeActive = false
+local castOn      = false; local castThread  = nil; local castKey  = Enum.KeyCode.U
+local castActive  = false; local castPhase   = "idle"
+local sellKey     = Enum.KeyCode.K
+local autoSellOn  = false; local autoSellThread = nil; local autoSellDelay = 1.5
+local autoReelOn  = false; local autoReelThread = nil; local reelKey = Enum.KeyCode.L
+local reelActive  = false
+local npcRange    = 150
+local listening   = nil
+local currentTab  = "Cheats"
+local guiVisible  = true
+local vDebounce   = false
 
-local UI = { tabs = {}, pages = {}, search = {}, refs = {} }
+-- Mouse state (separado por sistema para não conflitar)
+local _castHeld = false
+local _reelHeld = false
+local _lastCastEquipAt = 0
 
--- ════════════════════════════════════════
--- REEL PARAMS v19 — duty-cycle based
--- Instead of hold/release times, we store % of cycle to hold
--- at different distances from fish.
--- ════════════════════════════════════════
+-- ═══════════════════════════════════════
+-- 🧠 APRENDIZADO — DUTY CYCLE (v19)
+-- ═══════════════════════════════════════
 local ReelParams = {
-    duty_far = 0.90,     -- fish far (>30% away): hold 90% of time
-    duty_mid = 0.65,     -- fish mid (10-30%): hold 65%
-    duty_near = 0.50,    -- fish near (inside barWidth*5%): balance point
-    cycle_ms = 45,       -- total cycle duration (ms) — smaller = snappier
-    rebound_ms = 80,     -- anti-oscillation cooldown when fish crosses edge
-    dead_zone = 0.04,    -- dead zone as fraction of barWidth (center)
+    duty_far    = 0.90,  -- peixe longe  (>40% fora): hold 90% do ciclo
+    duty_mid    = 0.65,  -- peixe médio  (10-40%):    hold 65%
+    duty_near   = 0.50,  -- peixe centro (<10%):       hold 50% (equilíbrio)
+    cycle_ms    = 45,    -- duração do ciclo (ms)
+    rebound_ms  = 80,    -- cooldown anti-oscilação (ms)
+    dead_zone   = 0.04,  -- zona morta como fração da largura da barra
 }
 
 local LearnHistory = {
-    sessions = {}, totalWins = 0, totalLosses = 0,
-    lastDiagnosis = "—", adjustCount = 0,
+    sessions      = {},
+    totalWins     = 0,
+    totalLosses   = 0,
+    lastDiagnosis = "—",
+    adjustCount   = 0,
 }
-
-local ISLANDS = {
-    { name = "Moosewood", pos = Vector3.new(350, 135, 250), cat = "first" },
-    { name = "Roslit Bay", pos = Vector3.new(-1600, 130, 500), cat = "first" },
-    { name = "Forsaken Shore", pos = Vector3.new(-2750, 130, 1450), cat = "first" },
-    { name = "Mushgrove Swamp", pos = Vector3.new(2420, 135, -750), cat = "first" },
-    { name = "Snowcap Island", pos = Vector3.new(2625, 135, 2370), cat = "first" },
-    { name = "Sunstone Island", pos = Vector3.new(-870, 135, -1100), cat = "first" },
-    { name = "Statue of Sovereignty", pos = Vector3.new(35, 135, -1010), cat = "first" },
-    { name = "Terrapin Island", pos = Vector3.new(-95, 130, 1875), cat = "first" },
-    { name = "Harvesters Spike", pos = Vector3.new(-1260, 135, 1550), cat = "first" },
-    { name = "The Arch", pos = Vector3.new(1100, 130, -1250), cat = "first" },
-    { name = "Birch Cay", pos = Vector3.new(1650, 130, -2350), cat = "first" },
-    { name = "Haddock Rock", pos = Vector3.new(-500, 125, -505), cat = "first" },
-    { name = "Earmark Island", pos = Vector3.new(1200, 130, 530), cat = "first" },
-    { name = "Desolate Deep", pos = Vector3.new(-800, 130, -3100), cat = "first" },
-    { name = "Ancient Isle", pos = Vector3.new(6000, 200, 300), cat = "first" },
-    { name = "Grand Reef", pos = Vector3.new(-3555, 150, 510), cat = "first" },
-    { name = "Castaway Cliffs", pos = Vector3.new(-1800, 135, -350), cat = "first" },
-    { name = "Lost Jungle", pos = Vector3.new(2150, 135, 1850), cat = "first" },
-    { name = "Cursed Isle", pos = Vector3.new(3520, 130, -1640), cat = "first" },
-    { name = "Treasure Island", pos = Vector3.new(4180, 135, -2470), cat = "first" },
-    { name = "Roslit Volcano", pos = Vector3.new(-1900, 165, 315), cat = "first" },
-    { name = "★ Waveborne", pos = Vector3.new(10700, 140, -8400), cat = "second" },
-    { name = "★ Pine Shoals", pos = Vector3.new(11850, 135, -8000), cat = "second" },
-    { name = "★ Emberreach", pos = Vector3.new(2390, 83, -490), cat = "second" },
-    { name = "★ Lushgrove", pos = Vector3.new(1133, 105, -560), cat = "second" },
-    { name = "★ Azure Lagoon", pos = Vector3.new(3460, 130, -1275), cat = "second" },
-    { name = "★ Cursed Shores", pos = Vector3.new(-500, 135, -3800), cat = "second" },
-    { name = "⭐ N. Expedition Portal", pos = Vector3.new(-1750, 130, 3750), cat = "deep" },
-    { name = "⭐ Northern Summit", pos = Vector3.new(19500, 135, 5300), cat = "deep" },
-    { name = "⭐ Atlantis Central", pos = Vector3.new(-4270, -600, 1830), cat = "deep" },
-    { name = "⭐ The Depths", pos = Vector3.new(1060, -635, 1315), cat = "deep" },
-    { name = "⭐ Mariana's Veil", pos = Vector3.new(-1500, 125, 530), cat = "deep" },
-    { name = "⭐ Cultist Lair", pos = Vector3.new(4450, -2000, -4675), cat = "deep" },
-    { name = "⭐ The Laboratory", pos = Vector3.new(-4640, 290, 2080), cat = "deep" },
-    { name = "⭐ Vertigo", pos = Vector3.new(1230, -490, 600), cat = "deep" },
-}
-
-local RODS = {
-    { name = "Starter Rod", loc = "Moosewood • grátis", pos = Vector3.new(465, 150, 230) },
-    { name = "Lucky Rod", loc = "Moosewood Merchant $500", pos = Vector3.new(465, 150, 230) },
-    { name = "Long Rod", loc = "Moosewood Merchant $1.5k", pos = Vector3.new(465, 150, 230) },
-    { name = "Fortune Rod", loc = "Roslit Blacksmith $1.5k", pos = Vector3.new(-1515, 140, 760) },
-    { name = "Rapid Rod", loc = "Roslit Blacksmith $6k", pos = Vector3.new(-1515, 140, 760) },
-    { name = "Steady Rod", loc = "Roslit Blacksmith $12.5k", pos = Vector3.new(-1515, 140, 760) },
-    { name = "Magma Rod", loc = "Roslit Orc (Pufferfish)", pos = Vector3.new(-1850, 165, 160) },
-    { name = "Enchanted Rod", loc = "Sunstone Merlin $35k", pos = Vector3.new(-930, 225, -990) },
-    { name = "Magnet Rod", loc = "Terrapin Shop $15k", pos = Vector3.new(-195, 130, 1930) },
-    { name = "Fungal Rod", loc = "Mushgrove Agaric (quest)", pos = Vector3.new(2790, 140, -630) },
-    { name = "Kings Rod", loc = "Keepers Altar (end-game)", pos = Vector3.new(1375, -805, -300) },
-    { name = "Destiny Rod", loc = "The Arch Caleia $190k", pos = Vector3.new(980, 130, -1230) },
-    { name = "Stone Rod", loc = "Ancient Isle $225k", pos = Vector3.new(5500, 145, -315) },
-    { name = "Phoenix Rod", loc = "Ancient Eclipse cave", pos = Vector3.new(5950, 270, 890) },
-    { name = "Relic Rod", loc = "Archeological Site", pos = Vector3.new(4040, 135, 80) },
-    { name = "Arctic Rod", loc = "N. Summit $25k", pos = Vector3.new(19500, 135, 5300) },
-    { name = "Avalanche Rod", loc = "N. Frigid Cavern $35k", pos = Vector3.new(20300, 415, 5640) },
-    { name = "Summit Rod", loc = "N. Cryogenic $300k", pos = Vector3.new(20000, 780, 5700) },
-    { name = "Heaven's Rod", loc = "N. Glacial Grotto $1.75M", pos = Vector3.new(20000, 1040, 5700) },
-    { name = "Champions Rod", loc = "Atlantis $80k", pos = Vector3.new(-4450, -600, 1875) },
-    { name = "Depthseeker Rod", loc = "Atlantis $40k", pos = Vector3.new(-4450, -600, 1875) },
-    { name = "Zeus Rod", loc = "Atlantis Zeus Room $1.7M", pos = Vector3.new(-4300, -630, 2680) },
-    { name = "Tempest Rod", loc = "Atlantis Sunken Trial", pos = Vector3.new(-4620, -590, 1840) },
-    { name = "Abyssal Specter", loc = "Atlantis Ethereal $1M", pos = Vector3.new(-3915, -650, 1830) },
-    { name = "Trident Rod", loc = "Desolate Deep Brine", pos = Vector3.new(-800, 130, -3100) },
-    { name = "Rod of the Depths", loc = "The Depths altars", pos = Vector3.new(1060, -635, 1315) },
-    { name = "Sunken Rod", loc = "Treasure chest reward", pos = Vector3.new(-2825, 215, 1515) },
-    { name = "Carrot Rod", loc = "Lushgrove Carrot Garden 75k", pos = Vector3.new(1310, 130, -945) },
-    { name = "Midas Rod", loc = "Emberreach $500k", pos = Vector3.new(2390, 83, -490) },
-    { name = "Inferno Rod", loc = "Emberreach Volcano", pos = Vector3.new(2390, 150, -490) },
-    { name = "Leviathan Rod", loc = "Cultist Lair end-quest", pos = Vector3.new(4450, -2000, -4675) },
-}
-
-local Theme = {
-    shell = Color3.fromRGB(8, 11, 19), panel = Color3.fromRGB(14, 18, 31),
-    surface = Color3.fromRGB(18, 24, 41), surfaceHover = Color3.fromRGB(24, 32, 54),
-    surfaceAlt = Color3.fromRGB(12, 16, 28), accent = Color3.fromRGB(88, 164, 255),
-    accentSoft = Color3.fromRGB(48, 94, 190), success = Color3.fromRGB(62, 215, 132),
-    danger = Color3.fromRGB(236, 87, 97), warning = Color3.fromRGB(241, 192, 69),
-    text = Color3.fromRGB(223, 230, 247), subtext = Color3.fromRGB(156, 170, 201),
-    muted = Color3.fromRGB(104, 118, 152), border = Color3.fromRGB(31, 40, 70),
-    gold = Color3.fromRGB(255, 191, 74), cyan = Color3.fromRGB(104, 230, 255),
-    purple = Color3.fromRGB(152, 108, 255), cast = Color3.fromRGB(92, 255, 191),
-    sell = Color3.fromRGB(22, 68, 45), sellHover = Color3.fromRGB(28, 84, 54),
-}
-
-local GUI_WIDTH = 226
-local HEADER_HEIGHT = 38
-local WINDOW_Y_OFFSET = -180
-
-local BLOCKED_KEYS = {
-    [Enum.KeyCode.Return] = true, [Enum.KeyCode.Escape] = true,
-    [Enum.KeyCode.Tab] = true, [Enum.KeyCode.Backspace] = true,
-    [Enum.KeyCode.LeftShift] = true, [Enum.KeyCode.RightShift] = true,
-    [Enum.KeyCode.LeftControl] = true, [Enum.KeyCode.RightControl] = true,
-    [Enum.KeyCode.LeftAlt] = true, [Enum.KeyCode.RightAlt] = true,
-    [Enum.KeyCode.V] = true,
-}
-
-local function create(className, props)
-    local parent = props.Parent
-    props.Parent = nil
-    local object = Instance.new(className)
-    for key, value in pairs(props) do object[key] = value end
-    if parent then object.Parent = parent end
-    return object
-end
-
-local function addCorner(parent, radius)
-    create("UICorner", { Parent = parent, CornerRadius = UDim.new(0, radius) })
-end
-
-local function addStroke(parent, color, thickness, transparency)
-    return create("UIStroke", {
-        Parent = parent, Color = color,
-        Thickness = thickness or 1, Transparency = transparency or 0,
-    })
-end
-
-local function addGradient(parent, rotation, colors)
-    return create("UIGradient", {
-        Parent = parent, Rotation = rotation or 0,
-        Color = ColorSequence.new(colors),
-    })
-end
-
-local function addPadding(parent, left, right, top, bottom)
-    return create("UIPadding", {
-        Parent = parent,
-        PaddingLeft = UDim.new(0, left or 0), PaddingRight = UDim.new(0, right or 0),
-        PaddingTop = UDim.new(0, top or 0), PaddingBottom = UDim.new(0, bottom or 0),
-    })
-end
-
-local function tween(instance, properties, duration, style, direction)
-    local info = TweenInfo.new(duration or 0.18, style or Enum.EasingStyle.Quad, direction or Enum.EasingDirection.Out)
-    local tw = TweenService:Create(instance, info, properties)
-    tw:Play()
-    return tw
-end
-
-local function spring(instance, properties)
-    local tw = TweenService:Create(instance, TweenInfo.new(0.24, Enum.EasingStyle.Back, Enum.EasingDirection.Out), properties)
-    tw:Play()
-    return tw
-end
-
-local function clamp(v, mn, mx) return math.max(mn, math.min(mx, v)) end
-local function character() return LocalPlayer.Character end
-local function humanoid() local c = character(); return c and c:FindFirstChildOfClass("Humanoid") end
-local function rootPart() local c = character(); return c and c:FindFirstChild("HumanoidRootPart") end
-local function heldTool() local c = character(); return c and c:FindFirstChildOfClass("Tool") end
-
-local function setStatus(label, text, color)
-    if not label then return end
-    if label.Text ~= text then label.Text = text end
-    if color and label.TextColor3 ~= color then label.TextColor3 = color end
-end
-
-local function startTask(name, callback)
-    if State.tasks[name] then task.cancel(State.tasks[name]) end
-    State.tasks[name] = task.spawn(callback)
-end
-
-local function stopTask(name)
-    if State.tasks[name] then
-        task.cancel(State.tasks[name])
-        State.tasks[name] = nil
-    end
-end
 
 local function saveLearnData()
     pcall(function()
-        LocalPlayer:SetAttribute("RP_duty_far", ReelParams.duty_far)
-        LocalPlayer:SetAttribute("RP_duty_mid", ReelParams.duty_mid)
-        LocalPlayer:SetAttribute("RP_duty_near", ReelParams.duty_near)
-        LocalPlayer:SetAttribute("RP_cycle_ms", ReelParams.cycle_ms)
-        LocalPlayer:SetAttribute("RP_rebound_ms", ReelParams.rebound_ms)
-        LocalPlayer:SetAttribute("LH_wins", LearnHistory.totalWins)
-        LocalPlayer:SetAttribute("LH_losses", LearnHistory.totalLosses)
-        LocalPlayer:SetAttribute("LH_adjusts", LearnHistory.adjustCount)
-        LocalPlayer:SetAttribute("LH_last", LearnHistory.lastDiagnosis)
+        LP:SetAttribute("RP_duty_far",    ReelParams.duty_far)
+        LP:SetAttribute("RP_duty_mid",    ReelParams.duty_mid)
+        LP:SetAttribute("RP_duty_near",   ReelParams.duty_near)
+        LP:SetAttribute("RP_cycle_ms",    ReelParams.cycle_ms)
+        LP:SetAttribute("RP_rebound_ms",  ReelParams.rebound_ms)
+        LP:SetAttribute("LH_wins",        LearnHistory.totalWins)
+        LP:SetAttribute("LH_losses",      LearnHistory.totalLosses)
+        LP:SetAttribute("LH_adjusts",     LearnHistory.adjustCount)
+        LP:SetAttribute("LH_last",        LearnHistory.lastDiagnosis)
     end)
 end
 
 local function loadLearnData()
     pcall(function()
-        local function getAttr(key, def)
-            local v = LocalPlayer:GetAttribute(key)
-            if v == nil then return def end
-            return v
-        end
-        ReelParams.duty_far = getAttr("RP_duty_far", 0.90)
-        ReelParams.duty_mid = getAttr("RP_duty_mid", 0.65)
-        ReelParams.duty_near = getAttr("RP_duty_near", 0.50)
-        ReelParams.cycle_ms = getAttr("RP_cycle_ms", 45)
-        ReelParams.rebound_ms = getAttr("RP_rebound_ms", 80)
-        LearnHistory.totalWins = getAttr("LH_wins", 0)
-        LearnHistory.totalLosses = getAttr("LH_losses", 0)
-        LearnHistory.adjustCount = getAttr("LH_adjusts", 0)
-        LearnHistory.lastDiagnosis = getAttr("LH_last", "—")
+        local function ga(k, def) local v = LP:GetAttribute(k); return v ~= nil and v or def end
+        ReelParams.duty_far    = ga("RP_duty_far",    0.90)
+        ReelParams.duty_mid    = ga("RP_duty_mid",    0.65)
+        ReelParams.duty_near   = ga("RP_duty_near",   0.50)
+        ReelParams.cycle_ms    = ga("RP_cycle_ms",    45)
+        ReelParams.rebound_ms  = ga("RP_rebound_ms",  80)
+        LearnHistory.totalWins    = ga("LH_wins",    0)
+        LearnHistory.totalLosses  = ga("LH_losses",  0)
+        LearnHistory.adjustCount  = ga("LH_adjusts", 0)
+        LearnHistory.lastDiagnosis= ga("LH_last",    "—")
     end)
 end
 
--- ════════════════════════════════════════
--- LEARNING v19 — adjusts duty cycles instead of hold/release times
--- ════════════════════════════════════════
-local function applyLearning(won, diagnosis)
-    local step = 0.025
-    local message = ""
+loadLearnData()
+
+local function clamp(v, mn, mx) return math.max(mn, math.min(mx, v)) end
+local function rnd(a, b) return a + math.random() * (b - a) end
+
+local function applyLearning(won, diag)
+    local STEP = 0.025
+    local msg = ""
 
     if not won then
-        local total = math.max(diagnosis.timesFar + diagnosis.timesMid + diagnosis.timesInside, 1)
-        local farPct = diagnosis.timesFar / total
-        local overshootPct = diagnosis.timesOvershoots / math.max(diagnosis.timesInside + diagnosis.timesMid, 1)
+        local total = math.max(diag.timesFar + diag.timesMid + diag.timesInside, 1)
+        local pctFar = diag.timesFar / total
+        local pctOvr = diag.timesOvershoots / math.max(diag.timesInside + diag.timesMid, 1)
 
-        if farPct > 0.5 then
-            ReelParams.duty_far = clamp(ReelParams.duty_far + step, 0.60, 0.98)
-            message = "lento -> aumentei duty far"
-        elseif overshootPct > 0.3 then
-            ReelParams.duty_far = clamp(ReelParams.duty_far - step, 0.60, 0.98)
-            ReelParams.duty_mid = clamp(ReelParams.duty_mid - step * 0.7, 0.35, 0.85)
-            message = "rápido demais -> reduzi duty"
-        elseif diagnosis.timesInside > 0 and overshootPct < 0.1 then
-            ReelParams.duty_mid = clamp(ReelParams.duty_mid + step * 0.5, 0.35, 0.85)
-            message = "timing médio refinado"
+        if pctFar > 0.5 then
+            ReelParams.duty_far = clamp(ReelParams.duty_far + STEP, 0.60, 0.98)
+            msg = "lento → aumentei duty far"
+        elseif pctOvr > 0.3 then
+            ReelParams.duty_far = clamp(ReelParams.duty_far - STEP, 0.60, 0.98)
+            ReelParams.duty_mid = clamp(ReelParams.duty_mid - STEP * 0.7, 0.35, 0.85)
+            msg = "rápido demais → reduzi duty"
+        elseif diag.timesInside > 0 and pctOvr < 0.1 then
+            ReelParams.duty_mid = clamp(ReelParams.duty_mid + STEP * 0.5, 0.35, 0.85)
+            msg = "timing médio refinado"
         else
-            ReelParams.duty_near = clamp(ReelParams.duty_near + step * 0.3, 0.35, 0.70)
-            message = "ajuste leve centro"
+            ReelParams.duty_near = clamp(ReelParams.duty_near + STEP * 0.3, 0.35, 0.70)
+            msg = "ajuste leve centro"
         end
-
         LearnHistory.totalLosses = LearnHistory.totalLosses + 1
     else
-        if diagnosis.timesOvershoots > 2 then
-            ReelParams.duty_far = clamp(ReelParams.duty_far - step * 0.3, 0.60, 0.98)
-            message = "ganhou com overshoot -> refinando"
+        if diag.timesOvershoots > 2 then
+            ReelParams.duty_far = clamp(ReelParams.duty_far - STEP * 0.3, 0.60, 0.98)
+            msg = "ganhou com overshoot → refinando"
         else
-            message = "perfeito ✓"
+            msg = "perfeito ✓"
         end
         LearnHistory.totalWins = LearnHistory.totalWins + 1
     end
 
-    LearnHistory.adjustCount = LearnHistory.adjustCount + 1
-    LearnHistory.lastDiagnosis = (won and "✅ " or "❌ ") .. message
-    table.insert(LearnHistory.sessions, 1, { won = won, msg = message, time = tick() })
+    LearnHistory.adjustCount   = LearnHistory.adjustCount + 1
+    LearnHistory.lastDiagnosis = (won and "✅ " or "❌ ") .. msg
+    table.insert(LearnHistory.sessions, 1, { won = won, msg = msg, time = tick() })
     if #LearnHistory.sessions > 20 then table.remove(LearnHistory.sessions) end
     saveLearnData()
 end
 
-local function getRecentScore(amount)
-    amount = amount or 10
-    local wins, total = 0, 0
-    for i = 1, math.min(amount, #LearnHistory.sessions) do
-        total += 1
-        if LearnHistory.sessions[i].won then wins += 1 end
+local function getRecentScore(n)
+    n = n or 10; local wins, total = 0, 0
+    for i = 1, math.min(n, #LearnHistory.sessions) do
+        total = total + 1
+        if LearnHistory.sessions[i].won then wins = wins + 1 end
     end
     return wins, total
 end
 
-local function bindConnection(name, conn)
-    if State.connections[name] then State.connections[name]:Disconnect() end
-    State.connections[name] = conn
-end
+-- Auto-save a cada 30s
+task.spawn(function()
+    while true do task.wait(30); saveLearnData() end
+end)
 
-local function disconnectConnection(name)
-    if State.connections[name] then
-        State.connections[name]:Disconnect()
-        State.connections[name] = nil
-    end
-end
+-- ═══════════════════════════════════════
+-- ILHAS
+-- ═══════════════════════════════════════
+local ISLANDS = {
+    {name="Moosewood",             pos=Vector3.new(350,135,250),     cat="first"},
+    {name="Roslit Bay",            pos=Vector3.new(-1600,130,500),   cat="first"},
+    {name="Forsaken Shore",        pos=Vector3.new(-2750,130,1450),  cat="first"},
+    {name="Mushgrove Swamp",       pos=Vector3.new(2420,135,-750),   cat="first"},
+    {name="Snowcap Island",        pos=Vector3.new(2625,135,2370),   cat="first"},
+    {name="Sunstone Island",       pos=Vector3.new(-870,135,-1100),  cat="first"},
+    {name="Statue of Sovereignty", pos=Vector3.new(35,135,-1010),    cat="first"},
+    {name="Terrapin Island",       pos=Vector3.new(-95,130,1875),    cat="first"},
+    {name="Harvesters Spike",      pos=Vector3.new(-1260,135,1550),  cat="first"},
+    {name="The Arch",              pos=Vector3.new(1100,130,-1250),  cat="first"},
+    {name="Birch Cay",             pos=Vector3.new(1650,130,-2350),  cat="first"},
+    {name="Haddock Rock",          pos=Vector3.new(-500,125,-505),   cat="first"},
+    {name="Earmark Island",        pos=Vector3.new(1200,130,530),    cat="first"},
+    {name="Desolate Deep",         pos=Vector3.new(-800,130,-3100),  cat="first"},
+    {name="Ancient Isle",          pos=Vector3.new(6000,200,300),    cat="first"},
+    {name="Grand Reef",            pos=Vector3.new(-3555,150,510),   cat="first"},
+    {name="Castaway Cliffs",       pos=Vector3.new(-1800,135,-350),  cat="first"},
+    {name="Lost Jungle",           pos=Vector3.new(2150,135,1850),   cat="first"},
+    {name="Cursed Isle",           pos=Vector3.new(3520,130,-1640),  cat="first"},
+    {name="Treasure Island",       pos=Vector3.new(4180,135,-2470),  cat="first"},
+    {name="Roslit Volcano",        pos=Vector3.new(-1900,165,315),   cat="first"},
+    {name="★ Waveborne",           pos=Vector3.new(10700,140,-8400), cat="second"},
+    {name="★ Pine Shoals",         pos=Vector3.new(11850,135,-8000), cat="second"},
+    {name="★ Emberreach",          pos=Vector3.new(2390,83,-490),    cat="second"},
+    {name="★ Lushgrove",           pos=Vector3.new(1133,105,-560),   cat="second"},
+    {name="★ Azure Lagoon",        pos=Vector3.new(3460,130,-1275),  cat="second"},
+    {name="★ Cursed Shores",       pos=Vector3.new(-500,135,-3800),  cat="second"},
+    {name="⭐ N. Expedition Portal",pos=Vector3.new(-1750,130,3750), cat="deep"},
+    {name="⭐ Northern Summit",    pos=Vector3.new(19500,135,5300),  cat="deep"},
+    {name="⭐ Atlantis Central",   pos=Vector3.new(-4270,-600,1830), cat="deep"},
+    {name="⭐ The Depths",         pos=Vector3.new(1060,-635,1315),  cat="deep"},
+    {name="⭐ Mariana's Veil",     pos=Vector3.new(-1500,125,530),   cat="deep"},
+    {name="⭐ Cultist Lair",       pos=Vector3.new(4450,-2000,-4675),cat="deep"},
+    {name="⭐ The Laboratory",     pos=Vector3.new(-4640,290,2080),  cat="deep"},
+    {name="⭐ Vertigo",            pos=Vector3.new(1230,-490,600),   cat="deep"},
+}
 
-local function updateActivityDot()
-    local any = State.flags.noclip or State.flags.speed or State.flags.jump
-        or State.flags.shake or State.flags.cast or State.flags.autoSell or State.flags.autoReel
-    if UI.refs.activityDot then
-        tween(UI.refs.activityDot, { BackgroundColor3 = any and Theme.success or Theme.muted }, 0.15)
-    end
-end
+local RODS = {
+    {name="Starter Rod",       loc="Moosewood • grátis",           pos=Vector3.new(465,150,230)},
+    {name="Lucky Rod",         loc="Moosewood Merchant $500",      pos=Vector3.new(465,150,230)},
+    {name="Long Rod",          loc="Moosewood Merchant $1.5k",     pos=Vector3.new(465,150,230)},
+    {name="Fortune Rod",       loc="Roslit Blacksmith $1.5k",      pos=Vector3.new(-1515,140,760)},
+    {name="Rapid Rod",         loc="Roslit Blacksmith $6k",        pos=Vector3.new(-1515,140,760)},
+    {name="Steady Rod",        loc="Roslit Blacksmith $12.5k",     pos=Vector3.new(-1515,140,760)},
+    {name="Magma Rod",         loc="Roslit Orc (Pufferfish)",      pos=Vector3.new(-1850,165,160)},
+    {name="Enchanted Rod",     loc="Sunstone Merlin $35k",         pos=Vector3.new(-930,225,-990)},
+    {name="Magnet Rod",        loc="Terrapin Shop $15k",           pos=Vector3.new(-195,130,1930)},
+    {name="Fungal Rod",        loc="Mushgrove Agaric (quest)",     pos=Vector3.new(2790,140,-630)},
+    {name="Kings Rod",         loc="Keepers Altar (end-game)",     pos=Vector3.new(1375,-805,-300)},
+    {name="Destiny Rod",       loc="The Arch Caleia $190k",        pos=Vector3.new(980,130,-1230)},
+    {name="Stone Rod",         loc="Ancient Isle $225k",           pos=Vector3.new(5500,145,-315)},
+    {name="Phoenix Rod",       loc="Ancient Eclipse cave",         pos=Vector3.new(5950,270,890)},
+    {name="Relic Rod",         loc="Archeological Site",           pos=Vector3.new(4040,135,80)},
+    {name="Arctic Rod",        loc="N. Summit $25k",               pos=Vector3.new(19500,135,5300)},
+    {name="Avalanche Rod",     loc="N. Frigid Cavern $35k",        pos=Vector3.new(20300,415,5640)},
+    {name="Summit Rod",        loc="N. Cryogenic $300k",           pos=Vector3.new(20000,780,5700)},
+    {name="Heaven's Rod",      loc="N. Glacial Grotto $1.75M",     pos=Vector3.new(20000,1040,5700)},
+    {name="Champions Rod",     loc="Atlantis $80k",                pos=Vector3.new(-4450,-600,1875)},
+    {name="Depthseeker Rod",   loc="Atlantis $40k",                pos=Vector3.new(-4450,-600,1875)},
+    {name="Zeus Rod",          loc="Atlantis Zeus Room $1.7M",     pos=Vector3.new(-4300,-630,2680)},
+    {name="Tempest Rod",       loc="Atlantis Sunken Trial",        pos=Vector3.new(-4620,-590,1840)},
+    {name="Abyssal Specter",   loc="Atlantis Ethereal $1M",        pos=Vector3.new(-3915,-650,1830)},
+    {name="Trident Rod",       loc="Desolate Deep Brine",          pos=Vector3.new(-800,130,-3100)},
+    {name="Rod of the Depths", loc="The Depths altars",            pos=Vector3.new(1060,-635,1315)},
+    {name="Sunken Rod",        loc="Treasure chest reward",        pos=Vector3.new(-2825,215,1515)},
+    {name="Carrot Rod",        loc="Lushgrove Carrot Garden 75k",  pos=Vector3.new(1310,130,-945)},
+    {name="Midas Rod",         loc="Emberreach $500k",             pos=Vector3.new(2390,83,-490)},
+    {name="Inferno Rod",       loc="Emberreach Volcano",           pos=Vector3.new(2390,150,-490)},
+    {name="Leviathan Rod",     loc="Cultist Lair end-quest",       pos=Vector3.new(4450,-2000,-4675)},
+}
 
-local function teleportTo(position)
-    local root = rootPart()
-    if not root then return false end
-    root.CFrame = CFrame.new(position + Vector3.new(0, 5, 0))
-    return true
-end
+-- ═══════════════════════════════════════
+-- HELPERS
+-- ═══════════════════════════════════════
+local function chr()  return LP.Character end
+local function hum()  local c=chr(); return c and c:FindFirstChildOfClass("Humanoid") end
+local function hrp()  local c=chr(); return c and c:FindFirstChild("HumanoidRootPart") end
+local function tool() local c=chr(); return c and c:FindFirstChildOfClass("Tool") end
 
-local function setNoclip(enabled)
-    State.flags.noclip = enabled
-    disconnectConnection("noclip")
-    if enabled then
-        bindConnection("noclip", RunService.Stepped:Connect(function()
-            local c = character()
-            if not c then return end
-            for _, p in ipairs(c:GetDescendants()) do
-                if p:IsA("BasePart") then p.CanCollide = false end
-            end
-        end))
+-- ═══════════════════════════════════════
+-- NOCLIP / SPEED / JUMP
+-- ═══════════════════════════════════════
+local function setNoclip(v)
+    noclipOn=v
+    if noclipConn then noclipConn:Disconnect(); noclipConn=nil end
+    if v then
+        noclipConn=RunSvc.Stepped:Connect(function()
+            local c=chr(); if not c then return end
+            for _,p in ipairs(c:GetDescendants()) do if p:IsA("BasePart") then p.CanCollide=false end end
+        end)
     else
-        local c = character()
-        if c then
-            for _, p in ipairs(c:GetDescendants()) do
-                if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then p.CanCollide = true end
-            end
-        end
+        local c=chr()
+        if c then for _,p in ipairs(c:GetDescendants()) do
+            if p:IsA("BasePart") and p.Name~="HumanoidRootPart" then p.CanCollide=true end
+        end end
     end
 end
 
-local function applySpeedOnce()
-    local h = humanoid()
-    if h then h.WalkSpeed = State.flags.speed and State.values.speed or 16 end
-end
-
+local function applySpeedOnce() local h=hum(); if h then h.WalkSpeed=speedOn and speedVal or 16 end end
 local function startSpeedLoop()
-    disconnectConnection("speed")
-    bindConnection("speed", RunService.Heartbeat:Connect(function()
-        if not State.flags.speed then disconnectConnection("speed"); return end
-        local h = humanoid()
-        if h and h.WalkSpeed ~= State.values.speed then h.WalkSpeed = State.values.speed end
-    end))
+    if speedConn then speedConn:Disconnect(); speedConn=nil end
+    speedConn=RunSvc.Heartbeat:Connect(function()
+        if not speedOn then speedConn:Disconnect(); speedConn=nil; return end
+        local h=hum(); if h and h.WalkSpeed~=speedVal then h.WalkSpeed=speedVal end
+    end)
 end
-
 local function stopSpeedLoop()
-    disconnectConnection("speed")
-    local h = humanoid(); if h then h.WalkSpeed = 16 end
+    if speedConn then speedConn:Disconnect(); speedConn=nil end
+    local h=hum(); if h then h.WalkSpeed=16 end
 end
 
 local function startJumpLoop()
-    disconnectConnection("jump")
-    bindConnection("jump", RunService.Heartbeat:Connect(function()
-        if not State.flags.jump then disconnectConnection("jump"); return end
-        local h = humanoid()
-        if h then
-            h.UseJumpPower = true
-            if h.JumpPower ~= State.values.jump then h.JumpPower = State.values.jump end
-        end
-    end))
-end
-
-local function stopJumpLoop()
-    disconnectConnection("jump")
-    local h = humanoid(); if h then h.JumpPower = 50 end
-end
-
-local function startRejumpLoop()
-    disconnectConnection("rejump")
-    bindConnection("rejump", RunService.Heartbeat:Connect(function()
-        if not State.flags.rejump or not State.flags.jump then
-            disconnectConnection("rejump"); return
-        end
-        local h = humanoid()
-        if h and h.FloorMaterial ~= Enum.Material.Air then
-            h:ChangeState(Enum.HumanoidStateType.Jumping)
-            task.wait(0.15)
-        end
-    end))
-end
-
-local function stopRejumpLoop() disconnectConnection("rejump") end
-
-local function shakeUiVisible()
-    local g = PlayerGui:FindFirstChild("shakeui")
-    return g and g.Enabled ~= false
-end
-
-local function tapKey(kc)
-    pcall(function() VirtualInputManager:SendKeyEvent(true, kc, false, game) end)
-    task.wait(0.02)
-    pcall(function() VirtualInputManager:SendKeyEvent(false, kc, false, game) end)
-end
-
-local function pressEnter() tapKey(Enum.KeyCode.Return) end
-local function equipRodSlot() tapKey(Enum.KeyCode.One) end
-
-local function startShake()
-    startTask("shake", function()
-        while State.flags.shake do
-            if shakeUiVisible() then
-                State.runtime.shakeActive = true
-                pressEnter()
-                task.wait(0.05 + math.random() * 0.03)
-            else
-                State.runtime.shakeActive = false
-                task.wait(0.08)
-            end
-        end
-        State.runtime.shakeActive = false
+    if jumpConn then jumpConn:Disconnect(); jumpConn=nil end
+    jumpConn=RunSvc.Heartbeat:Connect(function()
+        if not jumpOn then jumpConn:Disconnect(); jumpConn=nil; return end
+        local h=hum(); if h then h.UseJumpPower=true; if h.JumpPower~=jumpVal then h.JumpPower=jumpVal end end
     end)
 end
-
-local function stopShake()
-    State.runtime.shakeActive = false
-    stopTask("shake")
+local function stopJumpLoop()
+    if jumpConn then jumpConn:Disconnect(); jumpConn=nil end
+    local h=hum(); if h then h.JumpPower=50 end
 end
 
-local function sendMouseDown(x, y)
-    if State.runtime.castMouseHeld then return end
-    pcall(function() VirtualInputManager:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, true, game, 0) end)
-    State.runtime.castMouseHeld = true
+local function startReJump()
+    if reJumpConn then reJumpConn:Disconnect(); reJumpConn=nil end
+    reJumpConn=RunSvc.Heartbeat:Connect(function()
+        if not reJumpOn or not jumpOn then reJumpConn:Disconnect(); reJumpConn=nil; return end
+        local h=hum(); if h and h.FloorMaterial~=Enum.Material.Air then
+            h:ChangeState(Enum.HumanoidStateType.Jumping); task.wait(0.15) end
+    end)
 end
+local function stopReJump() if reJumpConn then reJumpConn:Disconnect(); reJumpConn=nil end end
 
-local function sendMouseUp(x, y)
-    if not State.runtime.castMouseHeld then return end
-    pcall(function() VirtualInputManager:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, false, game, 0) end)
-    State.runtime.castMouseHeld = false
+-- ═══════════════════════════════════════
+-- SHAKE
+-- ═══════════════════════════════════════
+local function shakeUiVisible()
+    local sui=PG:FindFirstChild("shakeui")
+    return sui and sui.Enabled~=false
 end
-
-local function forceCastRelease()
-    pcall(function() VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0) end)
-    State.runtime.castMouseHeld = false
+local function pressEnter()
+    pcall(function() VIM:SendKeyEvent(true,Enum.KeyCode.Return,false,game) end)
+    task.wait(0.02)
+    pcall(function() VIM:SendKeyEvent(false,Enum.KeyCode.Return,false,game) end)
 end
-
-local function findGuiByPatterns(names, includes, excludes)
-    for _, name in ipairs(names) do
-        local g = PlayerGui:FindFirstChild(name)
-        if g and g:IsA("ScreenGui") and g.Enabled ~= false then return g end
-    end
-    for _, g in ipairs(PlayerGui:GetChildren()) do
-        if g:IsA("ScreenGui") and g.Enabled then
-            local ln = g.Name:lower()
-            local matched = false
-            for _, p in ipairs(includes) do if ln:find(p) then matched = true; break end end
-            if matched then
-                local blocked = false
-                for _, p in ipairs(excludes or {}) do if ln:find(p) then blocked = true; break end end
-                if not blocked then return g end
+local function startShake()
+    if shakeThread then task.cancel(shakeThread); shakeThread=nil end
+    shakeThread=task.spawn(function()
+        while shakeOn do
+            if shakeUiVisible() then
+                shakeActive=true; pressEnter()
+                task.wait(0.05+math.random()*0.03)
+            else
+                shakeActive=false; task.wait(0.08)
             end
+        end
+        shakeActive=false
+    end)
+end
+local function stopShake()
+    shakeOn=false; shakeActive=false
+    if shakeThread then task.cancel(shakeThread); shakeThread=nil end
+end
+
+-- ═══════════════════════════════════════
+-- 🎯 AUTO-CAST v17-patch
+-- ═══════════════════════════════════════
+local function castPress(x, y)
+    if _castHeld then return end
+    pcall(function() VIM:SendMouseButtonEvent(math.floor(x),math.floor(y),0,true,game,0) end)
+    _castHeld=true
+end
+local function castRelease(x, y)
+    if not _castHeld then return end
+    pcall(function() VIM:SendMouseButtonEvent(math.floor(x),math.floor(y),0,false,game,0) end)
+    _castHeld=false
+end
+local function castForceRelease()
+    pcall(function() VIM:SendMouseButtonEvent(0,0,0,false,game,0) end)
+    _castHeld=false
+end
+local function equipRodSlot()
+    pcall(function() VIM:SendKeyEvent(true,Enum.KeyCode.One,false,game) end)
+    task.wait(0.05)
+    pcall(function() VIM:SendKeyEvent(false,Enum.KeyCode.One,false,game) end)
+end
+
+-- Busca exaustiva por remote de cast
+local function findCastRemote()
+    -- 1: Tool equipada (mais confiável no Fisch)
+    local t = tool()
+    if t then
+        local ef = t:FindFirstChild("events")
+        if ef then
+            for _,ch in ipairs(ef:GetChildren()) do
+                local n=ch.Name:lower()
+                if (n:find("cast") or n:find("throw") or n:find("launch") or n:find("power"))
+                    and ch:IsA("RemoteEvent") then
+                    return ch, "tool.events."..ch.Name
+                end
+            end
+        end
+        for _,ch in ipairs(t:GetDescendants()) do
+            if ch:IsA("RemoteEvent") then
+                local n=ch.Name:lower()
+                if n:find("cast") or n:find("throw") or n:find("launch") then
+                    return ch, "tool."..ch.Name
+                end
+            end
+        end
+    end
+    -- 2: ReplicatedStorage
+    local function scanRS(root)
+        for _,ch in ipairs(root:GetDescendants()) do
+            if ch:IsA("RemoteEvent") or ch:IsA("RemoteFunction") then
+                local n=ch.Name:lower()
+                if n=="cast" or n=="castrod" or n=="throwrod" or n=="castfish"
+                or n=="launchrod" or n=="power" or n=="castbobber" or n=="perfectcast" then
+                    return ch, "RS."..ch.Name
+                end
+                if (n:find("cast") or n:find("throw") or n:find("launch") or n:find("perfect"))
+                and not n:find("broad") and not n:find("chat") and not n:find("blast") then
+                    return ch, "RS."..ch.Name
+                end
+            end
+        end
+        return nil, nil
+    end
+    local re, where = scanRS(RS)
+    if re then return re, where end
+    -- 3: Workspace
+    for _,ch in ipairs(workspace:GetDescendants()) do
+        if ch:IsA("RemoteEvent") then
+            local n=ch.Name:lower()
+            if n:find("cast") or n:find("perfect") then return ch, "WS."..ch.Name end
+        end
+    end
+    return nil, nil
+end
+
+local function findCastUI()
+    for _,n in ipairs({"castui","CastUI","castbar","CastBar","powerui","PowerUI",
+                        "chargeui","ChargeUI","castingui","CastingUI","throwui","ThrowUI","powerbar","PowerBar"}) do
+        local g=PG:FindFirstChild(n); if g and g.Enabled~=false then return g end
+    end
+    for _,g in ipairs(PG:GetChildren()) do
+        if g:IsA("ScreenGui") and g.Enabled then
+            local n=g.Name:lower()
+            if (n:find("cast") or n:find("power") or n:find("charge") or n:find("throw") or n:find("launch"))
+               and not n:find("shake") and not n:find("reel") and not n:find("fish") then return g end
         end
     end
     return nil
 end
 
-local function rectContains(parent, child)
-    local pp, ps = parent.AbsolutePosition, parent.AbsoluteSize
-    local cp, cs = child.AbsolutePosition, child.AbsoluteSize
-    return cp.X >= pp.X - 2 and cp.Y >= pp.Y - 2
-        and cp.X + cs.X <= pp.X + ps.X + 2
-        and cp.Y + cs.Y <= pp.Y + ps.Y + 2
-end
-
-local function findCastUI()
-    return findGuiByPatterns(
-        { "castui", "CastUI", "castbar", "CastBar", "powerui", "PowerUI", "chargeui", "ChargeUI", "castingui", "CastingUI", "throwui", "ThrowUI", "powerbar", "PowerBar" },
-        { "cast", "power", "charge", "throw", "launch" },
-        { "shake", "reel", "fish" }
-    )
-end
-
-local function findCastBar(castGui)
-    local bestBar, bestBarScore = nil, -math.huge
-    local greenCandidates = {}
-
-    for _, d in ipairs(castGui:GetDescendants()) do
+local function findCastBar(cGui)
+    local bestBar, bestScore = nil, 0
+    local greenFill = nil
+    for _,d in ipairs(cGui:GetDescendants()) do
         if d:IsA("Frame") and d.Visible then
-            local sz = d.AbsoluteSize
-            local ln = d.Name:lower()
-
-            if sz.Y > 36 and sz.X > 6 and sz.X < 100 then
-                local ratio = sz.Y / math.max(sz.X, 1)
-                if ratio > 1.5 then
-                    local score = ratio * 3 + sz.Y * 0.03
-                    if ln:find("bar") or ln:find("meter") or ln:find("power") then score += 4 end
-                    if score > bestBarScore then bestBarScore = score; bestBar = d end
+            local sz=d.AbsoluteSize; local n=d.Name:lower()
+            local vRatio = sz.Y / math.max(sz.X, 1)
+            if sz.Y > 30 and sz.X < 80 and vRatio > 1.5 then
+                local score = vRatio * 3 + sz.Y * 0.03
+                if n:find("bar") or n:find("meter") or n:find("power") then score = score + 4 end
+                if score > bestScore then bestScore = score; bestBar = d end
+            end
+            if not greenFill then
+                local bc=d.BackgroundColor3
+                if bc.G > bc.R*1.15 and bc.G > bc.B*1.10 and bc.G > 0.2 then
+                    if d.Parent and bestBar and d.Parent == bestBar then greenFill = d end
+                end
+                if (n:find("fill") or n:find("progress") or n:find("green")) then
+                    local bc2=d.BackgroundColor3
+                    if bc2.G > bc2.R*1.1 and bc2.G > bc2.B*1.1 and bc2.G > 0.15 then greenFill = d end
                 end
             end
-
-            local c = d.BackgroundColor3
-            if c.G > c.R * 1.15 and c.G > c.B * 1.10 and c.G > 0.2 then
-                table.insert(greenCandidates, d)
-            elseif ln:find("fill") or ln:find("progress") or ln:find("green") then
-                table.insert(greenCandidates, d)
-            end
         end
     end
-
-    if not bestBar then return nil, nil end
-
-    local bestFill, bestFillScore = nil, -math.huge
-    for _, c in ipairs(greenCandidates) do
-        if c.Parent and rectContains(bestBar, c) then
-            local sz = c.AbsoluteSize
-            local score = sz.Y + sz.X * 0.2
-            if c.Parent == bestBar then score += 20 end
-            if score > bestFillScore then bestFillScore = score; bestFill = c end
-        end
-    end
-
-    return bestBar, bestFill
+    return bestBar, greenFill
 end
 
 local function getCastProgress(outer, fill)
     if not outer or not fill then return 0 end
-    local bh = math.max(outer.AbsoluteSize.Y, 1)
-    return math.clamp(fill.AbsoluteSize.Y / bh, 0, 1)
+    return math.clamp(fill.AbsoluteSize.Y / math.max(outer.AbsoluteSize.Y, 1), 0, 1)
 end
 
-local function startCast()
-    forceCastRelease()
-    State.runtime.lastCastEquipAttempt = 0
-    State.runtime.castActive = false
-    State.runtime.castPhase = "idle"
-    local primeStartedAt = 0
-    local cycleLocked = false
-    local clearSince = 0
-
-    local function hasFishingPhaseUI()
-        if shakeUiVisible() then return true end
-        for _, n in ipairs({ "reelui", "ReelUI", "fishingrod", "FishingRod", "reelbar", "ReelBar", "Fishing", "FishingBar", "FishingUI" }) do
-            local g = PlayerGui:FindFirstChild(n)
-            if g and g.Enabled ~= false then return true end
+local function hasFishingPhaseActive()
+    if shakeUiVisible() then return true end
+    for _,n in ipairs({"reelui","ReelUI","fishingrod","FishingRod","reelbar","ReelBar","Fishing","FishingBar","FishingUI"}) do
+        local g=PG:FindFirstChild(n); if g and g.Enabled~=false then return true end
+    end
+    for _,g in ipairs(PG:GetChildren()) do
+        if g:IsA("ScreenGui") and g.Enabled then
+            local n=g.Name:lower()
+            if (n:find("reel") or n:find("fish")) and not n:find("shake") and not n:find("cast") then return true end
         end
-        for _, g in ipairs(PlayerGui:GetChildren()) do
-            if g:IsA("ScreenGui") and g.Enabled then
-                local ln = g.Name:lower()
-                if (ln:find("reel") or ln:find("fish")) and not ln:find("shake") and not ln:find("cast") then
-                    return true
+    end
+    return false
+end
+
+local function startCast(statusLbl)
+    if castThread then task.cancel(castThread); castThread=nil end
+    castActive=false; castForceRelease()
+    local cycleLocked = false
+    local clearSince  = 0
+    local primeSince  = 0
+
+    castThread=task.spawn(function()
+        while castOn do
+            local busy = hasFishingPhaseActive()
+
+            -- Método 1: FireServer direto
+            if not busy and not cycleLocked then
+                local remote, where = findCastRemote()
+                if remote then
+                    castActive=true; castPhase="firing"
+                    local pw = math.random(92, 98)
+                    if statusLbl then
+                        statusLbl.TextColor3=Color3.fromRGB(80,255,180)
+                        statusLbl.Text="⚡ FireServer("..pw..")"
+                    end
+                    if remote:IsA("RemoteEvent") then
+                        pcall(function() remote:FireServer(pw) end)
+                    elseif remote:IsA("RemoteFunction") then
+                        pcall(function() remote:InvokeServer(pw) end)
+                    end
+                    castForceRelease()
+                    castActive=false; castPhase="cooldown"
+                    cycleLocked=true; clearSince=0
+                    task.wait(0.4 + math.random()*0.2)
+                    goto continue
                 end
             end
-        end
-        return false
-    end
 
-    startTask("cast", function()
-        while State.flags.cast do
-            local castGui = findCastUI()
-            local busy = hasFishingPhaseUI()
-
-            if castGui and castGui.Enabled and not cycleLocked then
-                local outer, fill = findCastBar(castGui)
-                if outer and fill then
-                    local cx = outer.AbsolutePosition.X + outer.AbsoluteSize.X * 0.5
-                    local cy = outer.AbsolutePosition.Y + outer.AbsoluteSize.Y * 0.5
-
-                    State.runtime.castActive = true
-                    State.runtime.castPhase = "holding"
-                    sendMouseDown(cx, cy)
-
-                    local elapsed, timeout = 0, 3.5
-                    while State.flags.cast and elapsed < timeout do
-                        task.wait(0.02)
-                        elapsed += 0.02
-                        outer, fill = findCastBar(castGui)
-                        local progress = getCastProgress(outer, fill)
-                        if progress >= State.values.castReleasePct then break end
-                        if not castGui.Parent or castGui.Enabled == false then break end
+            -- Método 2: Visual — barra verde
+            local cGui = findCastUI()
+            if cGui and not cycleLocked and not busy then
+                local outer, fill = findCastBar(cGui)
+                if outer then
+                    local cx = outer.AbsolutePosition.X + outer.AbsoluteSize.X*0.5
+                    local cy = outer.AbsolutePosition.Y + outer.AbsoluteSize.Y*0.5
+                    castActive=true; castPhase="holding"
+                    castPress(cx, cy)
+                    local waited=0
+                    while castOn and waited < 3.5 do
+                        task.wait(0.02); waited=waited+0.02
+                        local _, gf = findCastBar(cGui)
+                        local pct = getCastProgress(outer, gf or fill)
+                        if pct >= 0.72 then break end
+                        if not cGui.Enabled then break end
                     end
-
-                    State.runtime.castPhase = "releasing"
-                    sendMouseUp(cx, cy)
-                    State.runtime.castActive = false
-                    State.runtime.castPhase = "cooldown"
-                    cycleLocked = true
-                    clearSince = 0
-                    task.wait(0.45 + math.random() * 0.20)
-                else
-                    forceCastRelease()
-                    State.runtime.castActive = false
-                    State.runtime.castPhase = "searching"
-                    task.wait(0.08)
+                    castPhase="releasing"; castRelease(cx, cy)
+                    castActive=false; castPhase="cooldown"
+                    cycleLocked=true; clearSince=0
+                    task.wait(0.45 + math.random()*0.20)
+                    goto continue
                 end
-            elseif cycleLocked or busy then
-                forceCastRelease()
-                State.runtime.castActive = false
-                State.runtime.castPhase = "cooldown"
-                if busy or (castGui and castGui.Enabled) then
-                    clearSince = 0; cycleLocked = true
+            end
+
+            -- Estado: aguardando / armando
+            if cycleLocked or busy then
+                castForceRelease()
+                castActive=false; castPhase="cooldown"
+                if busy or (cGui and cGui.Enabled) then
+                    clearSince=0
                 else
-                    clearSince += 0.10
+                    clearSince = clearSince + 0.10
                     if clearSince >= 1.20 then
-                        cycleLocked = false
-                        State.runtime.castPhase = "idle"
+                        cycleLocked=false; castPhase="idle"
                     end
                 end
                 task.wait(0.10)
             else
-                State.runtime.castActive = false
-                State.runtime.castPhase = "arming"
-                local cam = workspace.CurrentCamera
-                local cx = cam and (cam.ViewportSize.X * 0.5) or 400
-                local cy = cam and (cam.ViewportSize.Y * 0.5) or 300
-
-                if tick() - State.runtime.lastCastEquipAttempt >= 0.90 then
-                    State.runtime.lastCastEquipAttempt = tick()
-                    equipRodSlot()
+                -- Arming: tenta equipar a vara e pressiona mouse pra estar pronto
+                castActive=false; castPhase="arming"
+                if tick() - _lastCastEquipAt >= 0.90 then
+                    _lastCastEquipAt = tick(); equipRodSlot()
                 end
-
-                if (not State.runtime.castMouseHeld) or (tick() - primeStartedAt >= 1.35) then
-                    if State.runtime.castMouseHeld then
-                        sendMouseUp(cx, cy)
-                        task.wait(0.12)
-                    end
-                    sendMouseDown(cx, cy)
-                    primeStartedAt = tick()
+                if not _castHeld or (tick() - primeSince >= 1.35) then
+                    if _castHeld then castRelease(0, 0); task.wait(0.12) end
+                    local cam = workspace.CurrentCamera
+                    local cx = cam and cam.ViewportSize.X*0.5 or 400
+                    local cy = cam and cam.ViewportSize.Y*0.5 or 300
+                    castPress(cx, cy); primeSince=tick()
                 end
                 task.wait(0.08)
             end
-        end
 
-        forceCastRelease()
-        State.runtime.castActive = false
-        State.runtime.castPhase = "idle"
+            ::continue::
+        end
+        castForceRelease(); castActive=false; castPhase="idle"
     end)
 end
 
 local function stopCast()
-    State.flags.cast = false
-    forceCastRelease()
-    State.runtime.lastCastEquipAttempt = 0
-    State.runtime.castActive = false
-    State.runtime.castPhase = "idle"
-    stopTask("cast")
+    castOn=false; castForceRelease()
+    castActive=false; castPhase="idle"
+    if castThread then task.cancel(castThread); castThread=nil end
 end
 
--- ════════════════════════════════════════
--- AUTO-REEL v19 — DUTY CYCLE REWRITE
--- ════════════════════════════════════════
+-- ═══════════════════════════════════════
+-- 🎣 AUTO-REEL v19 — DUTY CYCLE
+-- Loop em Heartbeat, sem task.wait no core
+-- ═══════════════════════════════════════
+local reelStatusLbl = nil  -- referência ao label (setado após GUI)
+
 local function findReelUI()
-    for _, n in ipairs({ "reelui", "ReelUI", "fishingrod", "FishingRod", "reelbar", "ReelBar", "Fishing", "FishingBar", "FishingUI" }) do
-        local g = PlayerGui:FindFirstChild(n)
-        if g and g.Enabled ~= false then return g end
+    for _,n in ipairs({"reelui","ReelUI","fishingrod","FishingRod","reelbar","ReelBar","Fishing","FishingBar","FishingUI"}) do
+        local g=PG:FindFirstChild(n); if g and g.Enabled~=false then return g end
     end
-    for _, g in ipairs(PlayerGui:GetChildren()) do
+    for _,g in ipairs(PG:GetChildren()) do
         if g:IsA("ScreenGui") and g.Enabled then
-            local ln = g.Name:lower()
-            if (ln:find("reel") or ln:find("fish")) and not ln:find("shake") then return g end
+            local n=g.Name:lower()
+            if (n:find("reel") or n:find("fish")) and not n:find("shake") then return g end
         end
     end
     return nil
 end
 
-local function findReelElements(reelGui)
+local function findReelElements(rGui)
     local pb, fb
-    for _, d in ipairs(reelGui:GetDescendants()) do
+    for _,d in ipairs(rGui:GetDescendants()) do
         if d:IsA("GuiObject") and d.Visible then
-            local ln = d.Name:lower()
-            if not pb and (ln == "playerbar" or ln == "player" or ln:find("playerbar")) then
-                pb = d
-            elseif not fb and (ln == "fish" or ln == "fishbar" or ln == "fishicon" or ln:find("fish") or ln:find("target")) then
-                fb = d
-            end
+            local n=d.Name:lower()
+            if not pb and (n=="playerbar" or n=="player" or n:find("playerbar")) then pb=d
+            elseif not fb and (n=="fish" or n=="fishbar" or n=="fishicon" or n:find("fish") or n:find("target")) then fb=d end
         end
     end
     return pb, fb
 end
 
 local function detectRewardGui()
-    for _, g in ipairs(PlayerGui:GetChildren()) do
+    for _,g in ipairs(PG:GetChildren()) do
         if g:IsA("ScreenGui") and g.Enabled then
-            local ln = g.Name:lower()
-            if ln:find("reward") or ln:find("catch") or ln:find("result") or ln:find("caught") then
-                return true, "win"
-            end
-            if ln:find("fail") or ln:find("escape") or ln:find("lost") then
-                return true, "lose"
-            end
+            local n=g.Name:lower()
+            if n:find("reward") or n:find("catch") or n:find("result") or n:find("caught") then return true,"win" end
+            if n:find("fail") or n:find("escape") or n:find("lost") then return true,"lose" end
         end
     end
-    for _, g in ipairs(PlayerGui:GetChildren()) do
+    for _,g in ipairs(PG:GetChildren()) do
         if g:IsA("ScreenGui") and g.Enabled then
-            for _, d in ipairs(g:GetDescendants()) do
+            for _,d in ipairs(g:GetDescendants()) do
                 if d:IsA("TextLabel") and d.Visible then
-                    local t = d.Text:lower()
-                    if t:find("got away") or t:find("escapou") or t:find("escaped") or t:find("failed") then
-                        return true, "lose"
-                    end
-                    if t:find("caught") or t:find("capturou") or t:find("pescou") or t:find("hooked") then
-                        return true, "win"
-                    end
+                    local t=d.Text:lower()
+                    if t:find("got away") or t:find("escapou") or t:find("escaped") or t:find("failed") then return true,"lose" end
+                    if t:find("caught") or t:find("capturou") or t:find("pescou") or t:find("hooked") then return true,"win" end
                 end
             end
         end
@@ -740,277 +644,192 @@ local function detectRewardGui()
     return false, nil
 end
 
-local function reelMousePress(x, y)
-    if State.runtime.reelMouseHeld then return end
-    pcall(function() VirtualInputManager:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, true, game, 0) end)
-    State.runtime.reelMouseHeld = true
+local function reelPress(x, y)
+    if _reelHeld then return end
+    pcall(function() VIM:SendMouseButtonEvent(math.floor(x),math.floor(y),0,true,game,0) end)
+    _reelHeld=true
 end
-
-local function reelMouseRelease(x, y)
-    if not State.runtime.reelMouseHeld then return end
-    pcall(function() VirtualInputManager:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, false, game, 0) end)
-    State.runtime.reelMouseHeld = false
+local function reelRelease(x, y)
+    if not _reelHeld then return end
+    pcall(function() VIM:SendMouseButtonEvent(math.floor(x),math.floor(y),0,false,game,0) end)
+    _reelHeld=false
 end
-
 local function reelForceRelease()
-    pcall(function() VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0) end)
-    State.runtime.reelMouseHeld = false
+    pcall(function() VIM:SendMouseButtonEvent(0,0,0,false,game,0) end)
+    _reelHeld=false
 end
 
-local function getOrCreateReelOverlay(reelGui)
-    local overlay = reelGui:FindFirstChild("UtilityReelOverlay")
-    if overlay then return overlay end
-
-    overlay = create("Frame", {
-        Parent = reelGui, Name = "UtilityReelOverlay",
-        Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1,
-        BorderSizePixel = 0, ZIndex = 19,
-    })
-
-    local function makeMarker(name, text, color)
-        return create("TextLabel", {
-            Parent = overlay, Name = name,
-            Size = UDim2.new(0, 14, 0, 14), BackgroundTransparency = 1,
-            Text = text, TextColor3 = color,
-            Font = Enum.Font.Code, TextSize = 14,
-            TextStrokeTransparency = 0.4,
-            TextXAlignment = Enum.TextXAlignment.Center,
-            TextYAlignment = Enum.TextYAlignment.Center,
-            Visible = false, ZIndex = 20,
-        })
+-- Overlay visual (< > ,)
+local function getOrCreateOverlay(rGui)
+    local ov = rGui:FindFirstChild("_UtilityOverlay")
+    if ov then return ov end
+    ov = Instance.new("Frame", rGui)
+    ov.Name="_UtilityOverlay"; ov.Size=UDim2.new(1,0,1,0)
+    ov.BackgroundTransparency=1; ov.BorderSizePixel=0; ov.ZIndex=19
+    local function mkMark(name, text, color)
+        local l=Instance.new("TextLabel", ov); l.Name=name
+        l.Size=UDim2.new(0,14,0,14); l.BackgroundTransparency=1
+        l.Text=text; l.TextColor3=color; l.Font=Enum.Font.Code; l.TextSize=14
+        l.TextStrokeTransparency=0.4; l.TextXAlignment=Enum.TextXAlignment.Center
+        l.TextYAlignment=Enum.TextYAlignment.Center; l.Visible=false; l.ZIndex=20
     end
-
-    makeMarker("Left", "<", Theme.warning)
-    makeMarker("Right", ">", Theme.warning)
-    makeMarker("Fish", ",", Theme.cast)
-    return overlay
+    mkMark("Left","<",Color3.fromRGB(241,192,69))
+    mkMark("Right",">",Color3.fromRGB(241,192,69))
+    mkMark("Fish",",",Color3.fromRGB(80,255,180))
+    return ov
 end
 
-local function hideReelOverlay(reelGui)
-    if not reelGui then return end
-    local overlay = reelGui:FindFirstChild("UtilityReelOverlay")
-    if not overlay then return end
-    for _, ch in ipairs(overlay:GetChildren()) do
-        if ch:IsA("TextLabel") then ch.Visible = false end
-    end
+local function updateOverlay(rGui, pb, fb)
+    if not rGui or not pb or not fb then return end
+    local ov = getOrCreateOverlay(rGui)
+    local l=ov:FindFirstChild("Left"); local r=ov:FindFirstChild("Right"); local f=ov:FindFirstChild("Fish")
+    if not (l and r and f) then return end
+    local bl=pb.AbsolutePosition.X; local br=bl+pb.AbsoluteSize.X
+    local by=pb.AbsolutePosition.Y+pb.AbsoluteSize.Y
+    local fx=fb.AbsolutePosition.X+fb.AbsoluteSize.X*0.5
+    local fy=fb.AbsolutePosition.Y+fb.AbsoluteSize.Y
+    l.Position=UDim2.fromOffset(math.floor(bl-7), math.floor(by+1)); l.Visible=true
+    r.Position=UDim2.fromOffset(math.floor(br-7), math.floor(by+1)); r.Visible=true
+    f.Position=UDim2.fromOffset(math.floor(fx-7), math.floor(fy-1)); f.Visible=true
 end
 
-local function updateReelOverlay(reelGui, pb, fb)
-    local overlay = getOrCreateReelOverlay(reelGui)
-    local l = overlay:FindFirstChild("Left")
-    local r = overlay:FindFirstChild("Right")
-    local f = overlay:FindFirstChild("Fish")
-    if not (l and r and f and pb and fb) then
-        hideReelOverlay(reelGui); return
-    end
-
-    local bl = pb.AbsolutePosition.X
-    local br = pb.AbsolutePosition.X + pb.AbsoluteSize.X
-    local bb = pb.AbsolutePosition.Y + pb.AbsoluteSize.Y
-    local fx = fb.AbsolutePosition.X + fb.AbsoluteSize.X * 0.5
-    local fy = fb.AbsolutePosition.Y + fb.AbsoluteSize.Y
-
-    l.Position = UDim2.fromOffset(math.floor(bl - 7), math.floor(bb + 1))
-    l.Visible = true
-    r.Position = UDim2.fromOffset(math.floor(br - 7), math.floor(bb + 1))
-    r.Visible = true
-    f.Position = UDim2.fromOffset(math.floor(fx - 7), math.floor(fy - 1))
-    f.Visible = true
+local function hideOverlay(rGui)
+    if not rGui then return end
+    local ov=rGui:FindFirstChild("_UtilityOverlay"); if not ov then return end
+    for _,ch in ipairs(ov:GetChildren()) do if ch:IsA("TextLabel") then ch.Visible=false end end
 end
 
--- ════════════════════════════════════════
--- CORE FIX v19: duty-cycle loop
---
--- How it works:
--- 1. Runs every Heartbeat (~16ms)
--- 2. Calculates fish offset from player bar center (-1 to +1)
--- 3. Converts offset to duty cycle (% of time mouse should be down)
--- 4. Within each cycle (45ms), mouse is down for (duty*cycle)ms
--- 5. No switchDelay/oscillation — pure time-based modulation
--- 6. Anti-rebound: if fish crosses center, lock state for 80ms
--- ════════════════════════════════════════
 local function startAutoReel()
-    reelForceRelease()
-    State.runtime.reelActive = false
+    if autoReelThread then task.cancel(autoReelThread); autoReelThread=nil end
+    reelActive=false; reelForceRelease()
 
-    startTask("autoReel", function()
-        local wasActive = false
+    autoReelThread = task.spawn(function()
+        local wasActive    = false
         local sessionStart = 0
-        local sessionDiag
+        local sessionDiag  = nil
+        local cycleStart   = tick()
+        local lastFishSide = 0
+        local reboundUntil = 0
 
-        -- Duty-cycle state
-        local cycleStartTime = tick()
-        local lastFishSide = 0  -- -1 left, 0 center, +1 right
-        local reboundUntil = 0  -- timestamp until which state is locked
+        while autoReelOn do
+            local rGui = findReelUI()
 
-        while State.flags.autoReel do
-            local reelGui = findReelUI()
-
-            if reelGui then
+            if rGui then
+                -- Início de nova sessão
                 if not wasActive then
-                    wasActive = true
-                    sessionStart = tick()
-                    sessionDiag = {
-                        timesFar = 0, timesOvershoots = 0,
-                        timesInside = 0, timesMid = 0,
-                        startTime = tick(),
-                    }
-                    cycleStartTime = tick()
-                    lastFishSide = 0
-                    reboundUntil = 0
+                    wasActive=true; sessionStart=tick(); cycleStart=tick()
+                    lastFishSide=0; reboundUntil=0
+                    sessionDiag={timesFar=0,timesOvershoots=0,timesInside=0,timesMid=0,startTime=tick()}
                 end
 
-                local pb, fb = findReelElements(reelGui)
+                local pb, fb = findReelElements(rGui)
                 if not pb or not fb then
-                    reelForceRelease()
-                    hideReelOverlay(reelGui)
-                    State.runtime.reelActive = false
-                    task.wait(0.05)
+                    reelForceRelease(); hideOverlay(rGui)
+                    reelActive=false; task.wait(0.05)
                 else
-                    State.runtime.reelActive = true
+                    reelActive=true
 
-                    local barLeft = pb.AbsolutePosition.X
-                    local barRight = pb.AbsolutePosition.X + pb.AbsoluteSize.X
-                    local barWidth = math.max(pb.AbsoluteSize.X, 1)
-                    local barCenter = barLeft + barWidth * 0.5
-                    local barY = pb.AbsolutePosition.Y + pb.AbsoluteSize.Y * 0.5
+                    local barL  = pb.AbsolutePosition.X
+                    local barR  = barL + pb.AbsoluteSize.X
+                    local barW  = math.max(pb.AbsoluteSize.X, 1)
+                    local barCX = barL + barW * 0.5
+                    local barCY = pb.AbsolutePosition.Y + pb.AbsoluteSize.Y * 0.5
                     local fishX = fb.AbsolutePosition.X + fb.AbsoluteSize.X * 0.5
 
-                    -- offset: -1 (far left) to +1 (far right), normalized to half barWidth
-                    local rawOffset = (fishX - barCenter) / (barWidth * 0.5)
-                    local offset = clamp(rawOffset, -1.2, 1.2)
-                    local absOffset = math.abs(offset)
-                    local fishInside = fishX >= barLeft and fishX <= barRight
+                    -- Offset normalizado: -1 (esquerda) → +1 (direita)
+                    local rawOffset = (fishX - barCX) / (barW * 0.5)
+                    local offset    = clamp(rawOffset, -1.2, 1.2)
+                    local absOff    = math.abs(offset)
+                    local fishIn    = fishX >= barL and fishX <= barR
 
-                    -- Diagnosis for learning
+                    -- Diagnóstico
                     if sessionDiag then
-                        if fishInside then
-                            sessionDiag.timesInside += 1
-                        elseif absOffset < 0.5 then
-                            sessionDiag.timesMid += 1
-                        else
-                            sessionDiag.timesFar += 1
-                        end
-                        if absOffset > 1.1 then
-                            sessionDiag.timesOvershoots += 1
-                        end
+                        if fishIn then sessionDiag.timesInside = sessionDiag.timesInside + 1
+                        elseif absOff < 0.5 then sessionDiag.timesMid = sessionDiag.timesMid + 1
+                        else sessionDiag.timesFar = sessionDiag.timesFar + 1 end
+                        if absOff > 1.1 then sessionDiag.timesOvershoots = sessionDiag.timesOvershoots + 1 end
                     end
 
-                    updateReelOverlay(reelGui, pb, fb)
+                    updateOverlay(rGui, pb, fb)
 
-                    -- ───────────────────────────────
-                    -- DUTY CYCLE CALCULATION
-                    -- ───────────────────────────────
-                    -- offset = -1 (esquerda total) → duty = 0 (solta 100%)
-                    -- offset = +1 (direita total) → duty = 1 (segura 100%)
-                    -- offset ≈ 0 (centro) → duty ≈ duty_near (equilíbrio)
-                    -- Dead zone: if within dead_zone of center, use exactly duty_near
-
+                    -- ── DUTY CYCLE ──────────────────────────────────────
+                    -- offset > 0 (peixe à direita) → segurar mais
+                    -- offset < 0 (peixe à esquerda) → soltar mais
+                    -- Interpolação suave entre dead_zone / near / mid / far
                     local duty
-                    if absOffset < ReelParams.dead_zone then
-                        -- Dead zone — no agitation
+                    if absOff < ReelParams.dead_zone then
                         duty = ReelParams.duty_near
                     elseif offset > 0 then
-                        -- Fish is right of center → hold more
-                        if absOffset < 0.3 then
-                            -- Near: smooth transition near → mid
-                            duty = ReelParams.duty_near + (ReelParams.duty_mid - ReelParams.duty_near) * (absOffset / 0.3)
-                        elseif absOffset < 0.7 then
-                            -- Mid → far transition
-                            duty = ReelParams.duty_mid + (ReelParams.duty_far - ReelParams.duty_mid) * ((absOffset - 0.3) / 0.4)
+                        if absOff < 0.3 then
+                            duty = ReelParams.duty_near + (ReelParams.duty_mid - ReelParams.duty_near) * (absOff / 0.3)
+                        elseif absOff < 0.7 then
+                            duty = ReelParams.duty_mid + (ReelParams.duty_far - ReelParams.duty_mid) * ((absOff-0.3)/0.4)
                         else
                             duty = ReelParams.duty_far
                         end
                     else
-                        -- Fish is left of center → release more (invert duty)
-                        if absOffset < 0.3 then
-                            duty = ReelParams.duty_near - (ReelParams.duty_mid - ReelParams.duty_near) * (absOffset / 0.3)
-                        elseif absOffset < 0.7 then
-                            duty = (1 - ReelParams.duty_mid) - (ReelParams.duty_far - ReelParams.duty_mid) * ((absOffset - 0.3) / 0.4)
+                        if absOff < 0.3 then
+                            duty = ReelParams.duty_near - (ReelParams.duty_mid - ReelParams.duty_near) * (absOff / 0.3)
+                        elseif absOff < 0.7 then
+                            duty = (1 - ReelParams.duty_mid) - (ReelParams.duty_far - ReelParams.duty_mid) * ((absOff-0.3)/0.4)
                         else
                             duty = 1 - ReelParams.duty_far
                         end
                     end
-
                     duty = clamp(duty, 0, 1)
 
-                    -- ───────────────────────────────
-                    -- ANTI-REBOUND (fix spam direita)
-                    -- ───────────────────────────────
-                    -- If fish just crossed center, lock the desired state
-                    -- for rebound_ms. Prevents oscillation when player bar
-                    -- overshoots and fish appears briefly on the other side.
-                    local fishSide = fishX > barCenter + barWidth * 0.02 and 1
-                        or (fishX < barCenter - barWidth * 0.02 and -1 or 0)
+                    -- ── ANTI-REBOUND ──────────────────────────────────
+                    local fishSide = fishX > barCX + barW*0.02 and 1
+                        or (fishX < barCX - barW*0.02 and -1 or 0)
                     if fishSide ~= 0 and fishSide ~= lastFishSide and lastFishSide ~= 0 then
                         reboundUntil = tick() + (ReelParams.rebound_ms / 1000)
                     end
                     if fishSide ~= 0 then lastFishSide = fishSide end
 
-                    -- ───────────────────────────────
-                    -- DRIVE MOUSE BASED ON DUTY CYCLE
-                    -- ───────────────────────────────
-                    local now = tick()
-                    local cyclePhase = ((now - cycleStartTime) * 1000) % ReelParams.cycle_ms
-                    local holdThreshold = duty * ReelParams.cycle_ms
-                    local shouldHold = cyclePhase < holdThreshold
+                    -- ── DRIVE DO MOUSE ────────────────────────────────
+                    local now       = tick()
+                    local phase     = ((now - cycleStart) * 1000) % ReelParams.cycle_ms
+                    local holdThresh= duty * ReelParams.cycle_ms
+                    local shouldHold= phase < holdThresh
 
-                    -- During rebound: override with whatever state matches fishSide
+                    -- Override durante rebound
                     if now < reboundUntil then
                         if fishSide > 0 then shouldHold = true
                         elseif fishSide < 0 then shouldHold = false end
                     end
 
-                    if shouldHold and not State.runtime.reelMouseHeld then
-                        reelMousePress(barCenter, barY)
-                    elseif not shouldHold and State.runtime.reelMouseHeld then
-                        reelMouseRelease(barCenter, barY)
+                    if shouldHold and not _reelHeld then
+                        reelPress(barCX, barCY)
+                    elseif not shouldHold and _reelHeld then
+                        reelRelease(barCX, barCY)
                     end
 
-                    -- Yield to next frame (Heartbeat = ~16ms @ 60fps)
-                    RunService.Heartbeat:Wait()
+                    RunSvc.Heartbeat:Wait()  -- próximo frame (~16ms) sem task.wait
                 end
+
             else
-                -- No reel UI visible
-                if State.runtime.reelMouseHeld then reelForceRelease() end
-                State.runtime.reelActive = false
-                lastFishSide = 0
-                reboundUntil = 0
+                -- Reel fechou — fim de sessão
+                if _reelHeld then reelForceRelease() end
+                hideOverlay(rGui)
+                reelActive=false
 
                 if wasActive then
-                    wasActive = false
-                    hideReelOverlay(reelGui)
-
-                    -- Detect win/lose
+                    wasActive=false
                     local won, detected = false, false
-                    for _ = 1, 20 do
+                    for _=1,20 do
                         task.wait(0.1)
-                        local found, result = detectRewardGui()
-                        if found then
-                            won = result == "win"
-                            detected = true
-                            break
-                        end
+                        local f, r = detectRewardGui()
+                        if f then won=(r=="win"); detected=true; break end
                     end
-                    if not detected then won = (tick() - sessionStart) > 3.0 end
-
-                    if sessionDiag then
-                        applyLearning(won, sessionDiag)
-                        sessionDiag = nil
+                    if not detected then won=(tick()-sessionStart)>3.0 end
+                    if sessionDiag then applyLearning(won, sessionDiag); sessionDiag=nil end
+                    -- Atualiza status
+                    local w, t = getRecentScore(10)
+                    local trend = (t>0) and (w>=t*0.7 and " ↑" or (w<=t*0.3 and " ↓" or " →")) or ""
+                    if reelStatusLbl then
+                        reelStatusLbl.Text=string.format("Score %d/%d%s • %s",w,t,trend,LearnHistory.lastDiagnosis)
+                        reelStatusLbl.TextColor3=won and Color3.fromRGB(52,211,120) or Color3.fromRGB(240,190,55)
                     end
-
-                    if UI.refs.reelScore then
-                        local wins, total = getRecentScore(10)
-                        local trend = ""
-                        if total > 0 then
-                            if wins >= total * 0.7 then trend = " ↑"
-                            elseif wins <= total * 0.3 then trend = " ↓"
-                            else trend = " →" end
-                        end
-                        UI.refs.reelScore.Text = string.format("Score %d/%d%s • %s", wins, total, trend, LearnHistory.lastDiagnosis)
-                        UI.refs.reelScore.TextColor3 = won and Theme.success or Theme.warning
-                    end
-
                     task.wait(1.5)
                 else
                     task.wait(0.08)
@@ -1019,1386 +838,707 @@ local function startAutoReel()
         end
 
         reelForceRelease()
-        State.runtime.reelActive = false
+        reelActive=false
     end)
 end
 
 local function stopAutoReel()
-    State.flags.autoReel = false
-    State.runtime.reelActive = false
-    reelForceRelease()
-    hideReelOverlay(findReelUI())
-    stopTask("autoReel")
+    autoReelOn=false; reelActive=false; reelForceRelease()
+    hideOverlay(findReelUI())
+    if autoReelThread then task.cancel(autoReelThread); autoReelThread=nil end
 end
 
--- ════════════════════════════════════════
--- SELL / MAPS / NPCs (igual v18)
--- ════════════════════════════════════════
+-- ═══════════════════════════════════════
+-- TREASURE MAPS
+-- ═══════════════════════════════════════
 local function getTreasureMaps()
-    local maps = {}
-    local function scan(cont)
-        if not cont then return end
-        for _, t in ipairs(cont:GetChildren()) do
+    local maps={}
+    local function scan(container)
+        if not container then return end
+        for _,t in ipairs(container:GetChildren()) do
             if t:IsA("Tool") and (t.Name:lower():find("treasure") or t.Name:lower():find("map")) then
-                local x, y, z
-                for _, a in ipairs({ "X", "x", "PosX", "CoordX", "TargetX" }) do
-                    local v = t:GetAttribute(a); if v then x = v; break end
-                end
-                for _, a in ipairs({ "Y", "y", "PosY", "CoordY", "TargetY" }) do
-                    local v = t:GetAttribute(a); if v then y = v; break end
-                end
-                for _, a in ipairs({ "Z", "z", "PosZ", "CoordZ", "TargetZ" }) do
-                    local v = t:GetAttribute(a); if v then z = v; break end
-                end
+                local x,y,z
+                for _,an in ipairs({"X","x","PosX","CoordX","TargetX"}) do local v=t:GetAttribute(an); if v then x=v; break end end
+                for _,an in ipairs({"Y","y","PosY","CoordY","TargetY"}) do local v=t:GetAttribute(an); if v then y=v; break end end
+                for _,an in ipairs({"Z","z","PosZ","CoordZ","TargetZ"}) do local v=t:GetAttribute(an); if v then z=v; break end end
                 if not (x and y and z) then
-                    for _, d in ipairs(t:GetDescendants()) do
-                        if d:IsA("Vector3Value") then
-                            x = d.Value.X; y = d.Value.Y; z = d.Value.Z; break
-                        end
-                        if d:IsA("StringValue") then
-                            local sx, sy, sz = d.Value:match("(%-?%d+)[,%s]+(%-?%d+)[,%s]+(%-?%d+)")
-                            if sx then x = tonumber(sx); y = tonumber(sy); z = tonumber(sz); break end
+                    for _,ch in ipairs(t:GetDescendants()) do
+                        if ch:IsA("Vector3Value") then x=ch.Value.X; y=ch.Value.Y; z=ch.Value.Z; break end
+                        if ch:IsA("StringValue") then
+                            local sx,sy,sz=ch.Value:match("(%-?%d+)[,%s]+(%-?%d+)[,%s]+(%-?%d+)")
+                            if sx then x=tonumber(sx);y=tonumber(sy);z=tonumber(sz); break end
                         end
                     end
                 end
-                if x and y and z then
-                    table.insert(maps, { name = t.Name, pos = Vector3.new(x, y, z), fixed = true, tool = t })
-                else
-                    table.insert(maps, { name = t.Name .. " (não fixado)", pos = nil, fixed = false, tool = t })
-                end
+                if x and y and z then table.insert(maps,{name=t.Name,pos=Vector3.new(x,y,z),fixed=true,tool=t})
+                else table.insert(maps,{name=t.Name.." (não fixado)",pos=nil,fixed=false,tool=t}) end
             end
         end
     end
-    scan(LocalPlayer:FindFirstChild("Backpack"))
-    if heldTool() and (heldTool().Name:lower():find("treasure") or heldTool().Name:lower():find("map")) then
-        scan(LocalPlayer.Character)
-    end
+    scan(LP:FindFirstChild("Backpack"))
+    local hand=tool()
+    if hand and (hand.Name:lower():find("treasure") or hand.Name:lower():find("map")) then scan(LP.Character) end
     return maps
 end
 
+-- ═══════════════════════════════════════
+-- SELL
+-- ═══════════════════════════════════════
 local function trySellTool(t)
-    if not t then return false, "no_tool" end
-    local ev = ReplicatedStorage:FindFirstChild("events")
-        or ReplicatedStorage:FindFirstChild("Events")
-        or ReplicatedStorage:FindFirstChild("Remotes")
-    if ev then
-        for _, n in ipairs({ "sell", "Sell", "appraise", "Appraise", "sellfish", "SellFish", "SellItem", "appraiseFish", "FishSell", "submitFish", "cashIn" }) do
-            local r = ev:FindFirstChild(n)
-            if r then
-                if r:IsA("RemoteEvent") then
-                    pcall(function() r:FireServer(t) end)
-                    return true, "RE:" .. n
-                end
-                if r:IsA("RemoteFunction") then
-                    local ok = pcall(function() r:InvokeServer(t) end)
-                    if ok then return true, "RF:" .. n end
-                end
+    if not t then return false,"no_tool" end
+    local rsEv=RS:FindFirstChild("events") or RS:FindFirstChild("Events") or RS:FindFirstChild("Remotes")
+    if rsEv then
+        for _,n in ipairs({"sell","Sell","appraise","Appraise","sellfish","SellFish","SellItem","appraiseFish","FishSell","submitFish","cashIn"}) do
+            local e=rsEv:FindFirstChild(n)
+            if e then
+                if e:IsA("RemoteEvent") then pcall(function() e:FireServer(t) end); return true,"RE:"..n
+                elseif e:IsA("RemoteFunction") then local ok=pcall(function() return e:InvokeServer(t) end); if ok then return true,"RF:"..n end end
             end
         end
-        for _, r in ipairs(ev:GetDescendants()) do
-            local ln = r.Name:lower()
-            if (ln:find("sell") or ln:find("appraise") or ln:find("submit") or ln:find("cash")) and r:IsA("RemoteEvent") then
-                pcall(function() r:FireServer(t) end)
-                return true, "RE:" .. r.Name
+        for _,e in ipairs(rsEv:GetDescendants()) do
+            local lw=e.Name:lower()
+            if (lw:find("sell") or lw:find("appraise") or lw:find("submit") or lw:find("cash")) and e:IsA("RemoteEvent") then
+                pcall(function() e:FireServer(t) end); return true,"RE:"..e.Name
             end
         end
     end
-    for _, o in ipairs(PlayerGui:GetDescendants()) do
-        if o:IsA("GuiButton") and o.Visible then
-            local ln = o.Name:lower()
-            if ln:find("sell") or ln:find("appraise") or ln:find("submit") then
-                local sz = o.AbsoluteSize
-                if sz.X > 2 and sz.Y > 2 then
-                    pcall(function() o.MouseButton1Click:Fire() end)
-                    return true, "GUI:" .. o.Name
-                end
+    for _,obj in ipairs(PG:GetDescendants()) do
+        if obj:IsA("GuiButton") and obj.Visible then
+            local n=obj.Name:lower()
+            if n:find("sell") or n:find("appraise") or n:find("submit") then
+                local sz=obj.AbsoluteSize; if sz.X>2 and sz.Y>2 then pcall(function() obj.MouseButton1Click:Fire() end); return true,"GUI:"..obj.Name end
             end
         end
     end
-    pcall(function() t:Activate() end)
-    return false, "no_method"
+    pcall(function() t:Activate() end); return false,"no_method"
 end
 
-local function sellFromHand()
-    local t = heldTool()
-    if not t then return false, "No item in hand" end
-    return trySellTool(t)
-end
+local function sellFromHand() local t=tool(); if not t then return false,"No item in hand" end; return trySellTool(t) end
 
 local function sellAll()
-    local sold, failed = 0, 0
-    local items = {}
-    local bp = LocalPlayer:FindFirstChild("Backpack")
-    if bp then
-        for _, t in ipairs(bp:GetChildren()) do
-            if t:IsA("Tool") and not (t.Name:lower():find("treasure") or t.Name:lower():find("map")) then
-                table.insert(items, t)
-            end
-        end
-    end
-    local t = heldTool()
-    if t and not (t.Name:lower():find("treasure") or t.Name:lower():find("map")) then
-        table.insert(items, t)
-    end
-    for _, i in ipairs(items) do
-        local ok = trySellTool(i)
-        if ok then sold += 1 else failed += 1 end
-        task.wait(0.15)
-    end
-    if sold == 0 and failed == 0 then return false, "Inventory empty" end
-    return true, "Sold " .. sold .. (failed > 0 and (" | Failed " .. failed) or "")
+    local sold,failed=0,0; local items={}
+    local bp=LP:FindFirstChild("Backpack")
+    if bp then for _,t in ipairs(bp:GetChildren()) do
+        if t:IsA("Tool") and not (t.Name:lower():find("treasure") or t.Name:lower():find("map")) then table.insert(items,t) end
+    end end
+    local hand=tool(); if hand and not (hand.Name:lower():find("treasure") or hand.Name:lower():find("map")) then table.insert(items,hand) end
+    for _,t in ipairs(items) do local ok=trySellTool(t); if ok then sold=sold+1 else failed=failed+1 end; task.wait(0.15) end
+    if sold==0 and failed==0 then return false,"Inventory empty" end
+    return true,"Sold "..sold..(failed>0 and " | Failed "..failed or "")
 end
 
-local function startAutoSell()
-    startTask("autoSell", function()
-        while State.flags.autoSell do
-            local ok, msg = sellAll()
-            setStatus(UI.refs.autoSellStatus, (ok and "✅ " or "⏳ ") .. msg, ok and Theme.success or Theme.warning)
-            task.wait(State.values.autoSellDelay)
+local function startAutoSell(lbl)
+    if autoSellThread then task.cancel(autoSellThread); autoSellThread=nil end
+    autoSellThread=task.spawn(function()
+        while autoSellOn do
+            local ok,msg=sellAll()
+            if lbl then lbl.TextColor3=ok and Color3.fromRGB(52,211,120) or Color3.fromRGB(240,190,55); lbl.Text=(ok and "✅ " or "⏳ ")..msg end
+            task.wait(autoSellDelay)
         end
-        setStatus(UI.refs.autoSellStatus, "Auto-sell off", Theme.muted)
+        if lbl then lbl.Text="Auto-sell off" end
     end)
 end
+local function stopAutoSell() autoSellOn=false; if autoSellThread then task.cancel(autoSellThread); autoSellThread=nil end end
 
-local function stopAutoSell() stopTask("autoSell") end
+local function tpTo(pos) local r=hrp(); if not r then return false end; r.CFrame=CFrame.new(pos+Vector3.new(0,5,0)); return true end
 
-local function getNearbyNPCs()
-    local r = rootPart()
-    if not r then return {} end
-    local res = {}
-    for _, o in ipairs(workspace:GetDescendants()) do
-        if o:IsA("Model") and o ~= LocalPlayer.Character then
-            local h = o:FindFirstChildOfClass("Humanoid")
-            local p = o:FindFirstChild("HumanoidRootPart") or o:FindFirstChildOfClass("BasePart")
-            if h and p then
-                local d = (r.Position - p.Position).Magnitude
-                if d <= State.values.npcRange then
-                    table.insert(res, { name = o.Name, part = p, dist = math.floor(d) })
-                end
-            end
+local function getNearby()
+    local r=hrp(); if not r then return {} end; local found={}
+    for _,obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") and obj~=LP.Character then
+            local h2=obj:FindFirstChildOfClass("Humanoid"); local part=obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChildOfClass("BasePart")
+            if h2 and part then local d=(r.Position-part.Position).Magnitude; if d<=npcRange then table.insert(found,{name=obj.Name,part=part,dist=math.floor(d)}) end end
         end
     end
-    table.sort(res, function(a, b) return a.dist < b.dist end)
-    return res
+    table.sort(found,function(a,b) return a.dist<b.dist end); return found
 end
+local function tpToNPC(part) local r=hrp(); if not r then return end; r.CFrame=CFrame.new((part.CFrame*CFrame.new(0,0,-3.5)).Position+Vector3.new(0,3,0)) end
 
-local function teleportToNPC(part)
-    local r = rootPart()
-    if not r then return end
-    r.CFrame = CFrame.new((part.CFrame * CFrame.new(0, 0, -3.5)).Position + Vector3.new(0, 3, 0))
-end
-
-local function createRipple(btn, color)
-    local r = create("Frame", {
-        Parent = btn, AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = UDim2.new(0.5, 0, 0.5, 0), Size = UDim2.new(0, 0, 0, 0),
-        BackgroundColor3 = color or Color3.new(1, 1, 1),
-        BackgroundTransparency = 0.68, BorderSizePixel = 0,
-        ZIndex = btn.ZIndex + 1,
-    })
-    addCorner(r, 999)
-    local sz = math.max(btn.AbsoluteSize.X, btn.AbsoluteSize.Y) * 2.2
-    local tw = TweenService:Create(r, TweenInfo.new(0.42, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-        Size = UDim2.new(0, sz, 0, sz), BackgroundTransparency = 1,
-    })
-    tw:Play()
-    tw.Completed:Connect(function() r:Destroy() end)
-end
-
-local function makeCard(parent, order, alt)
-    local c = create("Frame", {
-        Parent = parent, LayoutOrder = order,
-        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
-        BackgroundColor3 = alt and Theme.surfaceAlt or Theme.surface,
-        BorderSizePixel = 0,
-    })
-    addCorner(c, 10)
-    addStroke(c, Theme.border, 1, 0.12)
-    addPadding(c, 8, 8, 7, 7)
-    create("UIListLayout", {
-        Parent = c, SortOrder = Enum.SortOrder.LayoutOrder,
-        Padding = UDim.new(0, 4),
-    })
-    return c
-end
-
-local function makeDivider(parent, order)
-    return create("Frame", {
-        Parent = parent, LayoutOrder = order,
-        Size = UDim2.new(1, 0, 0, 1),
-        BackgroundColor3 = Theme.border, BorderSizePixel = 0,
-    })
-end
-
-local function makeToggle(tParent, activeColor)
-    local track = create("Frame", {
-        Parent = tParent, Size = UDim2.new(0, 36, 0, 18),
-        BackgroundColor3 = Color3.fromRGB(24, 31, 55), BorderSizePixel = 0,
-    })
-    addCorner(track, 9)
-    addStroke(track, Theme.border, 1)
-    local knob = create("Frame", {
-        Parent = track, Size = UDim2.new(0, 12, 0, 12),
-        Position = UDim2.new(0, 3, 0.5, -6),
-        BackgroundColor3 = Color3.fromRGB(241, 245, 255),
-        BorderSizePixel = 0,
-    })
-    addCorner(knob, 999)
-    local hit = create("TextButton", {
-        Parent = track, Size = UDim2.new(1, 0, 1, 0),
-        BackgroundTransparency = 1, Text = "",
-        AutoButtonColor = false, ZIndex = 4,
-    })
-    local function setState(on)
-        tween(track, { BackgroundColor3 = on and activeColor or Color3.fromRGB(24, 31, 55) }, 0.16)
-        spring(knob, { Position = on and UDim2.new(0, 21, 0.5, -6) or UDim2.new(0, 3, 0.5, -6) })
-    end
-    return { track = track, knob = knob, hit = hit, set = setState }
-end
-
-local function makeSlider(parent, label, mn, mx, def, color, onChanged, order)
-    local val = create("TextLabel", {
-        Parent = parent, LayoutOrder = order,
-        Size = UDim2.new(1, 0, 0, 11),
-        BackgroundTransparency = 1,
-        Text = label .. ": " .. def, TextColor3 = color,
-        Font = Enum.Font.GothamBold, TextSize = 8,
-        TextXAlignment = Enum.TextXAlignment.Left,
-    })
-    local wrap = create("Frame", {
-        Parent = parent, LayoutOrder = order + 1,
-        Size = UDim2.new(1, 0, 0, 12), BackgroundTransparency = 1,
-    })
-    local bar = create("Frame", {
-        Parent = wrap, Size = UDim2.new(1, 0, 0, 4),
-        Position = UDim2.new(0, 0, 0.5, -2),
-        BackgroundColor3 = Color3.fromRGB(22, 28, 49),
-        BorderSizePixel = 0,
-    })
-    addCorner(bar, 3)
-    local pct = (def - mn) / (mx - mn)
-    local fill = create("Frame", {
-        Parent = bar, Size = UDim2.new(pct, 0, 1, 0),
-        BackgroundColor3 = color, BorderSizePixel = 0,
-    })
-    addCorner(fill, 3)
-    local knob = create("Frame", {
-        Parent = bar, AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = UDim2.new(pct, 0, 0.5, 0), Size = UDim2.new(0, 10, 0, 10),
-        BackgroundColor3 = Color3.fromRGB(247, 250, 255), BorderSizePixel = 0,
-    })
-    addCorner(knob, 999)
-    local hit = create("TextButton", {
-        Parent = bar, Size = UDim2.new(1, 0, 0, 18),
-        Position = UDim2.new(0, 0, 0.5, -9),
-        BackgroundTransparency = 1, Text = "",
-        AutoButtonColor = false, ZIndex = 4,
-    })
-    local dragging = false
-    local function apply(sx)
-        local p = clamp((sx - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1), 0, 1)
-        local v = math.floor(mn + p * (mx - mn) + 0.5)
-        fill.Size = UDim2.new(p, 0, 1, 0)
-        knob.Position = UDim2.new(p, 0, 0.5, 0)
-        val.Text = label .. ": " .. v
-        if onChanged then onChanged(v) end
-    end
-    hit.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = true; apply(i.Position.X) end end)
-    hit.InputEnded:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end end)
-    UserInputService.InputChanged:Connect(function(i)
-        if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then apply(i.Position.X) end
-    end)
-    return { label = val }
-end
-
-local function makeBindRow(parent, kc, order)
-    local r = create("Frame", {
-        Parent = parent, LayoutOrder = order,
-        Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1,
-    })
-    create("TextLabel", {
-        Parent = r, Size = UDim2.new(0, 32, 1, 0),
-        BackgroundTransparency = 1, Text = "Key:",
-        TextColor3 = Theme.muted, Font = Enum.Font.Gotham,
-        TextSize = 8, TextXAlignment = Enum.TextXAlignment.Left,
-    })
-    local b = create("TextButton", {
-        Parent = r, Size = UDim2.new(0, 54, 0, 16),
-        Position = UDim2.new(0, 32, 0.5, -8),
-        BackgroundColor3 = Color3.fromRGB(20, 25, 47),
-        BorderSizePixel = 0, Text = kc.Name,
-        TextColor3 = Theme.accent, Font = Enum.Font.GothamBold,
-        TextSize = 8, AutoButtonColor = false,
-    })
-    addCorner(b, 5)
-    addStroke(b, Theme.accentSoft, 1)
-    return b
-end
-
-local function makeSearchBox(parent, placeholder, order)
-    local wrap = create("Frame", {
-        Parent = parent, LayoutOrder = order,
-        Size = UDim2.new(1, 0, 0, 24),
-        BackgroundColor3 = Theme.surfaceAlt, BorderSizePixel = 0,
-    })
-    addCorner(wrap, 8)
-    addStroke(wrap, Theme.border, 1)
-    addPadding(wrap, 8, 8, 0, 0)
-    create("TextLabel", {
-        Parent = wrap, Size = UDim2.new(0, 16, 1, 0),
-        BackgroundTransparency = 1, Text = "⌕",
-        TextColor3 = Theme.muted, Font = Enum.Font.GothamBold,
-        TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
-    })
-    local box = create("TextBox", {
-        Parent = wrap, Size = UDim2.new(1, -24, 1, 0),
-        Position = UDim2.new(0, 18, 0, 0),
-        BackgroundTransparency = 1, PlaceholderText = placeholder,
-        Text = "", TextColor3 = Theme.text, PlaceholderColor3 = Theme.muted,
-        Font = Enum.Font.Gotham, TextSize = 9,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        ClearTextOnFocus = false,
-    })
-    return box
-end
-
-local function makeActionButton(parent, order, text, bg, tc)
-    local b = create("TextButton", {
-        Parent = parent, LayoutOrder = order,
-        Size = UDim2.new(1, 0, 0, 24),
-        BackgroundColor3 = bg, BorderSizePixel = 0,
-        Text = text, TextColor3 = tc,
-        Font = Enum.Font.GothamBold, TextSize = 9,
-        AutoButtonColor = false,
-    })
-    addCorner(b, 7)
-    addStroke(b, Theme.border, 1)
-    return b
-end
-
-local function makeStatusLabel(parent, order, fontSize, color)
-    return create("TextLabel", {
-        Parent = parent, LayoutOrder = order,
-        Size = UDim2.new(1, 0, 0, 12),
-        BackgroundTransparency = 1, Text = "",
-        TextColor3 = color or Theme.muted,
-        Font = Enum.Font.Code, TextSize = fontSize or 8,
-        TextXAlignment = Enum.TextXAlignment.Left,
-    })
-end
-
-local function makeToggleSection(parent, opts)
-    local section = makeCard(parent, opts.order, opts.alt)
-    local row = create("Frame", {
-        Parent = section, LayoutOrder = 1,
-        Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1,
-    })
-    local label = create("TextLabel", {
-        Parent = row, Size = UDim2.new(1, -60, 1, 0),
-        BackgroundTransparency = 1,
-        Text = string.format("%s  %s", opts.icon, opts.label),
-        TextColor3 = Theme.subtext, Font = Enum.Font.GothamBold,
-        TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left,
-    })
-    local toggle = makeToggle(row, opts.toggleColor or Theme.accent)
-    toggle.track.Position = UDim2.new(1, -36, 0.5, -9)
-    toggle.hit.MouseButton1Click:Connect(function() createRipple(toggle.track, opts.toggleColor or Theme.accent) end)
-
-    local bindButton = makeBindRow(section, opts.keyCode, 2)
-    local status = opts.showStatus and makeStatusLabel(section, 3, 8, Theme.muted) or nil
-    local status2 = opts.showStatus2 and makeStatusLabel(section, 4, 7, Theme.purple) or nil
-    local lastOrder = opts.showStatus2 and 4 or (opts.showStatus and 3 or 2)
-
-    if opts.slider then
-        makeSlider(section, opts.slider.label, opts.slider.min, opts.slider.max,
-            opts.slider.value, opts.slider.color or Theme.accent,
-            opts.slider.onChanged, lastOrder + 1)
-        lastOrder += 2
-    end
-
-    local extraToggle
-    if opts.extraToggle then
-        local er = create("Frame", {
-            Parent = section, LayoutOrder = lastOrder + 1,
-            Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1,
-        })
-        create("TextLabel", {
-            Parent = er, Size = UDim2.new(1, -60, 1, 0),
-            BackgroundTransparency = 1, Text = opts.extraToggle.label,
-            TextColor3 = Theme.subtext, Font = Enum.Font.GothamBold,
-            TextSize = 8, TextXAlignment = Enum.TextXAlignment.Left,
-        })
-        extraToggle = makeToggle(er, opts.extraToggle.color or Theme.accent)
-        extraToggle.track.Position = UDim2.new(1, -36, 0.5, -9)
-        extraToggle.hit.MouseButton1Click:Connect(function() createRipple(extraToggle.track, opts.extraToggle.color or Theme.accent) end)
-    end
-
-    local function setEnabled(on)
-        toggle.set(on)
-        tween(label, { TextColor3 = on and Theme.text or Theme.subtext }, 0.14)
-    end
-    local function setExtraEnabled(on) if extraToggle then extraToggle.set(on) end end
-
-    return {
-        section = section, label = label, bindButton = bindButton,
-        status = status, status2 = status2,
-        toggleButton = toggle.hit,
-        extraToggleButton = extraToggle and extraToggle.hit or nil,
-        setEnabled = setEnabled, setExtraEnabled = setExtraEnabled,
-    }
-end
-
-local function refreshFrameSize()
-    if not UI.refs.frame or not State.runtime.guiVisible then return end
-    task.wait()
-    UI.refs.frame.Size = UDim2.new(0, GUI_WIDTH, 0, HEADER_HEIGHT + UI.refs.rootLayout.AbsoluteContentSize.Y)
-end
-
-local function switchTab(name)
-    State.runtime.currentTab = name
-    for n, p in pairs(UI.pages) do p.Visible = n == name end
-    for n, b in pairs(UI.tabs) do
-        tween(b, {
-            BackgroundColor3 = n == name and Theme.accent or Theme.surfaceAlt,
-            TextColor3 = n == name and Theme.shell or Theme.muted,
-        }, 0.16)
-    end
-    refreshFrameSize()
-end
-
-local function setGuiVisible(v)
-    if State.runtime.guiAnimating or State.runtime.guiVisible == v then return end
-    State.runtime.guiAnimating = true
-    State.runtime.guiVisible = v
-    if v then
-        UI.refs.content.Visible = true
-        task.wait()
-        tween(UI.refs.frame, {
-            Size = UDim2.new(0, GUI_WIDTH, 0, HEADER_HEIGHT + UI.refs.rootLayout.AbsoluteContentSize.Y),
-            BackgroundTransparency = 0,
-        }, 0.2)
-        tween(UI.refs.hideHint, { TextColor3 = Theme.muted }, 0.15)
-        task.delay(0.24, function() State.runtime.guiAnimating = false end)
-    else
-        local sh = tween(UI.refs.frame, { Size = UDim2.new(0, GUI_WIDTH, 0, HEADER_HEIGHT) }, 0.18)
-        tween(UI.refs.hideHint, { TextColor3 = Theme.accent }, 0.15)
-        sh.Completed:Connect(function()
-            if not State.runtime.guiVisible then UI.refs.content.Visible = false end
-            task.delay(0.04, function() State.runtime.guiAnimating = false end)
-        end)
-    end
-end
-
-local function setupBind(button, id, getKey, setKey)
-    button.MouseButton1Click:Connect(function()
-        if State.runtime.listening then return end
-        State.runtime.listening = id
-        button.Text = "..."
-        tween(button, { TextColor3 = Theme.warning }, 0.12)
-        local conn
-        conn = UserInputService.InputBegan:Connect(function(inp)
-            if inp.UserInputType ~= Enum.UserInputType.Keyboard then return end
-            if inp.KeyCode == Enum.KeyCode.Escape then
-                button.Text = getKey().Name
-                tween(button, { TextColor3 = Theme.accent }, 0.12)
-                State.runtime.listening = nil
-                conn:Disconnect()
-                return
-            end
-            if BLOCKED_KEYS[inp.KeyCode] then
-                button.Text = "invalid!"
-                tween(button, { TextColor3 = Theme.danger }, 0.12)
-                task.wait(0.8)
-                button.Text = getKey().Name
-                tween(button, { TextColor3 = Theme.accent }, 0.12)
-                State.runtime.listening = nil
-                conn:Disconnect()
-                return
-            end
-            setKey(inp.KeyCode)
-            button.Text = inp.KeyCode.Name
-            tween(button, { TextColor3 = Theme.accent }, 0.12)
-            State.runtime.listening = nil
-            conn:Disconnect()
-        end)
-    end)
-end
-
-local function updateLearningPanel()
-    if not UI.refs.learnScore then return end
-    local wins, total = getRecentScore(10)
-    local trend = ""
-    if total > 0 then
-        local r = wins / total
-        if r >= 0.7 then trend = " ↑"
-        elseif r <= 0.3 then trend = " ↓"
-        else trend = " →" end
-    end
-    UI.refs.learnScore.Text = string.format("Score: %d/%d%s  |  ✅%d  ❌%d  |  adj:%d",
-        wins, total, trend, LearnHistory.totalWins, LearnHistory.totalLosses, LearnHistory.adjustCount)
-    if total > 0 then
-        local r = wins / total
-        UI.refs.learnScore.TextColor3 = r >= 0.6 and Theme.success or (r <= 0.3 and Theme.danger or Theme.warning)
-    else
-        UI.refs.learnScore.TextColor3 = Theme.warning
-    end
-    UI.refs.learnDiag.Text = "Último: " .. LearnHistory.lastDiagnosis
-    UI.refs.learnParams.Text = string.format("⚙ far %.2f  mid %.2f  near %.2f | cycle %dms",
-        ReelParams.duty_far, ReelParams.duty_mid, ReelParams.duty_near, ReelParams.cycle_ms)
-end
-
-local function toggleNoclip()
-    setNoclip(not State.flags.noclip)
-    UI.refs.noclip.setEnabled(State.flags.noclip)
-    if UI.refs.frameStroke then
-        tween(UI.refs.frameStroke, { Color = State.flags.noclip and Theme.success or Theme.border }, 0.16)
-    end
-    updateActivityDot()
-end
-
-local function toggleSpeed()
-    State.flags.speed = not State.flags.speed
-    UI.refs.speed.setEnabled(State.flags.speed)
-    if State.flags.speed then applySpeedOnce(); startSpeedLoop() else stopSpeedLoop() end
-    updateActivityDot()
-end
-
-local function toggleJump()
-    State.flags.jump = not State.flags.jump
-    UI.refs.jump.setEnabled(State.flags.jump)
-    if State.flags.jump then
-        startJumpLoop()
-    else
-        stopJumpLoop()
-        State.flags.rejump = false
-        UI.refs.jump.setExtraEnabled(false)
-        stopRejumpLoop()
-    end
-    updateActivityDot()
-end
-
-local function toggleRejump()
-    if not State.flags.jump then return end
-    State.flags.rejump = not State.flags.rejump
-    UI.refs.jump.setExtraEnabled(State.flags.rejump)
-    if State.flags.rejump then startRejumpLoop() else stopRejumpLoop() end
-end
-
-local function toggleCast()
-    if State.flags.cast then
-        stopCast()
-        UI.refs.cast.setEnabled(false)
-        setStatus(UI.refs.cast.status, "", Theme.muted)
-    else
-        State.flags.cast = true
-        UI.refs.cast.setEnabled(true)
-        startCast()
-    end
-    updateActivityDot()
-end
-
-local function toggleShake()
-    State.flags.shake = not State.flags.shake
-    UI.refs.shake.setEnabled(State.flags.shake)
-    if State.flags.shake then startShake() else stopShake() end
-    updateActivityDot()
-end
-
-local function toggleAutoReel()
-    State.flags.autoReel = not State.flags.autoReel
-    UI.refs.reel.setEnabled(State.flags.autoReel)
-    if State.flags.autoReel then startAutoReel() else stopAutoReel() end
-    updateActivityDot()
-end
-
-local function toggleAutoSell()
-    State.flags.autoSell = not State.flags.autoSell
-    UI.refs.autoSell.toggle.set(State.flags.autoSell)
-    tween(UI.refs.autoSell.label, { TextColor3 = State.flags.autoSell and Theme.text or Theme.subtext }, 0.14)
-    if State.flags.autoSell then
-        startAutoSell()
-    else
-        stopAutoSell()
-        setStatus(UI.refs.autoSellStatus, "Auto-sell off", Theme.muted)
-    end
-    updateActivityDot()
-end
-
-local function flashAction(btn, base, pulse)
-    createRipple(btn, pulse)
-    tween(btn, { BackgroundColor3 = pulse }, 0.08)
-    task.delay(0.12, function() tween(btn, { BackgroundColor3 = base }, 0.15) end)
-end
-
-local function runSellInHand()
-    task.spawn(function()
-        flashAction(UI.refs.sellButton, Theme.sell, Theme.sellHover)
-        local ok, m = sellFromHand()
-        setStatus(UI.refs.sellStatus, (ok and "✅ " or "❌ ") .. m, ok and Theme.success or Theme.danger)
-        task.wait(3)
-        setStatus(UI.refs.sellStatus, "Waiting...", Theme.muted)
-    end)
-end
-
-local function runSellAll()
-    task.spawn(function()
-        flashAction(UI.refs.sellAllButton, Color3.fromRGB(16, 57, 35), Theme.sellHover)
-        local ok, m = sellAll()
-        setStatus(UI.refs.sellStatus, (ok and "✅ " or "❌ ") .. m, ok and Theme.success or Theme.danger)
-        task.wait(3)
-        setStatus(UI.refs.sellStatus, "Waiting...", Theme.muted)
-    end)
-end
-
-local function renderTeleportList()
-    local holder = UI.refs.tpList
-    if not holder then return end
-    for _, c in ipairs(holder:GetChildren()) do
-        if not c:IsA("UIListLayout") then c:Destroy() end
-    end
-    local q = (UI.search.tp and UI.search.tp.Text or ""):lower()
-    local lo = 1
-    for _, isl in ipairs(ISLANDS) do
-        if q == "" or isl.name:lower():find(q, 1, true) then
-            local tc, bc, hc = Theme.subtext, Theme.surface, Theme.surfaceHover
-            if isl.cat == "second" then
-                tc, bc, hc = Theme.cyan, Color3.fromRGB(14, 35, 46), Color3.fromRGB(18, 49, 63)
-            elseif isl.cat == "deep" then
-                tc, bc, hc = Color3.fromRGB(255, 132, 184), Color3.fromRGB(40, 16, 35), Color3.fromRGB(57, 23, 49)
-            end
-            local b = makeActionButton(holder, lo, "📍  " .. isl.name, bc, tc)
-            b.TextXAlignment = Enum.TextXAlignment.Left
-            addPadding(b, 10, 10, 0, 0)
-            b.MouseEnter:Connect(function() tween(b, { BackgroundColor3 = hc, TextColor3 = Theme.text }, 0.15) end)
-            b.MouseLeave:Connect(function() tween(b, { BackgroundColor3 = bc, TextColor3 = tc }, 0.15) end)
-            b.MouseButton1Click:Connect(function()
-                createRipple(b, tc)
-                local ok = teleportTo(isl.pos)
-                setStatus(UI.refs.tpStatus, (ok and "✅ " or "❌ ") .. isl.name, ok and Theme.success or Theme.danger)
-                task.delay(3, function() setStatus(UI.refs.tpStatus, "", Theme.success) end)
-            end)
-            lo += 1
-        end
-    end
-    if lo == 1 then
-        create("TextLabel", {
-            Parent = holder, LayoutOrder = 1,
-            Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1,
-            Text = "Nada encontrado", TextColor3 = Theme.muted,
-            Font = Enum.Font.Gotham, TextSize = 9,
-            TextXAlignment = Enum.TextXAlignment.Center,
-        })
-    end
-end
-
-local function renderRodList()
-    local holder = UI.refs.rodList
-    if not holder then return end
-    for _, c in ipairs(holder:GetChildren()) do
-        if not c:IsA("UIListLayout") then c:Destroy() end
-    end
-    local q = (UI.search.rods and UI.search.rods.Text or ""):lower()
-    local lo = 1
-    for _, rod in ipairs(RODS) do
-        local s = (rod.name .. " " .. rod.loc):lower()
-        if q == "" or s:find(q, 1, true) then
-            local b = create("TextButton", {
-                Parent = holder, LayoutOrder = lo,
-                Size = UDim2.new(1, 0, 0, 38),
-                BackgroundColor3 = Theme.surface, BorderSizePixel = 0,
-                Text = "", AutoButtonColor = false,
-            })
-            addCorner(b, 10)
-            addStroke(b, Theme.border, 1)
-            addPadding(b, 10, 10, 4, 4)
-            create("TextLabel", {
-                Parent = b, Size = UDim2.new(1, 0, 0, 14),
-                BackgroundTransparency = 1,
-                Text = "🎣  " .. rod.name,
-                TextColor3 = Theme.cyan, Font = Enum.Font.GothamBold,
-                TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
-            })
-            create("TextLabel", {
-                Parent = b, Position = UDim2.new(0, 0, 0, 16),
-                Size = UDim2.new(1, 0, 0, 12),
-                BackgroundTransparency = 1, Text = rod.loc,
-                TextColor3 = Theme.muted, Font = Enum.Font.Gotham,
-                TextSize = 8, TextXAlignment = Enum.TextXAlignment.Left,
-            })
-            b.MouseEnter:Connect(function() tween(b, { BackgroundColor3 = Theme.surfaceHover }, 0.15) end)
-            b.MouseLeave:Connect(function() tween(b, { BackgroundColor3 = Theme.surface }, 0.15) end)
-            b.MouseButton1Click:Connect(function()
-                createRipple(b, Theme.cyan)
-                local ok = teleportTo(rod.pos)
-                setStatus(UI.refs.rodStatus, (ok and "✅ TP -> " or "❌ ") .. rod.name, ok and Theme.success or Theme.danger)
-                task.delay(3, function() setStatus(UI.refs.rodStatus, "", Theme.success) end)
-            end)
-            lo += 1
-        end
-    end
-    if lo == 1 then
-        create("TextLabel", {
-            Parent = holder, LayoutOrder = 1,
-            Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1,
-            Text = "Nada encontrado", TextColor3 = Theme.muted,
-            Font = Enum.Font.Gotham, TextSize = 9,
-            TextXAlignment = Enum.TextXAlignment.Center,
-        })
-    end
-end
-
-local function refreshMaps()
-    local holder = UI.refs.mapList
-    if not holder then return end
-    for _, c in ipairs(holder:GetChildren()) do
-        if not c:IsA("UIListLayout") then c:Destroy() end
-    end
-    local maps = getTreasureMaps()
-    if #maps == 0 then
-        create("TextLabel", {
-            Parent = holder, LayoutOrder = 1,
-            Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1,
-            Text = "Nenhum mapa no inventário",
-            TextColor3 = Theme.muted, Font = Enum.Font.Gotham,
-            TextSize = 9, TextXAlignment = Enum.TextXAlignment.Center,
-        })
-        refreshFrameSize()
-        return
-    end
-    for i, m in ipairs(maps) do
-        local b = create("TextButton", {
-            Parent = holder, LayoutOrder = i,
-            Size = UDim2.new(1, 0, 0, 34),
-            BackgroundColor3 = m.fixed and Theme.surface or Color3.fromRGB(48, 38, 22),
-            BorderSizePixel = 0, Text = "", AutoButtonColor = false,
-        })
-        addCorner(b, 8)
-        addStroke(b, Theme.border, 1)
-        addPadding(b, 10, 10, 4, 4)
-        create("TextLabel", {
-            Parent = b, Size = UDim2.new(1, 0, 0, 12),
-            BackgroundTransparency = 1,
-            Text = (m.fixed and "📜  " or "❔  ") .. m.name,
-            TextColor3 = m.fixed and Theme.gold or Theme.warning,
-            Font = Enum.Font.GothamBold, TextSize = 9,
-            TextXAlignment = Enum.TextXAlignment.Left,
-        })
-        create("TextLabel", {
-            Parent = b, Position = UDim2.new(0, 0, 0, 14),
-            Size = UDim2.new(1, 0, 0, 11),
-            BackgroundTransparency = 1,
-            Text = m.fixed and string.format("X=%d  Y=%d  Z=%d", m.pos.X, m.pos.Y, m.pos.Z)
-                or "→ leve no Jack Marrow para fixar",
-            TextColor3 = m.fixed and Theme.cyan or Theme.muted,
-            Font = Enum.Font.Code, TextSize = 8,
-            TextXAlignment = Enum.TextXAlignment.Left,
-        })
-        if m.fixed then
-            b.MouseEnter:Connect(function() tween(b, { BackgroundColor3 = Theme.surfaceHover }, 0.15) end)
-            b.MouseLeave:Connect(function() tween(b, { BackgroundColor3 = Theme.surface }, 0.15) end)
-            b.MouseButton1Click:Connect(function()
-                createRipple(b, Theme.gold)
-                teleportTo(m.pos)
-            end)
-        end
-    end
-    refreshFrameSize()
-end
-
-local function rebuildNPCs()
-    local holder = UI.refs.npcList
-    if not holder then return end
-    for _, c in ipairs(holder:GetChildren()) do
-        if not c:IsA("UIListLayout") then c:Destroy() end
-    end
-    local npcs = getNearbyNPCs()
-    if #npcs == 0 then
-        create("TextLabel", {
-            Parent = holder, LayoutOrder = 1,
-            Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1,
-            Text = "No NPCs within " .. State.values.npcRange .. " studs",
-            TextColor3 = Theme.muted, Font = Enum.Font.Gotham,
-            TextSize = 9, TextXAlignment = Enum.TextXAlignment.Center,
-        })
-        return
-    end
-    for i, npc in ipairs(npcs) do
-        local b = makeActionButton(holder, i, "🧑  " .. npc.name .. "  (" .. npc.dist .. " st)", Theme.surface, Theme.subtext)
-        b.TextXAlignment = Enum.TextXAlignment.Left
-        addPadding(b, 10, 10, 0, 0)
-        b.MouseEnter:Connect(function() tween(b, { BackgroundColor3 = Theme.surfaceHover, TextColor3 = Theme.text }, 0.15) end)
-        b.MouseLeave:Connect(function() tween(b, { BackgroundColor3 = Theme.surface, TextColor3 = Theme.subtext }, 0.15) end)
-        b.MouseButton1Click:Connect(function()
-            createRipple(b, Theme.accent)
-            teleportToNPC(npc.part)
-            task.delay(0.8, rebuildNPCs)
-        end)
-    end
-end
-
-loadLearnData()
-
-pcall(function()
-    for _, n in ipairs({ "UtilityGui", "NoclipGui" }) do
-        local e = PlayerGui:FindFirstChild(n)
-        if e then e:Destroy() end
-    end
-end)
-
-local gui = create("ScreenGui", {
-    Parent = PlayerGui, Name = "UtilityGui",
-    ResetOnSpawn = false, DisplayOrder = 999, IgnoreGuiInset = true,
-})
-
-local frame = create("Frame", {
-    Parent = gui, Size = UDim2.new(0, GUI_WIDTH, 0, HEADER_HEIGHT),
-    Position = UDim2.new(0, -GUI_WIDTH, 0.5, WINDOW_Y_OFFSET),
-    BackgroundColor3 = Theme.shell, BackgroundTransparency = 1,
-    BorderSizePixel = 0, ClipsDescendants = true,
-})
-addCorner(frame, 14)
-addGradient(frame, 90, {
-    ColorSequenceKeypoint.new(0, Color3.fromRGB(10, 14, 24)),
-    ColorSequenceKeypoint.new(1, Theme.shell),
-})
-local frameStroke = addStroke(frame, Theme.border, 1.5, 0.06)
-
-local header = create("Frame", {
-    Parent = frame, Size = UDim2.new(1, 0, 0, HEADER_HEIGHT),
-    BackgroundColor3 = Theme.panel, BorderSizePixel = 0, ZIndex = 2,
-})
-addGradient(header, 90, {
-    ColorSequenceKeypoint.new(0, Color3.fromRGB(18, 25, 54)),
-    ColorSequenceKeypoint.new(1, Theme.panel),
-})
-
-local activityDot = create("Frame", {
-    Parent = header, Size = UDim2.new(0, 7, 0, 7),
-    Position = UDim2.new(0, 12, 0.5, -4),
-    BackgroundColor3 = Theme.muted, BorderSizePixel = 0, ZIndex = 4,
-})
-addCorner(activityDot, 999)
-
-create("TextLabel", {
-    Parent = header, Size = UDim2.new(1, -70, 0, 16),
-    Position = UDim2.new(0, 24, 0, 5),
-    BackgroundTransparency = 1, Text = "UTILITY v19",
-    TextColor3 = Theme.text, Font = Enum.Font.GothamBlack,
-    TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 4,
-})
-
-create("TextLabel", {
-    Parent = header, Size = UDim2.new(1, -70, 0, 11),
-    Position = UDim2.new(0, 24, 0, 20),
-    BackgroundTransparency = 1, Text = "reel duty-cycle",
-    TextColor3 = Theme.subtext, Font = Enum.Font.Gotham,
-    TextSize = 7, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 4,
-})
-
-local hideHint = create("TextLabel", {
-    Parent = header, Size = UDim2.new(0, 22, 0, 14),
-    Position = UDim2.new(1, -30, 0.5, -7),
-    BackgroundColor3 = Color3.fromRGB(22, 28, 54), BorderSizePixel = 0,
-    Text = "V", TextColor3 = Theme.muted,
-    Font = Enum.Font.GothamBold, TextSize = 8, ZIndex = 4,
-})
-addCorner(hideHint, 5)
-
-local content = create("Frame", {
-    Parent = frame, Position = UDim2.new(0, 0, 0, HEADER_HEIGHT),
-    Size = UDim2.new(1, 0, 0, 9999), BackgroundTransparency = 1,
-})
-
-local rootLayout = create("UIListLayout", {
-    Parent = content, SortOrder = Enum.SortOrder.LayoutOrder,
-    Padding = UDim.new(0, 0),
-})
-
-UI.refs.frame = frame
-UI.refs.frameStroke = frameStroke
-UI.refs.activityDot = activityDot
-UI.refs.content = content
-UI.refs.hideHint = hideHint
-UI.refs.rootLayout = rootLayout
-
-local tabBar = create("Frame", {
-    Parent = content, LayoutOrder = 1,
-    Size = UDim2.new(1, 0, 0, 28),
-    BackgroundColor3 = Theme.panel, BorderSizePixel = 0,
-})
-addPadding(tabBar, 4, 4, 4, 3)
-create("UIListLayout", {
-    Parent = tabBar, FillDirection = Enum.FillDirection.Horizontal,
-    SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4),
-})
-
-local function createTab(name, title, order)
-    local b = create("TextButton", {
-        Parent = tabBar, LayoutOrder = order,
-        Size = UDim2.new(0.2, -3, 1, 0),
-        BackgroundColor3 = Theme.surfaceAlt, BorderSizePixel = 0,
-        Text = title, TextColor3 = Theme.muted,
-        Font = Enum.Font.GothamBold, TextSize = 9, AutoButtonColor = false,
-    })
-    addCorner(b, 7)
-    UI.tabs[name] = b
-    b.MouseButton1Click:Connect(function() switchTab(name) end)
-end
-
-createTab("Cheats", "Cheats", 1)
-createTab("TP", "Travel", 2)
-createTab("Rods", "Rods", 3)
-createTab("Maps", "Maps", 4)
-createTab("NPCs", "NPCs", 5)
-
-makeDivider(content, 2)
-
-local function createPage(name, order)
-    local p = create("Frame", {
-        Parent = content, LayoutOrder = order,
-        Size = UDim2.new(1, 0, 0, 0),
-        AutomaticSize = Enum.AutomaticSize.Y,
-        BackgroundTransparency = 1, Visible = false,
-    })
-    create("UIListLayout", {
-        Parent = p, SortOrder = Enum.SortOrder.LayoutOrder,
-        Padding = UDim.new(0, 0),
-    })
-    UI.pages[name] = p
-    return p
-end
-
-local cheatsPage = createPage("Cheats", 3)
-local tpPage = createPage("TP", 4)
-local rodsPage = createPage("Rods", 5)
-local mapsPage = createPage("Maps", 6)
-local npcsPage = createPage("NPCs", 7)
-
-makeDivider(cheatsPage, 1)
-
-UI.refs.noclip = makeToggleSection(cheatsPage, {
-    order = 2, icon = "👻", label = "Noclip",
-    keyCode = State.keys.noclip, toggleColor = Theme.success,
-})
-makeDivider(cheatsPage, 3)
-
-UI.refs.speed = makeToggleSection(cheatsPage, {
-    order = 4, icon = "💨", label = "Speed",
-    keyCode = State.keys.speed, toggleColor = Theme.accent,
-    slider = {
-        label = "Speed", min = 16, max = 300,
-        value = State.values.speed, color = Theme.accent,
-        onChanged = function(v) State.values.speed = v end,
-    },
-})
-makeDivider(cheatsPage, 5)
-
-UI.refs.jump = makeToggleSection(cheatsPage, {
-    order = 6, icon = "🦘", label = "High Jump",
-    keyCode = State.keys.jump, toggleColor = Theme.warning,
-    slider = {
-        label = "Power", min = 50, max = 500,
-        value = State.values.jump, color = Theme.warning,
-        onChanged = function(v) State.values.jump = v end,
-    },
-    extraToggle = { label = "↩  Re-jump", color = Theme.warning },
-})
-makeDivider(cheatsPage, 7)
-
-UI.refs.cast = makeToggleSection(cheatsPage, {
-    order = 8, icon = "🎯", label = "Auto Cast",
-    keyCode = State.keys.cast, toggleColor = Theme.cast, showStatus = true,
-})
-makeDivider(cheatsPage, 9)
-
-UI.refs.shake = makeToggleSection(cheatsPage, {
-    order = 10, icon = "🔄", label = "Shake",
-    keyCode = State.keys.shake, toggleColor = Theme.success, showStatus = true,
-})
-makeDivider(cheatsPage, 11)
-
-UI.refs.reel = makeToggleSection(cheatsPage, {
-    order = 12, icon = "🎣", label = "Auto-Reel v19",
-    keyCode = State.keys.reel, toggleColor = Theme.purple,
-    showStatus = true, showStatus2 = true,
-})
-UI.refs.reelScore = UI.refs.reel.status
-
-local learningCard = makeCard(UI.refs.reel.section, 6, true)
-addStroke(learningCard, Color3.fromRGB(76, 56, 130), 1)
-
-create("TextLabel", {
-    Parent = learningCard, LayoutOrder = 1,
-    Size = UDim2.new(1, 0, 0, 12),
-    BackgroundTransparency = 1,
-    Text = "🧠  Duty-cycle learning",
-    TextColor3 = Theme.purple, Font = Enum.Font.GothamBold,
-    TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left,
-})
-
-UI.refs.learnScore = create("TextLabel", {
-    Parent = learningCard, LayoutOrder = 2,
-    Size = UDim2.new(1, 0, 0, 10),
-    BackgroundTransparency = 1, Text = "Score: —",
-    TextColor3 = Theme.text, Font = Enum.Font.Code,
-    TextSize = 8, TextXAlignment = Enum.TextXAlignment.Left,
-})
-
-UI.refs.learnDiag = create("TextLabel", {
-    Parent = learningCard, LayoutOrder = 3,
-    Size = UDim2.new(1, 0, 0, 10),
-    BackgroundTransparency = 1, Text = "Último: —",
-    TextColor3 = Theme.subtext, Font = Enum.Font.Code,
-    TextSize = 8, TextXAlignment = Enum.TextXAlignment.Left,
-})
-
-UI.refs.learnParams = create("TextLabel", {
-    Parent = learningCard, LayoutOrder = 4,
-    Size = UDim2.new(1, 0, 0, 10),
-    BackgroundTransparency = 1, Text = "",
-    TextColor3 = Theme.muted, Font = Enum.Font.Code,
-    TextSize = 7, TextXAlignment = Enum.TextXAlignment.Left,
-})
-
-makeDivider(learningCard, 5).BackgroundColor3 = Color3.fromRGB(76, 56, 130)
-
-local resetBtn = makeActionButton(learningCard, 6, "🔄  Resetar aprendizado", Color3.fromRGB(43, 18, 56), Theme.purple)
-resetBtn.MouseEnter:Connect(function() tween(resetBtn, { BackgroundColor3 = Color3.fromRGB(59, 24, 74) }, 0.14) end)
-resetBtn.MouseLeave:Connect(function() tween(resetBtn, { BackgroundColor3 = Color3.fromRGB(43, 18, 56) }, 0.14) end)
-resetBtn.MouseButton1Click:Connect(function()
-    createRipple(resetBtn, Theme.purple)
-    ReelParams.duty_far = 0.90
-    ReelParams.duty_mid = 0.65
-    ReelParams.duty_near = 0.50
-    ReelParams.cycle_ms = 45
-    ReelParams.rebound_ms = 80
-    LearnHistory.sessions = {}
-    LearnHistory.totalWins = 0
-    LearnHistory.totalLosses = 0
-    LearnHistory.lastDiagnosis = "—"
-    LearnHistory.adjustCount = 0
-    saveLearnData()
-    updateLearningPanel()
-    UI.refs.learnScore.Text = "Score: resetado"
-    UI.refs.learnScore.TextColor3 = Theme.warning
-    task.delay(2, updateLearningPanel)
-end)
-
-makeDivider(cheatsPage, 13)
-
-local sellCard = makeCard(cheatsPage, 14)
-create("TextLabel", {
-    Parent = sellCard, LayoutOrder = 1,
-    Size = UDim2.new(1, 0, 0, 14),
-    BackgroundTransparency = 1, Text = "💰  Sell",
-    TextColor3 = Theme.subtext, Font = Enum.Font.GothamBold,
-    TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
-})
-
-UI.refs.sellStatus = create("TextLabel", {
-    Parent = sellCard, LayoutOrder = 2,
-    Size = UDim2.new(1, 0, 0, 12),
-    BackgroundTransparency = 1, Text = "Waiting...",
-    TextColor3 = Theme.muted, Font = Enum.Font.Code,
-    TextSize = 8, TextXAlignment = Enum.TextXAlignment.Left,
-})
-
-local sellBindButton = makeBindRow(sellCard, State.keys.sell, 3)
-
-UI.refs.sellButton = makeActionButton(sellCard, 4, "💰  Sell Item in Hand", Theme.sell, Theme.success)
-UI.refs.sellButton.MouseEnter:Connect(function() tween(UI.refs.sellButton, { BackgroundColor3 = Theme.sellHover }, 0.15) end)
-UI.refs.sellButton.MouseLeave:Connect(function() tween(UI.refs.sellButton, { BackgroundColor3 = Theme.sell }, 0.15) end)
-
-makeDivider(sellCard, 5)
-
-UI.refs.sellAllButton = makeActionButton(sellCard, 6, "📦  Sell All (mantém mapas)", Color3.fromRGB(16, 57, 35), Theme.success)
-UI.refs.sellAllButton.MouseEnter:Connect(function() tween(UI.refs.sellAllButton, { BackgroundColor3 = Theme.sellHover }, 0.15) end)
-UI.refs.sellAllButton.MouseLeave:Connect(function() tween(UI.refs.sellAllButton, { BackgroundColor3 = Color3.fromRGB(16, 57, 35) }, 0.15) end)
-
-makeDivider(sellCard, 7)
-
-local autoSellRow = create("Frame", {
-    Parent = sellCard, LayoutOrder = 8,
-    Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1,
-})
-
-UI.refs.autoSell = {}
-UI.refs.autoSell.label = create("TextLabel", {
-    Parent = autoSellRow, Size = UDim2.new(1, -60, 1, 0),
-    BackgroundTransparency = 1, Text = "🔁  Auto-Sell",
-    TextColor3 = Theme.subtext, Font = Enum.Font.GothamBold,
-    TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left,
-})
-UI.refs.autoSell.toggle = makeToggle(autoSellRow, Theme.success)
-UI.refs.autoSell.toggle.track.Position = UDim2.new(1, -36, 0.5, -9)
-UI.refs.autoSell.toggle.hit.MouseButton1Click:Connect(function() createRipple(UI.refs.autoSell.toggle.track, Theme.success) end)
-
-makeSlider(sellCard, "Delay", 5, 100, math.floor(State.values.autoSellDelay * 10), Theme.success, function(v)
-    State.values.autoSellDelay = v / 10
-end, 9)
-
-UI.refs.autoSellStatus = makeStatusLabel(sellCard, 11, 8, Theme.muted)
-makeDivider(cheatsPage, 15)
-
-local tpCard = makeCard(tpPage, 1)
-UI.refs.tpStatus = makeStatusLabel(tpCard, 1, 8, Theme.success)
-UI.search.tp = makeSearchBox(tpCard, "Buscar ilha...", 2)
-
-local tpScroll = create("ScrollingFrame", {
-    Parent = tpCard, LayoutOrder = 3,
-    Size = UDim2.new(1, 0, 0, 250),
-    BackgroundTransparency = 1, BorderSizePixel = 0,
-    ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.accent,
-    AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    CanvasSize = UDim2.new(0, 0, 0, 0),
-})
-UI.refs.tpList = tpScroll
-create("UIListLayout", {
-    Parent = tpScroll, SortOrder = Enum.SortOrder.LayoutOrder,
-    Padding = UDim.new(0, 4),
-})
-
-local rodsCard = makeCard(rodsPage, 1)
-UI.refs.rodStatus = makeStatusLabel(rodsCard, 1, 8, Theme.success)
-UI.search.rods = makeSearchBox(rodsCard, "Buscar vara...", 2)
-
-local rodsScroll = create("ScrollingFrame", {
-    Parent = rodsCard, LayoutOrder = 3,
-    Size = UDim2.new(1, 0, 0, 250),
-    BackgroundTransparency = 1, BorderSizePixel = 0,
-    ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.accent,
-    AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    CanvasSize = UDim2.new(0, 0, 0, 0),
-})
-UI.refs.rodList = rodsScroll
-create("UIListLayout", {
-    Parent = rodsScroll, SortOrder = Enum.SortOrder.LayoutOrder,
-    Padding = UDim.new(0, 4),
-})
-
-local mapsCard = makeCard(mapsPage, 1)
-create("TextLabel", {
-    Parent = mapsCard, LayoutOrder = 1,
-    Size = UDim2.new(1, 0, 0, 14),
-    BackgroundTransparency = 1, Text = "📜  Treasure Maps no inventário",
-    TextColor3 = Theme.gold, Font = Enum.Font.GothamBold,
-    TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
-})
-create("TextLabel", {
-    Parent = mapsCard, LayoutOrder = 2,
-    Size = UDim2.new(1, 0, 0, 12),
-    BackgroundTransparency = 1, Text = "Leva o mapa no Jack Marrow pra fixar as coords",
-    TextColor3 = Theme.muted, Font = Enum.Font.Gotham,
-    TextSize = 8, TextXAlignment = Enum.TextXAlignment.Left,
-})
-
-local scanMapsButton = makeActionButton(mapsCard, 3, "🔍  Escanear mapas", Color3.fromRGB(53, 40, 16), Theme.gold)
-local jackButton = makeActionButton(mapsCard, 4, "🏴  TP Jack Marrow (fixar mapas)", Color3.fromRGB(18, 34, 53), Theme.accent)
-
-local mapList = create("Frame", {
-    Parent = mapsCard, LayoutOrder = 5,
-    Size = UDim2.new(1, 0, 0, 0),
-    AutomaticSize = Enum.AutomaticSize.Y,
-    BackgroundTransparency = 1,
-})
-UI.refs.mapList = mapList
-create("UIListLayout", {
-    Parent = mapList, SortOrder = Enum.SortOrder.LayoutOrder,
-    Padding = UDim.new(0, 4),
-})
-
-local npcCard = makeCard(npcsPage, 1)
-makeSlider(npcCard, "Scan range", 1, 1000, State.values.npcRange, Theme.accent, function(v)
-    State.values.npcRange = v
-end, 1)
-
-local scanNpcButton = makeActionButton(npcCard, 3, "🔍  Scan Nearby NPCs", Color3.fromRGB(18, 34, 62), Theme.accent)
-
-local npcScroll = create("ScrollingFrame", {
-    Parent = npcCard, LayoutOrder = 4,
-    Size = UDim2.new(1, 0, 0, 210),
-    BackgroundTransparency = 1, BorderSizePixel = 0,
-    ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.accent,
-    AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    CanvasSize = UDim2.new(0, 0, 0, 0),
-})
-UI.refs.npcList = npcScroll
-create("UIListLayout", {
-    Parent = npcScroll, SortOrder = Enum.SortOrder.LayoutOrder,
-    Padding = UDim.new(0, 4),
-})
-
-UI.refs.noclip.toggleButton.MouseButton1Click:Connect(toggleNoclip)
-UI.refs.speed.toggleButton.MouseButton1Click:Connect(toggleSpeed)
-UI.refs.jump.toggleButton.MouseButton1Click:Connect(toggleJump)
-if UI.refs.jump.extraToggleButton then
-    UI.refs.jump.extraToggleButton.MouseButton1Click:Connect(toggleRejump)
-end
-UI.refs.cast.toggleButton.MouseButton1Click:Connect(toggleCast)
-UI.refs.shake.toggleButton.MouseButton1Click:Connect(toggleShake)
-UI.refs.reel.toggleButton.MouseButton1Click:Connect(toggleAutoReel)
-UI.refs.autoSell.toggle.hit.MouseButton1Click:Connect(toggleAutoSell)
-UI.refs.sellButton.MouseButton1Click:Connect(runSellInHand)
-UI.refs.sellAllButton.MouseButton1Click:Connect(runSellAll)
-
-scanMapsButton.MouseEnter:Connect(function() tween(scanMapsButton, { BackgroundColor3 = Color3.fromRGB(68, 51, 20) }, 0.15) end)
-scanMapsButton.MouseLeave:Connect(function() tween(scanMapsButton, { BackgroundColor3 = Color3.fromRGB(53, 40, 16) }, 0.15) end)
-scanMapsButton.MouseButton1Click:Connect(function()
-    createRipple(scanMapsButton, Theme.gold)
-    scanMapsButton.Text = "⏳  Escaneando..."
-    task.wait(0.2)
-    refreshMaps()
-    scanMapsButton.Text = "🔍  Escanear mapas"
-end)
-
-jackButton.MouseEnter:Connect(function() tween(jackButton, { BackgroundColor3 = Color3.fromRGB(24, 44, 66) }, 0.15) end)
-jackButton.MouseLeave:Connect(function() tween(jackButton, { BackgroundColor3 = Color3.fromRGB(18, 34, 53) }, 0.15) end)
-jackButton.MouseButton1Click:Connect(function()
-    createRipple(jackButton, Theme.accent)
-    teleportTo(Vector3.new(-2825, 215, 1515))
-end)
-
-scanNpcButton.MouseEnter:Connect(function() tween(scanNpcButton, { BackgroundColor3 = Color3.fromRGB(24, 44, 74) }, 0.15) end)
-scanNpcButton.MouseLeave:Connect(function() tween(scanNpcButton, { BackgroundColor3 = Color3.fromRGB(18, 34, 62) }, 0.15) end)
-scanNpcButton.MouseButton1Click:Connect(function()
-    createRipple(scanNpcButton, Theme.accent)
-    scanNpcButton.Text = "⏳  Scanning..."
-    task.wait(0.15)
-    rebuildNPCs()
-    scanNpcButton.Text = "🔍  Scan Nearby NPCs"
-end)
-
-UI.search.tp:GetPropertyChangedSignal("Text"):Connect(renderTeleportList)
-UI.search.rods:GetPropertyChangedSignal("Text"):Connect(renderRodList)
-
-setupBind(UI.refs.noclip.bindButton, "noclip", function() return State.keys.noclip end, function(k) State.keys.noclip = k end)
-setupBind(UI.refs.speed.bindButton, "speed", function() return State.keys.speed end, function(k) State.keys.speed = k end)
-setupBind(UI.refs.jump.bindButton, "jump", function() return State.keys.jump end, function(k) State.keys.jump = k end)
-setupBind(UI.refs.cast.bindButton, "cast", function() return State.keys.cast end, function(k) State.keys.cast = k end)
-setupBind(UI.refs.shake.bindButton, "shake", function() return State.keys.shake end, function(k) State.keys.shake = k end)
-setupBind(UI.refs.reel.bindButton, "reel", function() return State.keys.reel end, function(k) State.keys.reel = k end)
-setupBind(sellBindButton, "sell", function() return State.keys.sell end, function(k) State.keys.sell = k end)
-
-UserInputService.InputBegan:Connect(function(input, gp)
-    if gp or State.runtime.listening then return end
-    local kc = input.KeyCode
-    if kc == State.keys.toggleGui then setGuiVisible(not State.runtime.guiVisible)
-    elseif kc == State.keys.noclip then toggleNoclip()
-    elseif kc == State.keys.speed then toggleSpeed()
-    elseif kc == State.keys.jump then toggleJump()
-    elseif kc == State.keys.cast then toggleCast()
-    elseif kc == State.keys.shake then toggleShake()
-    elseif kc == State.keys.reel then toggleAutoReel()
-    elseif kc == State.keys.sell then runSellInHand() end
-end)
-
-do
-    local dragging = false
-    local dragStart, startPos
-    header.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-            dragging = true; dragStart = i.Position; startPos = frame.Position
-        end
-    end)
-    UserInputService.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(i)
-        if not dragging then return end
-        if i.UserInputType ~= Enum.UserInputType.MouseMovement and i.UserInputType ~= Enum.UserInputType.Touch then return end
-        local d = i.Position - dragStart
-        frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
-    end)
-end
-
-LocalPlayer.CharacterAdded:Connect(function()
+LP.CharacterAdded:Connect(function()
     task.wait(0.5)
-    if State.flags.noclip then setNoclip(true) end
-    if State.flags.speed then applySpeedOnce(); startSpeedLoop() end
-    if State.flags.jump then startJumpLoop() end
-    if State.flags.rejump and State.flags.jump then startRejumpLoop() end
+    if noclipOn then setNoclip(true) end
+    if speedOn  then applySpeedOnce(); startSpeedLoop() end
+    if jumpOn   then startJumpLoop() end
+    if reJumpOn and jumpOn then startReJump() end
 end)
 
-startTask("autosaveLearning", function()
-    while true do task.wait(30); saveLearnData() end
+-- ═══════════════════════════════════════
+-- GUI — LAYOUT v17
+-- ═══════════════════════════════════════
+pcall(function()
+    for _,n in ipairs({"UtilityGui","NoclipGui"}) do local o=PG:FindFirstChild(n); if o then o:Destroy() end end
 end)
 
-startTask("learningPanel", function()
-    while true do task.wait(0.5); updateLearningPanel() end
+local gui=Instance.new("ScreenGui",PG)
+gui.Name="UtilityGui"; gui.ResetOnSpawn=false; gui.DisplayOrder=999; gui.IgnoreGuiInset=true
+
+local C={
+    bg=Color3.fromRGB(8,10,18),      panel=Color3.fromRGB(13,16,28),
+    card=Color3.fromRGB(18,22,38),   cardH=Color3.fromRGB(24,30,52),
+    acc=Color3.fromRGB(82,148,255),  accD=Color3.fromRGB(48,90,190),
+    grn=Color3.fromRGB(52,211,120),  red=Color3.fromRGB(235,70,80),
+    yel=Color3.fromRGB(240,190,55),  pink=Color3.fromRGB(255,80,180),
+    gold=Color3.fromRGB(255,180,60), cyan=Color3.fromRGB(80,220,255),
+    dim=Color3.fromRGB(70,82,112),   txt=Color3.fromRGB(210,218,240),
+    sub=Color3.fromRGB(128,140,175), bdr=Color3.fromRGB(26,33,58),
+    sellBg=Color3.fromRGB(16,58,36), sellH=Color3.fromRGB(20,72,44),
+    learn=Color3.fromRGB(130,80,220),cast=Color3.fromRGB(80,255,180),
+}
+
+local function tw(o,p,d)  return TweenSvc:Create(o,TweenInfo.new(d or 0.15,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),p) end
+local function twB(o,p)   return TweenSvc:Create(o,TweenInfo.new(0.22,Enum.EasingStyle.Back,Enum.EasingDirection.Out),p) end
+local function setS(lbl,text,color) if not lbl then return end; if lbl.Text~=text then lbl.Text=text end; if color then lbl.TextColor3=color end end
+
+local FRAME_W=220; local HEADER_H=36
+local frame=Instance.new("Frame",gui)
+frame.Size=UDim2.new(0,FRAME_W,0,HEADER_H); frame.Position=UDim2.new(0,-FRAME_W,0.5,-180)
+frame.BackgroundColor3=C.bg; frame.BorderSizePixel=0; frame.ClipsDescendants=true; frame.BackgroundTransparency=1
+Instance.new("UICorner",frame).CornerRadius=UDim.new(0,12)
+local fBdr=Instance.new("UIStroke",frame); fBdr.Color=C.bdr; fBdr.Thickness=1.5; fBdr.ApplyStrokeMode=Enum.ApplyStrokeMode.Border
+
+local contentHolder=Instance.new("Frame",frame)
+contentHolder.Size=UDim2.new(1,0,0,9999); contentHolder.Position=UDim2.new(0,0,0,HEADER_H)
+contentHolder.BackgroundTransparency=1; contentHolder.BorderSizePixel=0
+local rootLy=Instance.new("UIListLayout",contentHolder); rootLy.SortOrder=Enum.SortOrder.LayoutOrder; rootLy.Padding=UDim.new(0,0)
+
+local function mkDiv(p,order) local d=Instance.new("Frame",p); d.Size=UDim2.new(1,0,0,1); d.BackgroundColor3=C.bdr; d.BorderSizePixel=0; d.LayoutOrder=order end
+local function pad(p,l,r,t,b)
+    local u=Instance.new("UIPadding",p)
+    u.PaddingLeft=UDim.new(0,l or 10); u.PaddingRight=UDim.new(0,r or 10)
+    u.PaddingTop=UDim.new(0,t or 6); u.PaddingBottom=UDim.new(0,b or 6)
+end
+
+local header=Instance.new("Frame",frame)
+header.Size=UDim2.new(1,0,0,HEADER_H); header.Position=UDim2.new(0,0,0,0)
+header.BackgroundColor3=C.panel; header.BorderSizePixel=0; header.ZIndex=2
+local hGrad=Instance.new("UIGradient",header)
+hGrad.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(16,22,52)),ColorSequenceKeypoint.new(1,C.bg)}); hGrad.Rotation=90
+
+local dot=Instance.new("Frame",header)
+dot.Size=UDim2.new(0,7,0,7); dot.Position=UDim2.new(0,11,0.5,-3)
+dot.BackgroundColor3=C.dim; dot.BorderSizePixel=0; dot.ZIndex=4
+Instance.new("UICorner",dot).CornerRadius=UDim.new(1,0)
+
+local htitle=Instance.new("TextLabel",header)
+htitle.Size=UDim2.new(1,-60,1,0); htitle.Position=UDim2.new(0,24,0,0)
+htitle.BackgroundTransparency=1; htitle.Text="⚙  UTILITY  v20"
+htitle.TextColor3=C.txt; htitle.Font=Enum.Font.GothamBlack; htitle.TextSize=11
+htitle.TextXAlignment=Enum.TextXAlignment.Left; htitle.ZIndex=4
+
+local vHint=Instance.new("TextLabel",header)
+vHint.Size=UDim2.new(0,20,0,14); vHint.Position=UDim2.new(1,-26,0.5,-7)
+vHint.BackgroundColor3=Color3.fromRGB(20,26,50); vHint.BorderSizePixel=0
+vHint.Text="V"; vHint.TextColor3=C.dim; vHint.Font=Enum.Font.GothamBold; vHint.TextSize=8
+vHint.TextXAlignment=Enum.TextXAlignment.Center; vHint.ZIndex=4
+Instance.new("UICorner",vHint).CornerRadius=UDim.new(0,4)
+
+local tabBar=Instance.new("Frame",contentHolder)
+tabBar.Size=UDim2.new(1,0,0,28); tabBar.BackgroundColor3=C.panel; tabBar.BorderSizePixel=0; tabBar.LayoutOrder=1
+pad(tabBar,5,5,4,4)
+local tabLy=Instance.new("UIListLayout",tabBar); tabLy.FillDirection=Enum.FillDirection.Horizontal; tabLy.SortOrder=Enum.SortOrder.LayoutOrder; tabLy.Padding=UDim.new(0,2)
+
+local tabBtns={}; local tabPages={}
+local function mkTab(name,icon,order)
+    local b=Instance.new("TextButton",tabBar)
+    b.Size=UDim2.new(0.2,-2,1,0); b.BackgroundColor3=C.card; b.BorderSizePixel=0
+    b.Text=icon; b.TextColor3=C.dim; b.Font=Enum.Font.GothamBold; b.TextSize=11; b.AutoButtonColor=false; b.LayoutOrder=order
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,5); tabBtns[name]=b; return b
+end
+local function mkPage(order)
+    local pg=Instance.new("Frame",contentHolder)
+    pg.Size=UDim2.new(1,0,0,0); pg.AutomaticSize=Enum.AutomaticSize.Y; pg.BackgroundTransparency=1; pg.BorderSizePixel=0; pg.LayoutOrder=order; pg.Visible=false
+    local ly=Instance.new("UIListLayout",pg); ly.SortOrder=Enum.SortOrder.LayoutOrder; ly.Padding=UDim.new(0,0)
+    return pg
+end
+
+mkTab("Cheats","🎮",1); mkTab("TP","🗺",2); mkTab("Rods","🎣",3); mkTab("Maps","📜",4); mkTab("NPCs","🧑",5)
+mkDiv(contentHolder,2)
+tabPages["Cheats"]=mkPage(3); tabPages["TP"]=mkPage(4); tabPages["Rods"]=mkPage(5); tabPages["Maps"]=mkPage(6); tabPages["NPCs"]=mkPage(7)
+
+local function getContentH() return rootLy.AbsoluteContentSize.Y end
+local function refreshSize() if not guiVisible then return end; task.wait(); frame.Size=UDim2.new(0,FRAME_W,0,HEADER_H+getContentH()) end
+local function setVisible(v)
+    if vDebounce then return end; if guiVisible==v then return end; vDebounce=true; guiVisible=v
+    if v then
+        contentHolder.Visible=true; task.wait()
+        tw(frame,{Size=UDim2.new(0,FRAME_W,0,HEADER_H+getContentH()),BackgroundTransparency=0},0.2):Play()
+        tw(vHint,{TextColor3=C.dim},0.15):Play()
+        task.delay(0.25,function() vDebounce=false end)
+    else
+        local sh=tw(frame,{Size=UDim2.new(0,FRAME_W,0,HEADER_H)},0.18); sh:Play()
+        tw(vHint,{TextColor3=C.acc},0.15):Play()
+        sh.Completed:Connect(function() if not guiVisible then contentHolder.Visible=false end; task.delay(0.05,function() vDebounce=false end) end)
+    end
+end
+local function switchTab(name)
+    currentTab=name
+    for n,pg in pairs(tabPages) do pg.Visible=(n==name) end
+    for n,b in pairs(tabBtns) do tw(b,{BackgroundColor3=(n==name) and C.acc or C.card,TextColor3=(n==name) and C.bg or C.dim}):Play() end
+    refreshSize()
+end
+for name,b in pairs(tabBtns) do b.MouseButton1Click:Connect(function() switchTab(name) end) end
+
+local function ripple(btn,col)
+    local rip=Instance.new("Frame",btn); rip.Size=UDim2.new(0,0,0,0); rip.AnchorPoint=Vector2.new(0.5,0.5)
+    rip.Position=UDim2.new(0.5,0,0.5,0); rip.BackgroundColor3=col or Color3.fromRGB(255,255,255)
+    rip.BackgroundTransparency=0.7; rip.BorderSizePixel=0; rip.ZIndex=btn.ZIndex+1
+    Instance.new("UICorner",rip).CornerRadius=UDim.new(1,0)
+    local sz=math.max(btn.AbsoluteSize.X,btn.AbsoluteSize.Y)*2
+    local t=TweenSvc:Create(rip,TweenInfo.new(0.4,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{Size=UDim2.new(0,sz,0,sz),BackgroundTransparency=1})
+    t:Play(); t.Completed:Connect(function() rip:Destroy() end)
+end
+
+local BLOCKED={[Enum.KeyCode.Return]=true,[Enum.KeyCode.Escape]=true,[Enum.KeyCode.Tab]=true,
+    [Enum.KeyCode.Backspace]=true,[Enum.KeyCode.LeftShift]=true,[Enum.KeyCode.RightShift]=true,
+    [Enum.KeyCode.LeftControl]=true,[Enum.KeyCode.RightControl]=true,
+    [Enum.KeyCode.LeftAlt]=true,[Enum.KeyCode.RightAlt]=true,[Enum.KeyCode.V]=true}
+
+local function mkSection(parent,cfg)
+    local sec=Instance.new("Frame",parent)
+    sec.Size=UDim2.new(1,0,0,0); sec.AutomaticSize=Enum.AutomaticSize.Y; sec.BackgroundColor3=C.card; sec.BorderSizePixel=0; sec.LayoutOrder=cfg.order
+    local u=Instance.new("UIPadding",sec); u.PaddingLeft=UDim.new(0,10); u.PaddingRight=UDim.new(0,10); u.PaddingTop=UDim.new(0,7); u.PaddingBottom=UDim.new(0,7)
+    local ly=Instance.new("UIListLayout",sec); ly.SortOrder=Enum.SortOrder.LayoutOrder; ly.Padding=UDim.new(0,5)
+    local r1=Instance.new("Frame",sec); r1.Size=UDim2.new(1,0,0,20); r1.BackgroundTransparency=1; r1.LayoutOrder=1
+    local lbl=Instance.new("TextLabel",r1); lbl.Size=UDim2.new(1,-52,1,0); lbl.BackgroundTransparency=1
+    lbl.Text=cfg.icon.."  "..cfg.label; lbl.TextColor3=C.sub; lbl.Font=Enum.Font.GothamBold; lbl.TextSize=10; lbl.TextXAlignment=Enum.TextXAlignment.Left
+    local tr=Instance.new("Frame",r1); tr.Size=UDim2.new(0,36,0,18); tr.Position=UDim2.new(1,-36,0.5,-9)
+    tr.BackgroundColor3=Color3.fromRGB(22,28,50); tr.BorderSizePixel=0
+    Instance.new("UICorner",tr).CornerRadius=UDim.new(0,9); Instance.new("UIStroke",tr).Color=C.bdr
+    local kn=Instance.new("Frame",tr); kn.Size=UDim2.new(0,14,0,14); kn.Position=UDim2.new(0,2,0.5,-7)
+    kn.BackgroundColor3=Color3.fromRGB(195,205,235); kn.BorderSizePixel=0; Instance.new("UICorner",kn).CornerRadius=UDim.new(0,7)
+    local togHit=Instance.new("TextButton",tr); togHit.Size=UDim2.new(1,0,1,0); togHit.BackgroundTransparency=1; togHit.Text=""; togHit.AutoButtonColor=false; togHit.ZIndex=5
+    togHit.MouseButton1Click:Connect(function() ripple(tr,C.acc) end)
+    local r2=Instance.new("Frame",sec); r2.Size=UDim2.new(1,0,0,20); r2.BackgroundTransparency=1; r2.LayoutOrder=2
+    local kl=Instance.new("TextLabel",r2); kl.Size=UDim2.new(0,38,1,0); kl.BackgroundTransparency=1; kl.Text="Key:"; kl.TextColor3=C.dim; kl.Font=Enum.Font.Gotham; kl.TextSize=8; kl.TextXAlignment=Enum.TextXAlignment.Left
+    local bindB=Instance.new("TextButton",r2); bindB.Size=UDim2.new(0,64,0,18); bindB.Position=UDim2.new(0,40,0.5,-9)
+    bindB.BackgroundColor3=Color3.fromRGB(18,22,44); bindB.BorderSizePixel=0; bindB.Text=cfg.keyName; bindB.TextColor3=C.acc; bindB.Font=Enum.Font.GothamBold; bindB.TextSize=9; bindB.AutoButtonColor=false
+    Instance.new("UICorner",bindB).CornerRadius=UDim.new(0,5); Instance.new("UIStroke",bindB).Color=C.accD
+    local statusLbl=nil
+    if cfg.showStatus then
+        local rs=Instance.new("Frame",sec); rs.Size=UDim2.new(1,0,0,12); rs.BackgroundTransparency=1; rs.LayoutOrder=2.5
+        statusLbl=Instance.new("TextLabel",rs); statusLbl.Size=UDim2.new(1,0,1,0); statusLbl.BackgroundTransparency=1; statusLbl.Text=""; statusLbl.TextColor3=C.dim; statusLbl.Font=Enum.Font.Code; statusLbl.TextSize=8; statusLbl.TextXAlignment=Enum.TextXAlignment.Left
+    end
+    local statusLbl2=nil
+    if cfg.showStatus2 then
+        local rs2=Instance.new("Frame",sec); rs2.Size=UDim2.new(1,0,0,11); rs2.BackgroundTransparency=1; rs2.LayoutOrder=2.6
+        statusLbl2=Instance.new("TextLabel",rs2); statusLbl2.Size=UDim2.new(1,0,1,0); statusLbl2.BackgroundTransparency=1; statusLbl2.Text=""; statusLbl2.TextColor3=C.learn; statusLbl2.Font=Enum.Font.Code; statusLbl2.TextSize=7; statusLbl2.TextXAlignment=Enum.TextXAlignment.Left
+    end
+    if cfg.slider then
+        local s=cfg.slider
+        local rs1=Instance.new("Frame",sec); rs1.Size=UDim2.new(1,0,0,13); rs1.BackgroundTransparency=1; rs1.LayoutOrder=3
+        local vl=Instance.new("TextLabel",rs1); vl.Size=UDim2.new(1,0,1,0); vl.BackgroundTransparency=1; vl.Text=s.label..": "..s.def; vl.TextColor3=C.acc; vl.Font=Enum.Font.GothamBold; vl.TextSize=8; vl.TextXAlignment=Enum.TextXAlignment.Left
+        local rs2=Instance.new("Frame",sec); rs2.Size=UDim2.new(1,0,0,14); rs2.BackgroundTransparency=1; rs2.LayoutOrder=4
+        local sbg=Instance.new("Frame",rs2); sbg.Size=UDim2.new(1,0,0,4); sbg.Position=UDim2.new(0,0,0.5,-2); sbg.BackgroundColor3=Color3.fromRGB(20,25,45); sbg.BorderSizePixel=0; Instance.new("UICorner",sbg).CornerRadius=UDim.new(0,2)
+        local pct0=(s.def-s.min)/(s.max-s.min)
+        local fill=Instance.new("Frame",sbg); fill.Size=UDim2.new(pct0,0,1,0); fill.BackgroundColor3=C.acc; fill.BorderSizePixel=0; Instance.new("UICorner",fill).CornerRadius=UDim.new(0,2)
+        local sk=Instance.new("Frame",sbg); sk.Size=UDim2.new(0,11,0,11); sk.AnchorPoint=Vector2.new(0.5,0.5); sk.Position=UDim2.new(pct0,0,0.5,0); sk.BackgroundColor3=Color3.fromRGB(255,255,255); sk.BorderSizePixel=0; sk.ZIndex=3; Instance.new("UICorner",sk).CornerRadius=UDim.new(0,6)
+        local sHit=Instance.new("TextButton",sbg); sHit.Size=UDim2.new(1,0,0,20); sHit.Position=UDim2.new(0,0,0.5,-10); sHit.BackgroundTransparency=1; sHit.Text=""; sHit.AutoButtonColor=false; sHit.ZIndex=4
+        local drag=false
+        sHit.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=true end end)
+        sHit.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=false end end)
+        UIS.InputChanged:Connect(function(i)
+            if not drag or i.UserInputType~=Enum.UserInputType.MouseMovement then return end
+            local pct=math.clamp((i.Position.X-sbg.AbsolutePosition.X)/sbg.AbsoluteSize.X,0,1)
+            local val=math.floor(s.min+pct*(s.max-s.min)+0.5)
+            fill.Size=UDim2.new(pct,0,1,0); sk.Position=UDim2.new(pct,0,0.5,0)
+            vl.Text=s.label..": "..val; if s.onChange then s.onChange(val) end
+        end)
+    end
+    local rjTr,rjKn,rjTogHit
+    if cfg.rejump then
+        local rr=Instance.new("Frame",sec); rr.Size=UDim2.new(1,0,0,18); rr.BackgroundTransparency=1; rr.LayoutOrder=5
+        local rl=Instance.new("TextLabel",rr); rl.Size=UDim2.new(1,-52,1,0); rl.BackgroundTransparency=1; rl.Text="↩  Re-jump"; rl.TextColor3=C.sub; rl.Font=Enum.Font.GothamBold; rl.TextSize=9; rl.TextXAlignment=Enum.TextXAlignment.Left
+        rjTr=Instance.new("Frame",rr); rjTr.Size=UDim2.new(0,36,0,18); rjTr.Position=UDim2.new(1,-36,0.5,-9); rjTr.BackgroundColor3=Color3.fromRGB(22,28,50); rjTr.BorderSizePixel=0; Instance.new("UICorner",rjTr).CornerRadius=UDim.new(0,9); Instance.new("UIStroke",rjTr).Color=C.bdr
+        rjKn=Instance.new("Frame",rjTr); rjKn.Size=UDim2.new(0,14,0,14); rjKn.Position=UDim2.new(0,2,0.5,-7); rjKn.BackgroundColor3=Color3.fromRGB(195,205,235); rjKn.BorderSizePixel=0; Instance.new("UICorner",rjKn).CornerRadius=UDim.new(0,7)
+        rjTogHit=Instance.new("TextButton",rjTr); rjTogHit.Size=UDim2.new(1,0,1,0); rjTogHit.BackgroundTransparency=1; rjTogHit.Text=""; rjTogHit.AutoButtonColor=false; rjTogHit.ZIndex=5
+    end
+    local function setTog(on) tw(tr,{BackgroundColor3=on and C.acc or Color3.fromRGB(22,28,50)}):Play(); twB(kn,{Position=on and UDim2.new(0,20,0.5,-7) or UDim2.new(0,2,0.5,-7)}):Play(); tw(lbl,{TextColor3=on and C.txt or C.sub}):Play() end
+    local function setRj(on) if rjTr then tw(rjTr,{BackgroundColor3=on and C.acc or Color3.fromRGB(22,28,50)}):Play() end; if rjKn then twB(rjKn,{Position=on and UDim2.new(0,20,0.5,-7) or UDim2.new(0,2,0.5,-7)}):Play() end end
+    return {togHit=togHit,bindBtn=bindB,rjTogHit=rjTogHit,setTog=setTog,setRj=setRj,statusLbl=statusLbl,statusLbl2=statusLbl2,lbl=lbl,sec=sec}
+end
+
+-- ═══════════════════════════════════════
+-- PAGE CHEATS
+-- ═══════════════════════════════════════
+local pg1=tabPages["Cheats"]
+mkDiv(pg1,1)
+local ncSec=mkSection(pg1,{order=2,icon="👻",label="Noclip",keyName=ncKey.Name})
+mkDiv(pg1,3)
+local spSec=mkSection(pg1,{order=4,icon="💨",label="Speed",keyName=spKey.Name,
+    slider={min=16,max=300,def=speedVal,label="Speed",onChange=function(v) speedVal=v end}})
+mkDiv(pg1,5)
+local hjSec=mkSection(pg1,{order=6,icon="🦘",label="High Jump",keyName=hjKey.Name,
+    slider={min=50,max=500,def=jumpVal,label="Power",onChange=function(v) jumpVal=v end},rejump=true})
+mkDiv(pg1,7)
+local castSec=mkSection(pg1,{order=8,icon="🎯",label="Auto Cast",keyName=castKey.Name,showStatus=true})
+mkDiv(pg1,9)
+local shSec=mkSection(pg1,{order=10,icon="🔄",label="Shake",keyName=shakeKey.Name,showStatus=true})
+mkDiv(pg1,11)
+local reSec=mkSection(pg1,{order=12,icon="🎣",label="Auto-Reel  🧠",keyName=reelKey.Name,showStatus=true,showStatus2=true})
+reelStatusLbl=reSec.statusLbl
+
+-- Painel de aprendizado (dentro da seção Auto-Reel)
+local learnPad=Instance.new("Frame",reSec.sec)
+learnPad.Size=UDim2.new(1,0,0,0); learnPad.AutomaticSize=Enum.AutomaticSize.Y
+learnPad.BackgroundColor3=Color3.fromRGB(12,8,22); learnPad.BorderSizePixel=0; learnPad.LayoutOrder=6
+Instance.new("UICorner",learnPad).CornerRadius=UDim.new(0,6); Instance.new("UIStroke",learnPad).Color=Color3.fromRGB(60,40,100)
+local lpu=Instance.new("UIPadding",learnPad); lpu.PaddingLeft=UDim.new(0,8); lpu.PaddingRight=UDim.new(0,8); lpu.PaddingTop=UDim.new(0,5); lpu.PaddingBottom=UDim.new(0,6)
+local lpLy=Instance.new("UIListLayout",learnPad); lpLy.SortOrder=Enum.SortOrder.LayoutOrder; lpLy.Padding=UDim.new(0,3)
+
+local lpTitle=Instance.new("TextLabel",learnPad); lpTitle.Size=UDim2.new(1,0,0,11); lpTitle.BackgroundTransparency=1; lpTitle.LayoutOrder=1
+lpTitle.Text="🧠  Duty-cycle learning (salvo)"; lpTitle.TextColor3=C.learn; lpTitle.Font=Enum.Font.GothamBold; lpTitle.TextSize=8; lpTitle.TextXAlignment=Enum.TextXAlignment.Left
+local lpScore=Instance.new("TextLabel",learnPad); lpScore.Size=UDim2.new(1,0,0,10); lpScore.BackgroundTransparency=1; lpScore.LayoutOrder=2
+lpScore.Text="Score: —"; lpScore.TextColor3=C.txt; lpScore.Font=Enum.Font.Code; lpScore.TextSize=8; lpScore.TextXAlignment=Enum.TextXAlignment.Left
+local lpDiag=Instance.new("TextLabel",learnPad); lpDiag.Size=UDim2.new(1,0,0,10); lpDiag.BackgroundTransparency=1; lpDiag.LayoutOrder=3
+lpDiag.Text="Último: —"; lpDiag.TextColor3=C.sub; lpDiag.Font=Enum.Font.Code; lpDiag.TextSize=7; lpDiag.TextXAlignment=Enum.TextXAlignment.Left
+local lpParams=Instance.new("TextLabel",learnPad); lpParams.Size=UDim2.new(1,0,0,10); lpParams.BackgroundTransparency=1; lpParams.LayoutOrder=4
+lpParams.Text=""; lpParams.TextColor3=C.dim; lpParams.Font=Enum.Font.Code; lpParams.TextSize=7; lpParams.TextXAlignment=Enum.TextXAlignment.Left
+local lpDiv=Instance.new("Frame",learnPad); lpDiv.Size=UDim2.new(1,0,0,1); lpDiv.BackgroundColor3=Color3.fromRGB(60,40,100); lpDiv.BorderSizePixel=0; lpDiv.LayoutOrder=5
+
+local lpReset=Instance.new("TextButton",learnPad); lpReset.Size=UDim2.new(1,0,0,20); lpReset.LayoutOrder=6
+lpReset.BackgroundColor3=Color3.fromRGB(30,12,42); lpReset.BorderSizePixel=0
+lpReset.Text="🔄  Resetar aprendizado"; lpReset.TextColor3=C.learn; lpReset.Font=Enum.Font.GothamBold; lpReset.TextSize=8; lpReset.AutoButtonColor=false
+Instance.new("UICorner",lpReset).CornerRadius=UDim.new(0,5)
+lpReset.MouseEnter:Connect(function() tw(lpReset,{BackgroundColor3=Color3.fromRGB(44,18,60)}):Play() end)
+lpReset.MouseLeave:Connect(function() tw(lpReset,{BackgroundColor3=Color3.fromRGB(30,12,42)}):Play() end)
+lpReset.MouseButton1Click:Connect(function()
+    ripple(lpReset,C.learn)
+    ReelParams.duty_far=0.90; ReelParams.duty_mid=0.65; ReelParams.duty_near=0.50
+    ReelParams.cycle_ms=45; ReelParams.rebound_ms=80
+    LearnHistory.sessions={}; LearnHistory.totalWins=0; LearnHistory.totalLosses=0
+    LearnHistory.lastDiagnosis="—"; LearnHistory.adjustCount=0
+    saveLearnData()
+    lpScore.Text="Score: resetado"; lpScore.TextColor3=C.yel
+    lpDiag.Text="Último: —"
+    task.delay(2,function() lpScore.TextColor3=C.txt end)
 end)
 
-startTask("shakeStatus", function()
-    local dots = { "", ".", "..", "..." }
-    local i = 1
-    while true do
-        task.wait(0.2); i = i % #dots + 1
-        if State.flags.shake then
-            local t = State.runtime.shakeActive
-                and ("● Enter pressing" .. dots[i])
-                or ("○ waiting shake" .. dots[i])
-            setStatus(UI.refs.shake.status, t, State.runtime.shakeActive and Theme.success or Theme.warning)
-        else
-            setStatus(UI.refs.shake.status, "", Theme.muted)
+mkDiv(pg1,13)
+
+-- Atualiza painel a cada 0.5s
+task.spawn(function()
+    while true do task.wait(0.5)
+        local w,t=getRecentScore(10)
+        local trend=(t>0) and (w/t>=0.7 and " ↑" or (w/t<=0.3 and " ↓" or " →")) or ""
+        lpScore.Text=string.format("Score: %d/%d%s  |  ✅%d ❌%d  |  adj:%d",w,t,trend,LearnHistory.totalWins,LearnHistory.totalLosses,LearnHistory.adjustCount)
+        lpScore.TextColor3=(t>0 and w/t>=0.6) and C.grn or ((t>0 and w/t<=0.3) and C.red or C.yel)
+        lpDiag.Text="Último: "..LearnHistory.lastDiagnosis
+        lpParams.Text=string.format("⚙ far %.2f  mid %.2f  near %.2f | %dms",ReelParams.duty_far,ReelParams.duty_mid,ReelParams.duty_near,ReelParams.cycle_ms)
+    end
+end)
+
+-- SELL
+local sellF=Instance.new("Frame",pg1); sellF.Size=UDim2.new(1,0,0,0); sellF.AutomaticSize=Enum.AutomaticSize.Y; sellF.BackgroundColor3=C.card; sellF.BorderSizePixel=0; sellF.LayoutOrder=14
+local su=Instance.new("UIPadding",sellF); su.PaddingLeft=UDim.new(0,10); su.PaddingRight=UDim.new(0,10); su.PaddingTop=UDim.new(0,7); su.PaddingBottom=UDim.new(0,9)
+local sLy=Instance.new("UIListLayout",sellF); sLy.SortOrder=Enum.SortOrder.LayoutOrder; sLy.Padding=UDim.new(0,5)
+local sTR=Instance.new("Frame",sellF); sTR.Size=UDim2.new(1,0,0,16); sTR.BackgroundTransparency=1; sTR.LayoutOrder=1
+local sTL=Instance.new("TextLabel",sTR); sTL.Size=UDim2.new(1,0,1,0); sTL.BackgroundTransparency=1; sTL.Text="💰  Sell"; sTL.TextColor3=C.sub; sTL.Font=Enum.Font.GothamBold; sTL.TextSize=10; sTL.TextXAlignment=Enum.TextXAlignment.Left
+local sellSt=Instance.new("TextLabel",sellF); sellSt.Size=UDim2.new(1,0,0,10); sellSt.BackgroundTransparency=1; sellSt.Text="Waiting..."; sellSt.TextColor3=C.dim; sellSt.Font=Enum.Font.Gotham; sellSt.TextSize=8; sellSt.TextXAlignment=Enum.TextXAlignment.Left; sellSt.LayoutOrder=2
+local sBR=Instance.new("Frame",sellF); sBR.Size=UDim2.new(1,0,0,20); sBR.BackgroundTransparency=1; sBR.LayoutOrder=3
+local sBL=Instance.new("TextLabel",sBR); sBL.Size=UDim2.new(0,38,1,0); sBL.BackgroundTransparency=1; sBL.Text="Key:"; sBL.TextColor3=C.dim; sBL.Font=Enum.Font.Gotham; sBL.TextSize=8; sBL.TextXAlignment=Enum.TextXAlignment.Left
+local sellBind=Instance.new("TextButton",sBR); sellBind.Size=UDim2.new(0,64,0,18); sellBind.Position=UDim2.new(0,40,0.5,-9); sellBind.BackgroundColor3=Color3.fromRGB(18,22,44); sellBind.BorderSizePixel=0; sellBind.Text=sellKey.Name; sellBind.TextColor3=C.acc; sellBind.Font=Enum.Font.GothamBold; sellBind.TextSize=9; sellBind.AutoButtonColor=false; Instance.new("UICorner",sellBind).CornerRadius=UDim.new(0,5); Instance.new("UIStroke",sellBind).Color=C.accD
+local sellBtn=Instance.new("TextButton",sellF); sellBtn.Size=UDim2.new(1,0,0,28); sellBtn.LayoutOrder=4; sellBtn.BackgroundColor3=C.sellBg; sellBtn.BorderSizePixel=0; sellBtn.Text="💰  Sell Item in Hand"; sellBtn.TextColor3=C.grn; sellBtn.Font=Enum.Font.GothamBold; sellBtn.TextSize=9; sellBtn.AutoButtonColor=false; Instance.new("UICorner",sellBtn).CornerRadius=UDim.new(0,7); Instance.new("UIStroke",sellBtn).Color=Color3.fromRGB(22,82,50)
+sellBtn.MouseEnter:Connect(function() tw(sellBtn,{BackgroundColor3=C.sellH}):Play() end); sellBtn.MouseLeave:Connect(function() tw(sellBtn,{BackgroundColor3=C.sellBg}):Play() end); sellBtn.MouseButton1Click:Connect(function() ripple(sellBtn,C.grn) end)
+local innerDiv=Instance.new("Frame",sellF); innerDiv.Size=UDim2.new(1,0,0,1); innerDiv.BackgroundColor3=C.bdr; innerDiv.BorderSizePixel=0; innerDiv.LayoutOrder=5
+local sellAllBtn=Instance.new("TextButton",sellF); sellAllBtn.Size=UDim2.new(1,0,0,28); sellAllBtn.LayoutOrder=6; sellAllBtn.BackgroundColor3=Color3.fromRGB(14,50,30); sellAllBtn.BorderSizePixel=0; sellAllBtn.Text="📦  Sell All (mantém mapas)"; sellAllBtn.TextColor3=C.grn; sellAllBtn.Font=Enum.Font.GothamBold; sellAllBtn.TextSize=9; sellAllBtn.AutoButtonColor=false; Instance.new("UICorner",sellAllBtn).CornerRadius=UDim.new(0,7); Instance.new("UIStroke",sellAllBtn).Color=Color3.fromRGB(18,70,40)
+sellAllBtn.MouseEnter:Connect(function() tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(18,64,38)}):Play() end); sellAllBtn.MouseLeave:Connect(function() tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(14,50,30)}):Play() end); sellAllBtn.MouseButton1Click:Connect(function() ripple(sellAllBtn,C.grn) end)
+local innerDiv2=Instance.new("Frame",sellF); innerDiv2.Size=UDim2.new(1,0,0,1); innerDiv2.BackgroundColor3=C.bdr; innerDiv2.BorderSizePixel=0; innerDiv2.LayoutOrder=7
+local autoRow=Instance.new("Frame",sellF); autoRow.Size=UDim2.new(1,0,0,20); autoRow.BackgroundTransparency=1; autoRow.LayoutOrder=8
+local autoLbl=Instance.new("TextLabel",autoRow); autoLbl.Size=UDim2.new(1,-52,1,0); autoLbl.BackgroundTransparency=1; autoLbl.Text="🔁  Auto-Sell"; autoLbl.TextColor3=C.sub; autoLbl.Font=Enum.Font.GothamBold; autoLbl.TextSize=10; autoLbl.TextXAlignment=Enum.TextXAlignment.Left
+local autoTr=Instance.new("Frame",autoRow); autoTr.Size=UDim2.new(0,36,0,18); autoTr.Position=UDim2.new(1,-36,0.5,-9); autoTr.BackgroundColor3=Color3.fromRGB(22,28,50); autoTr.BorderSizePixel=0; Instance.new("UICorner",autoTr).CornerRadius=UDim.new(0,9); Instance.new("UIStroke",autoTr).Color=C.bdr
+local autoKn=Instance.new("Frame",autoTr); autoKn.Size=UDim2.new(0,14,0,14); autoKn.Position=UDim2.new(0,2,0.5,-7); autoKn.BackgroundColor3=Color3.fromRGB(195,205,235); autoKn.BorderSizePixel=0; Instance.new("UICorner",autoKn).CornerRadius=UDim.new(0,7)
+local autoTogHit=Instance.new("TextButton",autoTr); autoTogHit.Size=UDim2.new(1,0,1,0); autoTogHit.BackgroundTransparency=1; autoTogHit.Text=""; autoTogHit.AutoButtonColor=false; autoTogHit.ZIndex=5; autoTogHit.MouseButton1Click:Connect(function() ripple(autoTr,C.grn) end)
+local autoDelRow1=Instance.new("Frame",sellF); autoDelRow1.Size=UDim2.new(1,0,0,13); autoDelRow1.BackgroundTransparency=1; autoDelRow1.LayoutOrder=9
+local autoDelLbl=Instance.new("TextLabel",autoDelRow1); autoDelLbl.Size=UDim2.new(1,0,1,0); autoDelLbl.BackgroundTransparency=1; autoDelLbl.Text="Delay: 1.5s"; autoDelLbl.TextColor3=C.acc; autoDelLbl.Font=Enum.Font.GothamBold; autoDelLbl.TextSize=8; autoDelLbl.TextXAlignment=Enum.TextXAlignment.Left
+local autoDelRow2=Instance.new("Frame",sellF); autoDelRow2.Size=UDim2.new(1,0,0,14); autoDelRow2.BackgroundTransparency=1; autoDelRow2.LayoutOrder=10
+local adBg=Instance.new("Frame",autoDelRow2); adBg.Size=UDim2.new(1,0,0,4); adBg.Position=UDim2.new(0,0,0.5,-2); adBg.BackgroundColor3=Color3.fromRGB(20,25,45); adBg.BorderSizePixel=0; Instance.new("UICorner",adBg).CornerRadius=UDim.new(0,2)
+local adPct=(autoSellDelay-0.5)/(10-0.5)
+local adFill=Instance.new("Frame",adBg); adFill.Size=UDim2.new(adPct,0,1,0); adFill.BackgroundColor3=C.grn; adFill.BorderSizePixel=0; Instance.new("UICorner",adFill).CornerRadius=UDim.new(0,2)
+local adKn=Instance.new("Frame",adBg); adKn.Size=UDim2.new(0,11,0,11); adKn.AnchorPoint=Vector2.new(0.5,0.5); adKn.Position=UDim2.new(adPct,0,0.5,0); adKn.BackgroundColor3=Color3.fromRGB(255,255,255); adKn.BorderSizePixel=0; adKn.ZIndex=3; Instance.new("UICorner",adKn).CornerRadius=UDim.new(0,6)
+local adHit=Instance.new("TextButton",adBg); adHit.Size=UDim2.new(1,0,0,20); adHit.Position=UDim2.new(0,0,0.5,-10); adHit.BackgroundTransparency=1; adHit.Text=""; adHit.AutoButtonColor=false; adHit.ZIndex=4
+local adDrag=false
+adHit.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then adDrag=true end end)
+adHit.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then adDrag=false end end)
+UIS.InputChanged:Connect(function(i)
+    if not adDrag or i.UserInputType~=Enum.UserInputType.MouseMovement then return end
+    local pct=math.clamp((i.Position.X-adBg.AbsolutePosition.X)/adBg.AbsoluteSize.X,0,1)
+    autoSellDelay=math.floor((0.5+pct*(10-0.5))*10+0.5)/10
+    adFill.Size=UDim2.new(pct,0,1,0); adKn.Position=UDim2.new(pct,0,0.5,0); autoDelLbl.Text="Delay: "..autoSellDelay.."s"
+end)
+local autoStLbl=Instance.new("TextLabel",sellF); autoStLbl.Size=UDim2.new(1,0,0,10); autoStLbl.BackgroundTransparency=1; autoStLbl.Text=""; autoStLbl.TextColor3=C.dim; autoStLbl.Font=Enum.Font.Code; autoStLbl.TextSize=8; autoStLbl.TextXAlignment=Enum.TextXAlignment.Left; autoStLbl.LayoutOrder=11
+mkDiv(pg1,15)
+
+-- ═══════════════════════════════════════
+-- PAGE TP
+-- ═══════════════════════════════════════
+local pg2=tabPages["TP"]
+local tpScroll=Instance.new("ScrollingFrame",pg2); tpScroll.Size=UDim2.new(1,0,0,300); tpScroll.BackgroundTransparency=1; tpScroll.BorderSizePixel=0; tpScroll.ScrollBarThickness=3; tpScroll.ScrollBarImageColor3=C.acc; tpScroll.CanvasSize=UDim2.new(0,0,0,0); tpScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; tpScroll.LayoutOrder=1
+local tpLy=Instance.new("UIListLayout",tpScroll); tpLy.SortOrder=Enum.SortOrder.LayoutOrder; tpLy.Padding=UDim.new(0,2); pad(tpScroll,8,8,6,6)
+local tpSt=Instance.new("TextLabel",tpScroll); tpSt.Size=UDim2.new(1,0,0,14); tpSt.BackgroundTransparency=1; tpSt.Text=""; tpSt.TextColor3=C.grn; tpSt.Font=Enum.Font.GothamBold; tpSt.TextSize=8; tpSt.TextXAlignment=Enum.TextXAlignment.Left; tpSt.LayoutOrder=0
+local function catColor(cat)
+    if cat=="second" then return C.cyan,Color3.fromRGB(16,42,52),Color3.fromRGB(24,60,75) end
+    if cat=="deep"   then return C.pink,Color3.fromRGB(40,16,42),Color3.fromRGB(60,26,62) end
+    return C.sub,C.card,C.cardH
+end
+for i,isl in ipairs(ISLANDS) do
+    local tc,bc,hc=catColor(isl.cat)
+    local b=Instance.new("TextButton",tpScroll); b.Size=UDim2.new(1,0,0,26); b.BackgroundColor3=bc; b.BorderSizePixel=0; b.Text="📍 "..isl.name; b.TextColor3=tc; b.Font=Enum.Font.GothamBold; b.TextSize=9; b.TextXAlignment=Enum.TextXAlignment.Left; b.AutoButtonColor=false; b.LayoutOrder=i
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); pad(b,8,8,0,0)
+    b.MouseEnter:Connect(function() tw(b,{BackgroundColor3=hc,TextColor3=C.txt}):Play() end); b.MouseLeave:Connect(function() tw(b,{BackgroundColor3=bc,TextColor3=tc}):Play() end)
+    b.MouseButton1Click:Connect(function()
+        ripple(b,tc); tw(b,{BackgroundColor3=C.accD}):Play(); task.wait(0.12); tw(b,{BackgroundColor3=bc}):Play()
+        local ok=tpTo(isl.pos); tpSt.TextColor3=ok and C.grn or C.red; tpSt.Text=(ok and "✅ " or "❌ ")..isl.name
+        task.delay(3,function() tpSt.Text="" end)
+    end)
+end
+
+-- ═══════════════════════════════════════
+-- PAGE RODS
+-- ═══════════════════════════════════════
+local pg4=tabPages["Rods"]
+local rodScroll=Instance.new("ScrollingFrame",pg4); rodScroll.Size=UDim2.new(1,0,0,300); rodScroll.BackgroundTransparency=1; rodScroll.BorderSizePixel=0; rodScroll.ScrollBarThickness=3; rodScroll.ScrollBarImageColor3=C.acc; rodScroll.CanvasSize=UDim2.new(0,0,0,0); rodScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; rodScroll.LayoutOrder=1
+local rodLy=Instance.new("UIListLayout",rodScroll); rodLy.SortOrder=Enum.SortOrder.LayoutOrder; rodLy.Padding=UDim.new(0,2); pad(rodScroll,8,8,6,6)
+local rodSt=Instance.new("TextLabel",rodScroll); rodSt.Size=UDim2.new(1,0,0,14); rodSt.BackgroundTransparency=1; rodSt.Text=""; rodSt.TextColor3=C.grn; rodSt.Font=Enum.Font.GothamBold; rodSt.TextSize=8; rodSt.TextXAlignment=Enum.TextXAlignment.Left; rodSt.LayoutOrder=0
+for i,rod in ipairs(RODS) do
+    local b=Instance.new("TextButton",rodScroll); b.Size=UDim2.new(1,0,0,34); b.BackgroundColor3=C.card; b.BorderSizePixel=0; b.Text=""; b.AutoButtonColor=false; b.LayoutOrder=i
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); pad(b,8,8,3,3)
+    local nm=Instance.new("TextLabel",b); nm.Size=UDim2.new(1,0,0,13); nm.Position=UDim2.new(0,0,0,0); nm.BackgroundTransparency=1; nm.Text="🎣 "..rod.name; nm.TextColor3=C.cyan; nm.Font=Enum.Font.GothamBold; nm.TextSize=10; nm.TextXAlignment=Enum.TextXAlignment.Left
+    local ll=Instance.new("TextLabel",b); ll.Size=UDim2.new(1,0,0,11); ll.Position=UDim2.new(0,0,0,14); ll.BackgroundTransparency=1; ll.Text=rod.loc; ll.TextColor3=C.dim; ll.Font=Enum.Font.Gotham; ll.TextSize=8; ll.TextXAlignment=Enum.TextXAlignment.Left
+    b.MouseEnter:Connect(function() tw(b,{BackgroundColor3=C.cardH}):Play() end); b.MouseLeave:Connect(function() tw(b,{BackgroundColor3=C.card}):Play() end)
+    b.MouseButton1Click:Connect(function()
+        ripple(b,C.cyan); tw(b,{BackgroundColor3=C.accD}):Play(); task.wait(0.12); tw(b,{BackgroundColor3=C.card}):Play()
+        local ok=tpTo(rod.pos); rodSt.TextColor3=ok and C.grn or C.red; rodSt.Text=(ok and "✅ TP → " or "❌ ")..rod.name
+        task.delay(3,function() rodSt.Text="" end)
+    end)
+end
+
+-- ═══════════════════════════════════════
+-- PAGE MAPS
+-- ═══════════════════════════════════════
+local pg5=tabPages["Maps"]
+local mapF=Instance.new("Frame",pg5); mapF.Size=UDim2.new(1,0,0,0); mapF.AutomaticSize=Enum.AutomaticSize.Y; mapF.BackgroundColor3=C.card; mapF.BorderSizePixel=0; mapF.LayoutOrder=1; pad(mapF,10,10,8,8)
+local mapLy=Instance.new("UIListLayout",mapF); mapLy.SortOrder=Enum.SortOrder.LayoutOrder; mapLy.Padding=UDim.new(0,6)
+local mapTitle=Instance.new("TextLabel",mapF); mapTitle.Size=UDim2.new(1,0,0,14); mapTitle.BackgroundTransparency=1; mapTitle.Text="📜  Treasure Maps no inventário"; mapTitle.TextColor3=C.gold; mapTitle.Font=Enum.Font.GothamBold; mapTitle.TextSize=10; mapTitle.TextXAlignment=Enum.TextXAlignment.Left; mapTitle.LayoutOrder=1
+local mapInfo=Instance.new("TextLabel",mapF); mapInfo.Size=UDim2.new(1,0,0,11); mapInfo.BackgroundTransparency=1; mapInfo.Text="Leva o mapa no Jack Marrow pra fixar as coords"; mapInfo.TextColor3=C.dim; mapInfo.Font=Enum.Font.Gotham; mapInfo.TextSize=8; mapInfo.TextXAlignment=Enum.TextXAlignment.Left; mapInfo.LayoutOrder=2
+local mapRefresh=Instance.new("TextButton",mapF); mapRefresh.Size=UDim2.new(1,0,0,26); mapRefresh.LayoutOrder=3; mapRefresh.BackgroundColor3=Color3.fromRGB(40,30,12); mapRefresh.BorderSizePixel=0; mapRefresh.Text="🔍  Escanear mapas"; mapRefresh.TextColor3=C.gold; mapRefresh.Font=Enum.Font.GothamBold; mapRefresh.TextSize=9; mapRefresh.AutoButtonColor=false; Instance.new("UICorner",mapRefresh).CornerRadius=UDim.new(0,6); Instance.new("UIStroke",mapRefresh).Color=Color3.fromRGB(100,70,20)
+mapRefresh.MouseEnter:Connect(function() tw(mapRefresh,{BackgroundColor3=Color3.fromRGB(55,40,18)}):Play() end); mapRefresh.MouseLeave:Connect(function() tw(mapRefresh,{BackgroundColor3=Color3.fromRGB(40,30,12)}):Play() end); mapRefresh.MouseButton1Click:Connect(function() ripple(mapRefresh,C.gold) end)
+local quickJack=Instance.new("TextButton",mapF); quickJack.Size=UDim2.new(1,0,0,24); quickJack.LayoutOrder=4; quickJack.BackgroundColor3=Color3.fromRGB(18,30,48); quickJack.BorderSizePixel=0; quickJack.Text="🏴  TP Jack Marrow (fixar mapas)"; quickJack.TextColor3=C.acc; quickJack.Font=Enum.Font.GothamBold; quickJack.TextSize=9; quickJack.AutoButtonColor=false; Instance.new("UICorner",quickJack).CornerRadius=UDim.new(0,6)
+quickJack.MouseEnter:Connect(function() tw(quickJack,{BackgroundColor3=Color3.fromRGB(24,40,64)}):Play() end); quickJack.MouseLeave:Connect(function() tw(quickJack,{BackgroundColor3=Color3.fromRGB(18,30,48)}):Play() end); quickJack.MouseButton1Click:Connect(function() ripple(quickJack,C.acc); tpTo(Vector3.new(-2825,215,1515)) end)
+local mapListHolder=Instance.new("Frame",mapF); mapListHolder.Size=UDim2.new(1,0,0,0); mapListHolder.AutomaticSize=Enum.AutomaticSize.Y; mapListHolder.BackgroundTransparency=1; mapListHolder.BorderSizePixel=0; mapListHolder.LayoutOrder=5
+local mapListLy=Instance.new("UIListLayout",mapListHolder); mapListLy.SortOrder=Enum.SortOrder.LayoutOrder; mapListLy.Padding=UDim.new(0,3)
+local function refreshMaps()
+    for _,ch in ipairs(mapListHolder:GetChildren()) do if not (ch:IsA("UIListLayout") or ch:IsA("UIPadding")) then ch:Destroy() end end
+    local maps=getTreasureMaps()
+    if #maps==0 then
+        local l=Instance.new("TextLabel",mapListHolder); l.Size=UDim2.new(1,0,0,24); l.BackgroundTransparency=1; l.Text="Nenhum mapa no inventário"; l.TextColor3=C.dim; l.Font=Enum.Font.Gotham; l.TextSize=9; l.TextXAlignment=Enum.TextXAlignment.Center; l.LayoutOrder=1; refreshSize(); return
+    end
+    for i,m in ipairs(maps) do
+        local b=Instance.new("TextButton",mapListHolder); b.Size=UDim2.new(1,0,0,32); b.BackgroundColor3=m.fixed and C.card or Color3.fromRGB(30,26,18); b.BorderSizePixel=0; b.Text=""; b.AutoButtonColor=false; b.LayoutOrder=i; Instance.new("UICorner",b).CornerRadius=UDim.new(0,5); pad(b,8,8,3,3)
+        local nm=Instance.new("TextLabel",b); nm.Size=UDim2.new(1,0,0,12); nm.Position=UDim2.new(0,0,0,0); nm.BackgroundTransparency=1; nm.Text=(m.fixed and "📜 " or "❔ ")..m.name; nm.TextColor3=m.fixed and C.gold or C.yel; nm.Font=Enum.Font.GothamBold; nm.TextSize=9; nm.TextXAlignment=Enum.TextXAlignment.Left
+        local cd=Instance.new("TextLabel",b); cd.Size=UDim2.new(1,0,0,11); cd.Position=UDim2.new(0,0,0,13); cd.BackgroundTransparency=1
+        if m.fixed then cd.Text=string.format("X=%d  Y=%d  Z=%d",m.pos.X,m.pos.Y,m.pos.Z); cd.TextColor3=C.cyan else cd.Text="→ vai no Jack Marrow (Forsaken) pra fixar"; cd.TextColor3=C.dim end
+        cd.Font=Enum.Font.Code; cd.TextSize=8; cd.TextXAlignment=Enum.TextXAlignment.Left
+        if m.fixed then
+            b.MouseEnter:Connect(function() tw(b,{BackgroundColor3=C.cardH}):Play() end); b.MouseLeave:Connect(function() tw(b,{BackgroundColor3=C.card}):Play() end)
+            local pos=m.pos; b.MouseButton1Click:Connect(function() ripple(b,C.gold); tw(b,{BackgroundColor3=C.gold}):Play(); task.wait(0.12); tw(b,{BackgroundColor3=C.card}):Play(); tpTo(pos) end)
+        end
+    end
+    refreshSize()
+end
+mapRefresh.MouseButton1Click:Connect(function() mapRefresh.Text="⏳  Escaneando..."; task.wait(0.2); refreshMaps(); mapRefresh.Text="🔍  Escanear mapas" end)
+
+-- ═══════════════════════════════════════
+-- PAGE NPCs
+-- ═══════════════════════════════════════
+local pg3=tabPages["NPCs"]
+local rngF=Instance.new("Frame",pg3); rngF.Size=UDim2.new(1,0,0,0); rngF.AutomaticSize=Enum.AutomaticSize.Y; rngF.BackgroundColor3=C.card; rngF.BorderSizePixel=0; rngF.LayoutOrder=1; pad(rngF,10,10,7,7)
+local rngLy2=Instance.new("UIListLayout",rngF); rngLy2.SortOrder=Enum.SortOrder.LayoutOrder; rngLy2.Padding=UDim.new(0,4)
+local rngRow1=Instance.new("Frame",rngF); rngRow1.Size=UDim2.new(1,0,0,13); rngRow1.BackgroundTransparency=1; rngRow1.LayoutOrder=1
+local rngLbl=Instance.new("TextLabel",rngRow1); rngLbl.Size=UDim2.new(1,0,1,0); rngLbl.BackgroundTransparency=1; rngLbl.Text="Scan range: "..npcRange.." studs"; rngLbl.TextColor3=C.acc; rngLbl.Font=Enum.Font.GothamBold; rngLbl.TextSize=8; rngLbl.TextXAlignment=Enum.TextXAlignment.Left
+local rngRow2=Instance.new("Frame",rngF); rngRow2.Size=UDim2.new(1,0,0,14); rngRow2.BackgroundTransparency=1; rngRow2.LayoutOrder=2
+local rngBg=Instance.new("Frame",rngRow2); rngBg.Size=UDim2.new(1,0,0,4); rngBg.Position=UDim2.new(0,0,0.5,-2); rngBg.BackgroundColor3=Color3.fromRGB(20,25,45); rngBg.BorderSizePixel=0; Instance.new("UICorner",rngBg).CornerRadius=UDim.new(0,2)
+local rPct=(npcRange-1)/999
+local rngFill=Instance.new("Frame",rngBg); rngFill.Size=UDim2.new(rPct,0,1,0); rngFill.BackgroundColor3=C.acc; rngFill.BorderSizePixel=0; Instance.new("UICorner",rngFill).CornerRadius=UDim.new(0,2)
+local rngKn=Instance.new("Frame",rngBg); rngKn.Size=UDim2.new(0,11,0,11); rngKn.AnchorPoint=Vector2.new(0.5,0.5); rngKn.Position=UDim2.new(rPct,0,0.5,0); rngKn.BackgroundColor3=Color3.fromRGB(255,255,255); rngKn.BorderSizePixel=0; rngKn.ZIndex=3; Instance.new("UICorner",rngKn).CornerRadius=UDim.new(0,6)
+local rngHit=Instance.new("TextButton",rngBg); rngHit.Size=UDim2.new(1,0,0,20); rngHit.Position=UDim2.new(0,0,0.5,-10); rngHit.BackgroundTransparency=1; rngHit.Text=""; rngHit.AutoButtonColor=false; rngHit.ZIndex=4
+local rngDrag=false
+rngHit.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then rngDrag=true end end)
+rngHit.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then rngDrag=false end end)
+UIS.InputChanged:Connect(function(i)
+    if not rngDrag or i.UserInputType~=Enum.UserInputType.MouseMovement then return end
+    local pct=math.clamp((i.Position.X-rngBg.AbsolutePosition.X)/rngBg.AbsoluteSize.X,0,1)
+    npcRange=math.floor(1+pct*999); rngFill.Size=UDim2.new(pct,0,1,0); rngKn.Position=UDim2.new(pct,0,0.5,0); rngLbl.Text="Scan range: "..npcRange.." studs"
+end)
+mkDiv(pg3,2)
+local scanBtn=Instance.new("TextButton",pg3); scanBtn.Size=UDim2.new(1,0,0,30); scanBtn.LayoutOrder=3; scanBtn.BackgroundColor3=Color3.fromRGB(16,28,60); scanBtn.BorderSizePixel=0; scanBtn.Text="🔍  Scan Nearby NPCs"; scanBtn.TextColor3=C.acc; scanBtn.Font=Enum.Font.GothamBold; scanBtn.TextSize=9; scanBtn.AutoButtonColor=false; Instance.new("UICorner",scanBtn).CornerRadius=UDim.new(0,7); Instance.new("UIStroke",scanBtn).Color=C.accD
+scanBtn.MouseEnter:Connect(function() tw(scanBtn,{BackgroundColor3=Color3.fromRGB(20,36,78)}):Play() end); scanBtn.MouseLeave:Connect(function() tw(scanBtn,{BackgroundColor3=Color3.fromRGB(16,28,60)}):Play() end); scanBtn.MouseButton1Click:Connect(function() ripple(scanBtn,C.acc) end)
+mkDiv(pg3,4)
+local npcScroll=Instance.new("ScrollingFrame",pg3); npcScroll.Size=UDim2.new(1,0,0,220); npcScroll.BackgroundTransparency=1; npcScroll.BorderSizePixel=0; npcScroll.ScrollBarThickness=3; npcScroll.ScrollBarImageColor3=C.acc; npcScroll.CanvasSize=UDim2.new(0,0,0,0); npcScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; npcScroll.LayoutOrder=5
+local npcLy=Instance.new("UIListLayout",npcScroll); npcLy.SortOrder=Enum.SortOrder.LayoutOrder; npcLy.Padding=UDim.new(0,2); pad(npcScroll,8,8,4,4)
+local function rebuildNPCs()
+    for _,ch in ipairs(npcScroll:GetChildren()) do if not ch:IsA("UIListLayout") and not ch:IsA("UIPadding") then ch:Destroy() end end
+    local npcs=getNearby()
+    if #npcs==0 then
+        local l=Instance.new("TextLabel",npcScroll); l.Size=UDim2.new(1,0,0,26); l.BackgroundTransparency=1; l.Text="No NPCs within "..npcRange.." studs"; l.TextColor3=C.dim; l.Font=Enum.Font.Gotham; l.TextSize=9; l.TextXAlignment=Enum.TextXAlignment.Center; l.LayoutOrder=1; return
+    end
+    for i,npc in ipairs(npcs) do
+        local b=Instance.new("TextButton",npcScroll); b.Size=UDim2.new(1,0,0,28); b.BackgroundColor3=C.card; b.BorderSizePixel=0; b.AutoButtonColor=false; b.LayoutOrder=i; b.Text="🧑  "..npc.name.."  ("..npc.dist.." st)"; b.TextColor3=C.sub; b.Font=Enum.Font.GothamBold; b.TextSize=8; b.TextXAlignment=Enum.TextXAlignment.Left; Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); pad(b,8,8,0,0)
+        b.MouseEnter:Connect(function() tw(b,{BackgroundColor3=C.cardH,TextColor3=C.txt}):Play() end); b.MouseLeave:Connect(function() tw(b,{BackgroundColor3=C.card,TextColor3=C.sub}):Play() end)
+        local cp=npc.part; b.MouseButton1Click:Connect(function() ripple(b,C.acc); tw(b,{BackgroundColor3=C.accD}):Play(); task.wait(0.12); tw(b,{BackgroundColor3=C.card}):Play(); tpToNPC(cp); task.delay(0.8,rebuildNPCs) end)
+    end
+end
+scanBtn.MouseButton1Click:Connect(function() scanBtn.Text="⏳  Scanning..."; task.wait(0.15); rebuildNPCs(); scanBtn.Text="🔍  Scan Nearby NPCs" end)
+
+-- ═══════════════════════════════════════
+-- TOGGLES
+-- ═══════════════════════════════════════
+local function updateDot()
+    local anyOn=noclipOn or speedOn or jumpOn or shakeOn or castOn or autoSellOn or autoReelOn
+    tw(dot,{BackgroundColor3=anyOn and C.grn or C.dim}):Play()
+end
+
+ncSec.togHit.MouseButton1Click:Connect(function() noclipOn=not noclipOn; setNoclip(noclipOn); ncSec.setTog(noclipOn); tw(fBdr,{Color=noclipOn and C.grn or C.bdr}):Play(); updateDot() end)
+spSec.togHit.MouseButton1Click:Connect(function() speedOn=not speedOn; spSec.setTog(speedOn); if speedOn then applySpeedOnce(); startSpeedLoop() else stopSpeedLoop() end; updateDot() end)
+hjSec.togHit.MouseButton1Click:Connect(function()
+    jumpOn=not jumpOn; hjSec.setTog(jumpOn)
+    if jumpOn then startJumpLoop() else stopJumpLoop(); reJumpOn=false; hjSec.setRj(false); stopReJump() end; updateDot()
+end)
+if hjSec.rjTogHit then hjSec.rjTogHit.MouseButton1Click:Connect(function()
+    if not jumpOn then return end; reJumpOn=not reJumpOn; hjSec.setRj(reJumpOn); if reJumpOn then startReJump() else stopReJump() end
+end) end
+
+castSec.togHit.MouseButton1Click:Connect(function()
+    castOn=not castOn; castSec.setTog(castOn)
+    if castOn then startCast(castSec.statusLbl) else stopCast(); if castSec.statusLbl then castSec.statusLbl.Text="" end end
+    updateDot()
+end)
+shSec.togHit.MouseButton1Click:Connect(function() shakeOn=not shakeOn; shSec.setTog(shakeOn); if shakeOn then startShake() else stopShake() end; updateDot() end)
+reSec.togHit.MouseButton1Click:Connect(function() autoReelOn=not autoReelOn; reSec.setTog(autoReelOn); if autoReelOn then startAutoReel() else stopAutoReel() end; updateDot() end)
+
+sellBtn.MouseButton1Click:Connect(function()
+    task.spawn(function()
+        tw(sellBtn,{BackgroundColor3=Color3.fromRGB(10,44,26)}):Play(); task.wait(0.1); tw(sellBtn,{BackgroundColor3=C.sellBg}):Play()
+        local ok,msg=sellFromHand(); sellSt.TextColor3=ok and C.grn or C.red; sellSt.Text=(ok and "✅ " or "❌ ")..msg
+        task.wait(3); tw(sellSt,{TextColor3=C.dim}):Play(); sellSt.Text="Waiting..."
+    end)
+end)
+sellAllBtn.MouseButton1Click:Connect(function()
+    task.spawn(function()
+        tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(10,38,22)}):Play(); task.wait(0.1); tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(14,50,30)}):Play()
+        local ok,msg=sellAll(); sellSt.TextColor3=ok and C.grn or C.red; sellSt.Text=(ok and "✅ " or "❌ ")..msg
+        task.wait(3); tw(sellSt,{TextColor3=C.dim}):Play(); sellSt.Text="Waiting..."
+    end)
+end)
+autoTogHit.MouseButton1Click:Connect(function()
+    autoSellOn=not autoSellOn
+    tw(autoTr,{BackgroundColor3=autoSellOn and C.grn or Color3.fromRGB(22,28,50)}):Play()
+    twB(autoKn,{Position=autoSellOn and UDim2.new(0,20,0.5,-7) or UDim2.new(0,2,0.5,-7)}):Play()
+    tw(autoLbl,{TextColor3=autoSellOn and C.txt or C.sub}):Play()
+    if autoSellOn then startAutoSell(autoStLbl) else stopAutoSell(); autoStLbl.Text="Auto-sell off"; task.delay(2,function() autoStLbl.Text="" end) end
+    updateDot()
+end)
+
+-- ═══════════════════════════════════════
+-- STATUS LOOPS — sem flickering (só escreve se mudou)
+-- ═══════════════════════════════════════
+task.spawn(function()
+    local d={"",".",".","..."}; local i=1
+    while true do task.wait(0.2); i=i%4+1
+        if shSec.statusLbl then
+            if shakeOn then
+                local t=shakeActive and ("● Enter pressing"..d[i]) or ("○ waiting shake"..d[i])
+                setS(shSec.statusLbl,t,shakeActive and C.grn or C.yel)
+            else setS(shSec.statusLbl,"",C.dim) end
         end
     end
 end)
 
-startTask("castStatus", function()
-    local dots = { "", ".", "..", "..." }
-    local i = 1
-    while true do
-        task.wait(0.2); i = i % #dots + 1
-        if State.flags.cast then
-            if State.runtime.castActive then
-                if State.runtime.castPhase == "holding" then
-                    setStatus(UI.refs.cast.status, "▲ carregando" .. dots[i], Theme.cast)
-                else
-                    setStatus(UI.refs.cast.status, "↓ soltando" .. dots[i], Theme.success)
-                end
-            elseif State.runtime.castPhase == "cooldown" then
-                setStatus(UI.refs.cast.status, "○ aguardando pesca" .. dots[i], Theme.warning)
-            elseif State.runtime.castPhase == "arming" then
-                setStatus(UI.refs.cast.status, "○ puxando vara [1]" .. dots[i], Theme.warning)
-            elseif State.runtime.castPhase == "searching" then
-                setStatus(UI.refs.cast.status, "⌕ aguardando verde" .. dots[i], Theme.warning)
-            else
-                setStatus(UI.refs.cast.status, "○ aguardando cast" .. dots[i], Theme.warning)
-            end
-        else
-            setStatus(UI.refs.cast.status, "", Theme.muted)
+task.spawn(function()
+    local d={"",".",".","..."}; local i=1
+    while true do task.wait(0.2); i=i%4+1
+        if castSec.statusLbl then
+            if castOn then
+                local t, col
+                if castActive then
+                    if castPhase=="holding" then t="▲ carregando"..d[i]; col=C.cast
+                    elseif castPhase=="firing" then t="⚡ FireServer"..d[i]; col=C.cast
+                    else t="↓ soltando"..d[i]; col=C.grn end
+                elseif castPhase=="cooldown" then t="○ aguardando pesca"..d[i]; col=C.yel
+                elseif castPhase=="arming" then t="○ puxando vara [1]"..d[i]; col=C.yel
+                else t="○ aguardando cast"..d[i]; col=C.yel end
+                setS(castSec.statusLbl,t,col)
+            else setS(castSec.statusLbl,"",C.dim) end
         end
     end
 end)
 
-startTask("reelStatus", function()
-    local dots = { "", ".", "..", "..." }
-    local i = 1
-    while true do
-        task.wait(0.25); i = i % #dots + 1
-        if State.flags.autoReel then
-            if State.runtime.reelActive then
-                setStatus(UI.refs.reel.status, "● pescando" .. dots[i], Theme.success)
-            else
-                setStatus(UI.refs.reel.status, "○ aguardando UI" .. dots[i], Theme.warning)
-            end
-        else
-            setStatus(UI.refs.reel.status, "", Theme.muted)
+task.spawn(function()
+    local d={"",".",".","..."}; local i=1
+    while true do task.wait(0.25); i=i%4+1
+        if reSec.statusLbl then
+            if autoReelOn then
+                local t = reelActive and ("● pescando"..d[i]) or ("○ aguardando UI"..d[i])
+                setS(reSec.statusLbl, t, reelActive and C.grn or C.yel)
+            else setS(reSec.statusLbl,"",C.dim) end
         end
     end
 end)
 
+-- ═══════════════════════════════════════
+-- REBIND
+-- ═══════════════════════════════════════
+local function setupBind(bindBtn,id,getKey,setKey)
+    bindBtn.MouseButton1Click:Connect(function()
+        if listening then return end; listening=id; bindBtn.Text="..."; tw(bindBtn,{TextColor3=C.yel}):Play()
+        local conn; conn=UIS.InputBegan:Connect(function(inp)
+            if inp.UserInputType~=Enum.UserInputType.Keyboard then return end
+            if inp.KeyCode==Enum.KeyCode.Escape then bindBtn.Text=getKey().Name; tw(bindBtn,{TextColor3=C.acc}):Play(); listening=nil; conn:Disconnect(); return end
+            if BLOCKED[inp.KeyCode] then bindBtn.Text="invalid!"; tw(bindBtn,{TextColor3=C.red}):Play(); task.wait(0.8); bindBtn.Text=getKey().Name; tw(bindBtn,{TextColor3=C.acc}):Play(); listening=nil; conn:Disconnect(); return end
+            setKey(inp.KeyCode); bindBtn.Text=inp.KeyCode.Name; tw(bindBtn,{TextColor3=C.acc}):Play(); listening=nil; conn:Disconnect()
+        end)
+    end)
+end
+setupBind(ncSec.bindBtn,"nc",   function() return ncKey    end,function(k) ncKey=k    end)
+setupBind(spSec.bindBtn,"sp",   function() return spKey    end,function(k) spKey=k    end)
+setupBind(hjSec.bindBtn,"hj",   function() return hjKey    end,function(k) hjKey=k    end)
+setupBind(castSec.bindBtn,"ct", function() return castKey  end,function(k) castKey=k  end)
+setupBind(shSec.bindBtn,"sh",   function() return shakeKey end,function(k) shakeKey=k end)
+setupBind(reSec.bindBtn,"re",   function() return reelKey  end,function(k) reelKey=k  end)
+setupBind(sellBind,"sell",      function() return sellKey  end,function(k) sellKey=k  end)
+
+-- DRAG
+do
+    local dragging,dragStart,startPos=false,nil,nil
+    header.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dragging=true; dragStart=i.Position; startPos=frame.Position end
+    end)
+    UIS.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dragging=false end end)
+    UIS.InputChanged:Connect(function(i)
+        if not dragging then return end
+        if i.UserInputType~=Enum.UserInputType.MouseMovement and i.UserInputType~=Enum.UserInputType.Touch then return end
+        local d=i.Position-dragStart; frame.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y)
+    end)
+end
+
+-- HOTKEYS
+UIS.InputBegan:Connect(function(inp,gpe)
+    if gpe or listening then return end; local k=inp.KeyCode
+    if k==Enum.KeyCode.V then setVisible(not guiVisible)
+    elseif k==ncKey    then noclipOn=not noclipOn;setNoclip(noclipOn);ncSec.setTog(noclipOn);tw(fBdr,{Color=noclipOn and C.grn or C.bdr}):Play();updateDot()
+    elseif k==spKey    then speedOn=not speedOn;spSec.setTog(speedOn);if speedOn then applySpeedOnce();startSpeedLoop() else stopSpeedLoop() end;updateDot()
+    elseif k==hjKey    then jumpOn=not jumpOn;hjSec.setTog(jumpOn);if jumpOn then startJumpLoop() else stopJumpLoop();reJumpOn=false;hjSec.setRj(false);stopReJump() end;updateDot()
+    elseif k==castKey  then castOn=not castOn;castSec.setTog(castOn);if castOn then startCast(castSec.statusLbl) else stopCast();if castSec.statusLbl then castSec.statusLbl.Text="" end end;updateDot()
+    elseif k==shakeKey then shakeOn=not shakeOn;shSec.setTog(shakeOn);if shakeOn then startShake() else stopShake() end;updateDot()
+    elseif k==reelKey  then autoReelOn=not autoReelOn;reSec.setTog(autoReelOn);if autoReelOn then startAutoReel() else stopAutoReel() end;updateDot()
+    elseif k==sellKey  then task.spawn(function() local ok,msg=sellFromHand(); sellSt.TextColor3=ok and C.grn or C.red;sellSt.Text=(ok and "✅ " or "❌ ")..msg; task.wait(3);tw(sellSt,{TextColor3=C.dim}):Play();sellSt.Text="Waiting..." end)
+    end
+end)
+
+-- INIT
 switchTab("Cheats")
-renderTeleportList()
-renderRodList()
-refreshMaps()
-updateLearningPanel()
-refreshFrameSize()
-updateActivityDot()
-
-task.delay(0.08, refreshFrameSize)
-TweenService:Create(frame, TweenInfo.new(0.45, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-    Position = UDim2.new(0, 18, 0.5, WINDOW_Y_OFFSET),
-    BackgroundTransparency = 0,
+task.wait(0.1); refreshSize(); task.wait(0.05)
+TweenSvc:Create(frame,TweenInfo.new(0.45,Enum.EasingStyle.Back,Enum.EasingDirection.Out),{
+    Position=UDim2.new(0,18,0.5,-180),
+    BackgroundTransparency=0,
 }):Play()
+task.delay(1,refreshMaps)
