@@ -28,20 +28,10 @@ pcall(function()
     VIM_OK = VIM ~= nil
 end)
 
-local function hasExecutorMouse()
-    return type(mouse1press) == "function" and type(mouse1release) == "function"
-end
-
-local function hasExecutorKey()
-    return type(keypress) == "function" and type(keyrelease) == "function"
-end
-
 local function safeMousePress(x, y, held_ref_set)
     if held_ref_set and held_ref_set[1] then return end
     if VIM_OK then
         pcall(function() VIM:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, true, game, 0) end)
-    elseif hasExecutorMouse() then
-        pcall(mouse1press)
     end
     if held_ref_set then held_ref_set[1] = true end
 end
@@ -50,8 +40,6 @@ local function safeMouseRelease(x, y, held_ref_set)
     if held_ref_set and not held_ref_set[1] then return end
     if VIM_OK then
         pcall(function() VIM:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, false, game, 0) end)
-    elseif hasExecutorMouse() then
-        pcall(mouse1release)
     end
     if held_ref_set then held_ref_set[1] = false end
 end
@@ -59,8 +47,6 @@ end
 local function safeMouseForceRelease()
     if VIM_OK then
         pcall(function() VIM:SendMouseButtonEvent(0, 0, 0, false, game, 0) end)
-    elseif hasExecutorMouse() then
-        pcall(mouse1release)
     end
 end
 
@@ -69,21 +55,11 @@ local function safeKeyPress(keyCode)
         pcall(function() VIM:SendKeyEvent(true,  keyCode, false, game) end)
         task.wait(0.02)
         pcall(function() VIM:SendKeyEvent(false, keyCode, false, game) end)
-    elseif hasExecutorKey() then
-        local code = keyCode.Value or 0
-        pcall(function() keypress(code) end)
-        task.wait(0.02)
-        pcall(function() keyrelease(code) end)
     end
 end
 
 local function safeGuiClick(btn)
     if not btn then return false end
-
-    local ok = pcall(function()
-        btn:Activate()
-    end)
-    if ok then return true end
 
     if VIM_OK then
         local cx = btn.AbsolutePosition.X + btn.AbsoluteSize.X * 0.5
@@ -254,6 +230,11 @@ local function stopReJump() if reJumpConn then reJumpConn:Disconnect(); reJumpCo
 -- ═══════════════════════════════════════
 -- SHAKE — Fire no botão diretamente (sem VIM)
 -- ═══════════════════════════════════════
+local function shakeUiVisible()
+    local sui = PG:FindFirstChild("shakeui")
+    return sui and sui.Enabled ~= false
+end
+
 local function getShakeButton()
     local sui = PG:FindFirstChild("shakeui")
     if not sui or not sui.Enabled then return nil end
@@ -274,17 +255,11 @@ end
 local function startShake()
     if shakeThread then task.cancel(shakeThread); shakeThread=nil end
     shakeThread=task.spawn(function()
-        local lastClick=0
         while shakeOn do
-            local btn=getShakeButton()
-            if btn then
+            if shakeUiVisible() then
                 shakeActive=true
-                local now=tick()
-                if now-lastClick>=0.08 then
-                    lastClick=now
-                    safeGuiClick(btn)
-                end
-                task.wait(0.06+math.random()*0.03)
+                safeKeyPress(Enum.KeyCode.Return)
+                task.wait(0.05+math.random()*0.03)
             else
                 shakeActive=false
                 task.wait(0.08)
@@ -470,23 +445,6 @@ local function startCast(statusLbl)
             end
 
             if not cycleLocked then
-                -- Tenta FireServer
-                local remote=findCastRemote()
-                if remote then
-                    castActive=true; castPhase="firing"
-                    local pw=math.random(90,98)
-                    if statusLbl then statusLbl.TextColor3=Color3.fromRGB(80,255,180); statusLbl.Text="⚡ casting ("..pw..")%" end
-                    if remote:IsA("RemoteEvent") then
-                        pcall(function() remote:FireServer(pw) end)
-                    else
-                        pcall(function() remote:InvokeServer(pw) end)
-                    end
-                    safeMouseForceRelease(); _castHeld[1]=false
-                    castActive=false; castPhase="cooldown"; cycleLocked=true; clearSince=0
-                    task.wait(0.5+math.random()*0.3)
-                    goto continue
-                end
-
                 -- Fallback visual: segura mouse
                 local cGui=findCastUI()
                 if cGui then
