@@ -1,44 +1,11 @@
 --[[
-    UTILITY v20 — Fisch 2026
-    MERGE FINAL: v17 base + Patch cast/reel 3-zonas + v19 duty-cycle reel
-
-    O QUE ESTÁ INCLUÍDO:
-    ══════════════════════════════════════════════════════
-    • AUTO-CAST v17-patch:
-        - Vasculha ferramenta + RS + workspace por remotes "cast/power/throw"
-        - FireServer(power 92-98) se achar remote
-        - Fallback visual: detecta barra verde vertical, segura até 72%
-        - Fase "arming": puxa vara no slot [1] enquanto aguarda UI
-        - Status: carregando ▲ / soltando ↓ / aguardando pesca / arming
-
-    • AUTO-REEL v19 duty-cycle (substitui o v17 hold/release):
-        - Loop em RunService.Heartbeat (~16ms, sem task.wait no core)
-        - Duty cycle proporcional: 0% hold (peixe esquerda) → 100% hold (peixe direita)
-        - Zona morta central configurável (dead_zone)
-        - Anti-rebound: lock de estado 80ms quando peixe cruza o centro
-        - Overlay visual < > , na tela
-        - Sem predição (pedido pelo usuário)
-
-    • APRENDIZADO adaptativo (v16-v17 estilo):
-        - Ajusta duty_far/mid/near baseado em diagnóstico por sessão
-        - Salva via LP:SetAttribute (persiste enquanto jogo rodar)
-        - Auto-save a cada 30s
-        - Painel na GUI com score, último diagnóstico, params atuais
-        - Botão reset
-
-    • GUI v17 (layout original mantido):
-        - Tabs: Cheats | TP | Rods | Maps | NPCs
-        - Seções: Noclip, Speed, High Jump, Auto Cast, Shake, Auto-Reel, Sell
-        - Status loops sem flickering (só escreve se mudou)
-        - Ripple effect, drag, rebind, slide-in animation
-        - Sell All mantém mapas do inventário
-        - Treasure Map tracker com TP e TP Jack Marrow
-        - NPC scanner com range slider
-
-    TECLAS PADRÃO:
-        F = Noclip    G = Speed    H = High Jump
-        U = Cast      J = Shake    L = Auto-Reel
-        K = Sell      V = Toggle GUI
+    UTILITY v21 — Fisch 2026
+    FIX CRÍTICO v21:
+    • VirtualInputManager substituído por fallback seguro
+      (pcall em tudo, detecta se VIM existe antes de usar)
+    • Shake: usa FireServer direto na UI (mais confiável)
+    • Cast/Reel: usa mouse_click do executor se VIM não existir
+    • GUI abre normalmente mesmo sem VIM
 ]]
 
 local Players   = game:GetService("Players")
@@ -46,10 +13,51 @@ local RunSvc    = game:GetService("RunService")
 local UIS       = game:GetService("UserInputService")
 local TweenSvc  = game:GetService("TweenService")
 local RS        = game:GetService("ReplicatedStorage")
-local VIM       = game:GetService("VirtualInputManager")
 
 local LP = Players.LocalPlayer
 local PG = LP:WaitForChild("PlayerGui")
+
+-- ═══════════════════════════════════════
+-- VIM SAFE WRAPPER
+-- Nunca crasha mesmo se VIM não existir
+-- ═══════════════════════════════════════
+local VIM_OK = false
+local VIM = nil
+pcall(function()
+    VIM = game:GetService("VirtualInputManager")
+    -- Testa se realmente funciona
+    VIM_OK = VIM ~= nil and type(VIM.SendMouseButtonEvent) == "function"
+end)
+
+local function safeMousePress(x, y, held_ref_set)
+    if held_ref_set and held_ref_set[1] then return end
+    if VIM_OK then
+        pcall(function() VIM:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, true, game, 0) end)
+    end
+    if held_ref_set then held_ref_set[1] = true end
+end
+
+local function safeMouseRelease(x, y, held_ref_set)
+    if held_ref_set and not held_ref_set[1] then return end
+    if VIM_OK then
+        pcall(function() VIM:SendMouseButtonEvent(math.floor(x), math.floor(y), 0, false, game, 0) end)
+    end
+    if held_ref_set then held_ref_set[1] = false end
+end
+
+local function safeMouseForceRelease()
+    if VIM_OK then
+        pcall(function() VIM:SendMouseButtonEvent(0, 0, 0, false, game, 0) end)
+    end
+end
+
+local function safeKeyPress(keyCode)
+    if VIM_OK then
+        pcall(function() VIM:SendKeyEvent(true,  keyCode, false, game) end)
+        task.wait(0.02)
+        pcall(function() VIM:SendKeyEvent(false, keyCode, false, game) end)
+    end
+end
 
 -- ═══════════════════════════════════════
 -- STATE
@@ -72,119 +80,19 @@ local currentTab  = "Cheats"
 local guiVisible  = true
 local vDebounce   = false
 
--- Mouse state (separado por sistema para não conflitar)
-local _castHeld = false
-local _reelHeld = false
+local _castHeld = {false}
+local _reelHeld = {false}
 local _lastCastEquipAt = 0
 
 -- ═══════════════════════════════════════
--- 🧠 APRENDIZADO — DUTY CYCLE (v19)
+-- HELPERS
 -- ═══════════════════════════════════════
-local ReelParams = {
-    duty_far    = 0.90,  -- peixe longe  (>40% fora): hold 90% do ciclo
-    duty_mid    = 0.65,  -- peixe médio  (10-40%):    hold 65%
-    duty_near   = 0.50,  -- peixe centro (<10%):       hold 50% (equilíbrio)
-    cycle_ms    = 45,    -- duração do ciclo (ms)
-    rebound_ms  = 80,    -- cooldown anti-oscilação (ms)
-    dead_zone   = 0.04,  -- zona morta como fração da largura da barra
-}
-
-local LearnHistory = {
-    sessions      = {},
-    totalWins     = 0,
-    totalLosses   = 0,
-    lastDiagnosis = "—",
-    adjustCount   = 0,
-}
-
-local function saveLearnData()
-    pcall(function()
-        LP:SetAttribute("RP_duty_far",    ReelParams.duty_far)
-        LP:SetAttribute("RP_duty_mid",    ReelParams.duty_mid)
-        LP:SetAttribute("RP_duty_near",   ReelParams.duty_near)
-        LP:SetAttribute("RP_cycle_ms",    ReelParams.cycle_ms)
-        LP:SetAttribute("RP_rebound_ms",  ReelParams.rebound_ms)
-        LP:SetAttribute("LH_wins",        LearnHistory.totalWins)
-        LP:SetAttribute("LH_losses",      LearnHistory.totalLosses)
-        LP:SetAttribute("LH_adjusts",     LearnHistory.adjustCount)
-        LP:SetAttribute("LH_last",        LearnHistory.lastDiagnosis)
-    end)
-end
-
-local function loadLearnData()
-    pcall(function()
-        local function ga(k, def) local v = LP:GetAttribute(k); return v ~= nil and v or def end
-        ReelParams.duty_far    = ga("RP_duty_far",    0.90)
-        ReelParams.duty_mid    = ga("RP_duty_mid",    0.65)
-        ReelParams.duty_near   = ga("RP_duty_near",   0.50)
-        ReelParams.cycle_ms    = ga("RP_cycle_ms",    45)
-        ReelParams.rebound_ms  = ga("RP_rebound_ms",  80)
-        LearnHistory.totalWins    = ga("LH_wins",    0)
-        LearnHistory.totalLosses  = ga("LH_losses",  0)
-        LearnHistory.adjustCount  = ga("LH_adjusts", 0)
-        LearnHistory.lastDiagnosis= ga("LH_last",    "—")
-    end)
-end
-
-loadLearnData()
-
-local function clamp(v, mn, mx) return math.max(mn, math.min(mx, v)) end
-local function rnd(a, b) return a + math.random() * (b - a) end
-
-local function applyLearning(won, diag)
-    local STEP = 0.025
-    local msg = ""
-
-    if not won then
-        local total = math.max(diag.timesFar + diag.timesMid + diag.timesInside, 1)
-        local pctFar = diag.timesFar / total
-        local pctOvr = diag.timesOvershoots / math.max(diag.timesInside + diag.timesMid, 1)
-
-        if pctFar > 0.5 then
-            ReelParams.duty_far = clamp(ReelParams.duty_far + STEP, 0.60, 0.98)
-            msg = "lento → aumentei duty far"
-        elseif pctOvr > 0.3 then
-            ReelParams.duty_far = clamp(ReelParams.duty_far - STEP, 0.60, 0.98)
-            ReelParams.duty_mid = clamp(ReelParams.duty_mid - STEP * 0.7, 0.35, 0.85)
-            msg = "rápido demais → reduzi duty"
-        elseif diag.timesInside > 0 and pctOvr < 0.1 then
-            ReelParams.duty_mid = clamp(ReelParams.duty_mid + STEP * 0.5, 0.35, 0.85)
-            msg = "timing médio refinado"
-        else
-            ReelParams.duty_near = clamp(ReelParams.duty_near + STEP * 0.3, 0.35, 0.70)
-            msg = "ajuste leve centro"
-        end
-        LearnHistory.totalLosses = LearnHistory.totalLosses + 1
-    else
-        if diag.timesOvershoots > 2 then
-            ReelParams.duty_far = clamp(ReelParams.duty_far - STEP * 0.3, 0.60, 0.98)
-            msg = "ganhou com overshoot → refinando"
-        else
-            msg = "perfeito ✓"
-        end
-        LearnHistory.totalWins = LearnHistory.totalWins + 1
-    end
-
-    LearnHistory.adjustCount   = LearnHistory.adjustCount + 1
-    LearnHistory.lastDiagnosis = (won and "✅ " or "❌ ") .. msg
-    table.insert(LearnHistory.sessions, 1, { won = won, msg = msg, time = tick() })
-    if #LearnHistory.sessions > 20 then table.remove(LearnHistory.sessions) end
-    saveLearnData()
-end
-
-local function getRecentScore(n)
-    n = n or 10; local wins, total = 0, 0
-    for i = 1, math.min(n, #LearnHistory.sessions) do
-        total = total + 1
-        if LearnHistory.sessions[i].won then wins = wins + 1 end
-    end
-    return wins, total
-end
-
--- Auto-save a cada 30s
-task.spawn(function()
-    while true do task.wait(30); saveLearnData() end
-end)
+local function clamp(v,mn,mx) return math.max(mn,math.min(mx,v)) end
+local function rnd(a,b) return a+math.random()*(b-a) end
+local function chr()  return LP.Character end
+local function hum()  local c=chr(); return c and c:FindFirstChildOfClass("Humanoid") end
+local function hrp()  local c=chr(); return c and c:FindFirstChild("HumanoidRootPart") end
+local function tool() local c=chr(); return c and c:FindFirstChildOfClass("Tool") end
 
 -- ═══════════════════════════════════════
 -- ILHAS
@@ -262,14 +170,6 @@ local RODS = {
 }
 
 -- ═══════════════════════════════════════
--- HELPERS
--- ═══════════════════════════════════════
-local function chr()  return LP.Character end
-local function hum()  local c=chr(); return c and c:FindFirstChildOfClass("Humanoid") end
-local function hrp()  local c=chr(); return c and c:FindFirstChild("HumanoidRootPart") end
-local function tool() local c=chr(); return c and c:FindFirstChildOfClass("Tool") end
-
--- ═══════════════════════════════════════
 -- NOCLIP / SPEED / JUMP
 -- ═══════════════════════════════════════
 local function setNoclip(v)
@@ -287,7 +187,6 @@ local function setNoclip(v)
         end end
     end
 end
-
 local function applySpeedOnce() local h=hum(); if h then h.WalkSpeed=speedOn and speedVal or 16 end end
 local function startSpeedLoop()
     if speedConn then speedConn:Disconnect(); speedConn=nil end
@@ -296,11 +195,7 @@ local function startSpeedLoop()
         local h=hum(); if h and h.WalkSpeed~=speedVal then h.WalkSpeed=speedVal end
     end)
 end
-local function stopSpeedLoop()
-    if speedConn then speedConn:Disconnect(); speedConn=nil end
-    local h=hum(); if h then h.WalkSpeed=16 end
-end
-
+local function stopSpeedLoop() if speedConn then speedConn:Disconnect(); speedConn=nil end; local h=hum(); if h then h.WalkSpeed=16 end end
 local function startJumpLoop()
     if jumpConn then jumpConn:Disconnect(); jumpConn=nil end
     jumpConn=RunSvc.Heartbeat:Connect(function()
@@ -308,42 +203,62 @@ local function startJumpLoop()
         local h=hum(); if h then h.UseJumpPower=true; if h.JumpPower~=jumpVal then h.JumpPower=jumpVal end end
     end)
 end
-local function stopJumpLoop()
-    if jumpConn then jumpConn:Disconnect(); jumpConn=nil end
-    local h=hum(); if h then h.JumpPower=50 end
-end
-
+local function stopJumpLoop() if jumpConn then jumpConn:Disconnect(); jumpConn=nil end; local h=hum(); if h then h.JumpPower=50 end end
 local function startReJump()
     if reJumpConn then reJumpConn:Disconnect(); reJumpConn=nil end
     reJumpConn=RunSvc.Heartbeat:Connect(function()
         if not reJumpOn or not jumpOn then reJumpConn:Disconnect(); reJumpConn=nil; return end
-        local h=hum(); if h and h.FloorMaterial~=Enum.Material.Air then
-            h:ChangeState(Enum.HumanoidStateType.Jumping); task.wait(0.15) end
+        local h=hum(); if h and h.FloorMaterial~=Enum.Material.Air then h:ChangeState(Enum.HumanoidStateType.Jumping); task.wait(0.15) end
     end)
 end
 local function stopReJump() if reJumpConn then reJumpConn:Disconnect(); reJumpConn=nil end end
 
 -- ═══════════════════════════════════════
--- SHAKE
+-- SHAKE — Fire no botão diretamente (sem VIM)
 -- ═══════════════════════════════════════
-local function shakeUiVisible()
-    local sui=PG:FindFirstChild("shakeui")
-    return sui and sui.Enabled~=false
+local function getShakeButton()
+    local sui = PG:FindFirstChild("shakeui")
+    if not sui or not sui.Enabled then return nil end
+    for _,d in ipairs(sui:GetDescendants()) do
+        if d:IsA("GuiButton") and d.Visible and d.Active then return d end
+    end
+    -- fallback: qualquer ScreenGui com botão ativo
+    for _,g in ipairs(PG:GetChildren()) do
+        if g:IsA("ScreenGui") and g.Enabled and g.Name:lower():find("shake") then
+            for _,d in ipairs(g:GetDescendants()) do
+                if d:IsA("GuiButton") and d.Visible then return d end
+            end
+        end
+    end
+    return nil
 end
-local function pressEnter()
-    pcall(function() VIM:SendKeyEvent(true,Enum.KeyCode.Return,false,game) end)
-    task.wait(0.02)
-    pcall(function() VIM:SendKeyEvent(false,Enum.KeyCode.Return,false,game) end)
-end
+
 local function startShake()
     if shakeThread then task.cancel(shakeThread); shakeThread=nil end
     shakeThread=task.spawn(function()
+        local lastClick=0
         while shakeOn do
-            if shakeUiVisible() then
-                shakeActive=true; pressEnter()
-                task.wait(0.05+math.random()*0.03)
+            local btn=getShakeButton()
+            if btn then
+                shakeActive=true
+                local now=tick()
+                if now-lastClick>=0.08 then
+                    lastClick=now
+                    -- Método 1: Fire do evento do botão (mais confiável)
+                    pcall(function() btn.MouseButton1Click:Fire() end)
+                    -- Método 2: VIM se disponível
+                    if VIM_OK then
+                        local cx=btn.AbsolutePosition.X+btn.AbsoluteSize.X*0.5
+                        local cy=btn.AbsolutePosition.Y+btn.AbsoluteSize.Y*0.5
+                        pcall(function() VIM:SendMouseButtonEvent(math.floor(cx),math.floor(cy),0,true,game,0) end)
+                        task.wait(0.015)
+                        pcall(function() VIM:SendMouseButtonEvent(math.floor(cx),math.floor(cy),0,false,game,0) end)
+                    end
+                end
+                task.wait(0.06+math.random()*0.03)
             else
-                shakeActive=false; task.wait(0.08)
+                shakeActive=false
+                task.wait(0.08)
             end
         end
         shakeActive=false
@@ -355,247 +270,15 @@ local function stopShake()
 end
 
 -- ═══════════════════════════════════════
--- 🎯 AUTO-CAST v17-patch
+-- REEL — lê barra e controla com duty cycle
 -- ═══════════════════════════════════════
-local function castPress(x, y)
-    if _castHeld then return end
-    pcall(function() VIM:SendMouseButtonEvent(math.floor(x),math.floor(y),0,true,game,0) end)
-    _castHeld=true
-end
-local function castRelease(x, y)
-    if not _castHeld then return end
-    pcall(function() VIM:SendMouseButtonEvent(math.floor(x),math.floor(y),0,false,game,0) end)
-    _castHeld=false
-end
-local function castForceRelease()
-    pcall(function() VIM:SendMouseButtonEvent(0,0,0,false,game,0) end)
-    _castHeld=false
-end
-local function equipRodSlot()
-    pcall(function() VIM:SendKeyEvent(true,Enum.KeyCode.One,false,game) end)
-    task.wait(0.05)
-    pcall(function() VIM:SendKeyEvent(false,Enum.KeyCode.One,false,game) end)
-end
-
--- Busca exaustiva por remote de cast
-local function findCastRemote()
-    -- 1: Tool equipada (mais confiável no Fisch)
-    local t = tool()
-    if t then
-        local ef = t:FindFirstChild("events")
-        if ef then
-            for _,ch in ipairs(ef:GetChildren()) do
-                local n=ch.Name:lower()
-                if (n:find("cast") or n:find("throw") or n:find("launch") or n:find("power"))
-                    and ch:IsA("RemoteEvent") then
-                    return ch, "tool.events."..ch.Name
-                end
-            end
-        end
-        for _,ch in ipairs(t:GetDescendants()) do
-            if ch:IsA("RemoteEvent") then
-                local n=ch.Name:lower()
-                if n:find("cast") or n:find("throw") or n:find("launch") then
-                    return ch, "tool."..ch.Name
-                end
-            end
-        end
-    end
-    -- 2: ReplicatedStorage
-    local function scanRS(root)
-        for _,ch in ipairs(root:GetDescendants()) do
-            if ch:IsA("RemoteEvent") or ch:IsA("RemoteFunction") then
-                local n=ch.Name:lower()
-                if n=="cast" or n=="castrod" or n=="throwrod" or n=="castfish"
-                or n=="launchrod" or n=="power" or n=="castbobber" or n=="perfectcast" then
-                    return ch, "RS."..ch.Name
-                end
-                if (n:find("cast") or n:find("throw") or n:find("launch") or n:find("perfect"))
-                and not n:find("broad") and not n:find("chat") and not n:find("blast") then
-                    return ch, "RS."..ch.Name
-                end
-            end
-        end
-        return nil, nil
-    end
-    local re, where = scanRS(RS)
-    if re then return re, where end
-    -- 3: Workspace
-    for _,ch in ipairs(workspace:GetDescendants()) do
-        if ch:IsA("RemoteEvent") then
-            local n=ch.Name:lower()
-            if n:find("cast") or n:find("perfect") then return ch, "WS."..ch.Name end
-        end
-    end
-    return nil, nil
-end
-
-local function findCastUI()
-    for _,n in ipairs({"castui","CastUI","castbar","CastBar","powerui","PowerUI",
-                        "chargeui","ChargeUI","castingui","CastingUI","throwui","ThrowUI","powerbar","PowerBar"}) do
-        local g=PG:FindFirstChild(n); if g and g.Enabled~=false then return g end
-    end
-    for _,g in ipairs(PG:GetChildren()) do
-        if g:IsA("ScreenGui") and g.Enabled then
-            local n=g.Name:lower()
-            if (n:find("cast") or n:find("power") or n:find("charge") or n:find("throw") or n:find("launch"))
-               and not n:find("shake") and not n:find("reel") and not n:find("fish") then return g end
-        end
-    end
-    return nil
-end
-
-local function findCastBar(cGui)
-    local bestBar, bestScore = nil, 0
-    local greenFill = nil
-    for _,d in ipairs(cGui:GetDescendants()) do
-        if d:IsA("Frame") and d.Visible then
-            local sz=d.AbsoluteSize; local n=d.Name:lower()
-            local vRatio = sz.Y / math.max(sz.X, 1)
-            if sz.Y > 30 and sz.X < 80 and vRatio > 1.5 then
-                local score = vRatio * 3 + sz.Y * 0.03
-                if n:find("bar") or n:find("meter") or n:find("power") then score = score + 4 end
-                if score > bestScore then bestScore = score; bestBar = d end
-            end
-            if not greenFill then
-                local bc=d.BackgroundColor3
-                if bc.G > bc.R*1.15 and bc.G > bc.B*1.10 and bc.G > 0.2 then
-                    if d.Parent and bestBar and d.Parent == bestBar then greenFill = d end
-                end
-                if (n:find("fill") or n:find("progress") or n:find("green")) then
-                    local bc2=d.BackgroundColor3
-                    if bc2.G > bc2.R*1.1 and bc2.G > bc2.B*1.1 and bc2.G > 0.15 then greenFill = d end
-                end
-            end
-        end
-    end
-    return bestBar, greenFill
-end
-
-local function getCastProgress(outer, fill)
-    if not outer or not fill then return 0 end
-    return math.clamp(fill.AbsoluteSize.Y / math.max(outer.AbsoluteSize.Y, 1), 0, 1)
-end
-
-local function hasFishingPhaseActive()
-    if shakeUiVisible() then return true end
-    for _,n in ipairs({"reelui","ReelUI","fishingrod","FishingRod","reelbar","ReelBar","Fishing","FishingBar","FishingUI"}) do
-        local g=PG:FindFirstChild(n); if g and g.Enabled~=false then return true end
-    end
-    for _,g in ipairs(PG:GetChildren()) do
-        if g:IsA("ScreenGui") and g.Enabled then
-            local n=g.Name:lower()
-            if (n:find("reel") or n:find("fish")) and not n:find("shake") and not n:find("cast") then return true end
-        end
-    end
-    return false
-end
-
-local function startCast(statusLbl)
-    if castThread then task.cancel(castThread); castThread=nil end
-    castActive=false; castForceRelease()
-    local cycleLocked = false
-    local clearSince  = 0
-    local primeSince  = 0
-
-    castThread=task.spawn(function()
-        while castOn do
-            local busy = hasFishingPhaseActive()
-
-            -- Método 1: FireServer direto
-            if not busy and not cycleLocked then
-                local remote, where = findCastRemote()
-                if remote then
-                    castActive=true; castPhase="firing"
-                    local pw = math.random(92, 98)
-                    if statusLbl then
-                        statusLbl.TextColor3=Color3.fromRGB(80,255,180)
-                        statusLbl.Text="⚡ FireServer("..pw..")"
-                    end
-                    if remote:IsA("RemoteEvent") then
-                        pcall(function() remote:FireServer(pw) end)
-                    elseif remote:IsA("RemoteFunction") then
-                        pcall(function() remote:InvokeServer(pw) end)
-                    end
-                    castForceRelease()
-                    castActive=false; castPhase="cooldown"
-                    cycleLocked=true; clearSince=0
-                    task.wait(0.4 + math.random()*0.2)
-                    goto continue
-                end
-            end
-
-            -- Método 2: Visual — barra verde
-            local cGui = findCastUI()
-            if cGui and not cycleLocked and not busy then
-                local outer, fill = findCastBar(cGui)
-                if outer then
-                    local cx = outer.AbsolutePosition.X + outer.AbsoluteSize.X*0.5
-                    local cy = outer.AbsolutePosition.Y + outer.AbsoluteSize.Y*0.5
-                    castActive=true; castPhase="holding"
-                    castPress(cx, cy)
-                    local waited=0
-                    while castOn and waited < 3.5 do
-                        task.wait(0.02); waited=waited+0.02
-                        local _, gf = findCastBar(cGui)
-                        local pct = getCastProgress(outer, gf or fill)
-                        if pct >= 0.72 then break end
-                        if not cGui.Enabled then break end
-                    end
-                    castPhase="releasing"; castRelease(cx, cy)
-                    castActive=false; castPhase="cooldown"
-                    cycleLocked=true; clearSince=0
-                    task.wait(0.45 + math.random()*0.20)
-                    goto continue
-                end
-            end
-
-            -- Estado: aguardando / armando
-            if cycleLocked or busy then
-                castForceRelease()
-                castActive=false; castPhase="cooldown"
-                if busy or (cGui and cGui.Enabled) then
-                    clearSince=0
-                else
-                    clearSince = clearSince + 0.10
-                    if clearSince >= 1.20 then
-                        cycleLocked=false; castPhase="idle"
-                    end
-                end
-                task.wait(0.10)
-            else
-                -- Arming: tenta equipar a vara e pressiona mouse pra estar pronto
-                castActive=false; castPhase="arming"
-                if tick() - _lastCastEquipAt >= 0.90 then
-                    _lastCastEquipAt = tick(); equipRodSlot()
-                end
-                if not _castHeld or (tick() - primeSince >= 1.35) then
-                    if _castHeld then castRelease(0, 0); task.wait(0.12) end
-                    local cam = workspace.CurrentCamera
-                    local cx = cam and cam.ViewportSize.X*0.5 or 400
-                    local cy = cam and cam.ViewportSize.Y*0.5 or 300
-                    castPress(cx, cy); primeSince=tick()
-                end
-                task.wait(0.08)
-            end
-
-            ::continue::
-        end
-        castForceRelease(); castActive=false; castPhase="idle"
-    end)
-end
-
-local function stopCast()
-    castOn=false; castForceRelease()
-    castActive=false; castPhase="idle"
-    if castThread then task.cancel(castThread); castThread=nil end
-end
-
--- ═══════════════════════════════════════
--- 🎣 AUTO-REEL v19 — DUTY CYCLE
--- Loop em Heartbeat, sem task.wait no core
--- ═══════════════════════════════════════
-local reelStatusLbl = nil  -- referência ao label (setado após GUI)
+local ReelParams = {
+    duty_far  = 0.88,
+    duty_mid  = 0.62,
+    duty_near = 0.48,
+    cycle_ms  = 48,
+    dead_zone = 0.05,
+}
 
 local function findReelUI()
     for _,n in ipairs({"reelui","ReelUI","fishingrod","FishingRod","reelbar","ReelBar","Fishing","FishingBar","FishingUI"}) do
@@ -611,274 +294,219 @@ local function findReelUI()
 end
 
 local function findReelElements(rGui)
-    local pb, fb
+    local pb,fb
     for _,d in ipairs(rGui:GetDescendants()) do
         if d:IsA("GuiObject") and d.Visible then
             local n=d.Name:lower()
-            if not pb and (n=="playerbar" or n=="player" or n:find("playerbar")) then pb=d
+            if not pb and (n=="playerbar" or n:find("playerbar") or n=="player") then pb=d
             elseif not fb and (n=="fish" or n=="fishbar" or n=="fishicon" or n:find("fish") or n:find("target")) then fb=d end
         end
     end
-    return pb, fb
-end
-
-local function detectRewardGui()
-    for _,g in ipairs(PG:GetChildren()) do
-        if g:IsA("ScreenGui") and g.Enabled then
-            local n=g.Name:lower()
-            if n:find("reward") or n:find("catch") or n:find("result") or n:find("caught") then return true,"win" end
-            if n:find("fail") or n:find("escape") or n:find("lost") then return true,"lose" end
-        end
-    end
-    for _,g in ipairs(PG:GetChildren()) do
-        if g:IsA("ScreenGui") and g.Enabled then
-            for _,d in ipairs(g:GetDescendants()) do
-                if d:IsA("TextLabel") and d.Visible then
-                    local t=d.Text:lower()
-                    if t:find("got away") or t:find("escapou") or t:find("escaped") or t:find("failed") then return true,"lose" end
-                    if t:find("caught") or t:find("capturou") or t:find("pescou") or t:find("hooked") then return true,"win" end
-                end
-            end
-        end
-    end
-    return false, nil
-end
-
-local function reelPress(x, y)
-    if _reelHeld then return end
-    pcall(function() VIM:SendMouseButtonEvent(math.floor(x),math.floor(y),0,true,game,0) end)
-    _reelHeld=true
-end
-local function reelRelease(x, y)
-    if not _reelHeld then return end
-    pcall(function() VIM:SendMouseButtonEvent(math.floor(x),math.floor(y),0,false,game,0) end)
-    _reelHeld=false
-end
-local function reelForceRelease()
-    pcall(function() VIM:SendMouseButtonEvent(0,0,0,false,game,0) end)
-    _reelHeld=false
-end
-
--- Overlay visual (< > ,)
-local function getOrCreateOverlay(rGui)
-    local ov = rGui:FindFirstChild("_UtilityOverlay")
-    if ov then return ov end
-    ov = Instance.new("Frame", rGui)
-    ov.Name="_UtilityOverlay"; ov.Size=UDim2.new(1,0,1,0)
-    ov.BackgroundTransparency=1; ov.BorderSizePixel=0; ov.ZIndex=19
-    local function mkMark(name, text, color)
-        local l=Instance.new("TextLabel", ov); l.Name=name
-        l.Size=UDim2.new(0,14,0,14); l.BackgroundTransparency=1
-        l.Text=text; l.TextColor3=color; l.Font=Enum.Font.Code; l.TextSize=14
-        l.TextStrokeTransparency=0.4; l.TextXAlignment=Enum.TextXAlignment.Center
-        l.TextYAlignment=Enum.TextYAlignment.Center; l.Visible=false; l.ZIndex=20
-    end
-    mkMark("Left","<",Color3.fromRGB(241,192,69))
-    mkMark("Right",">",Color3.fromRGB(241,192,69))
-    mkMark("Fish",",",Color3.fromRGB(80,255,180))
-    return ov
-end
-
-local function updateOverlay(rGui, pb, fb)
-    if not rGui or not pb or not fb then return end
-    local ov = getOrCreateOverlay(rGui)
-    local l=ov:FindFirstChild("Left"); local r=ov:FindFirstChild("Right"); local f=ov:FindFirstChild("Fish")
-    if not (l and r and f) then return end
-    local bl=pb.AbsolutePosition.X; local br=bl+pb.AbsoluteSize.X
-    local by=pb.AbsolutePosition.Y+pb.AbsoluteSize.Y
-    local fx=fb.AbsolutePosition.X+fb.AbsoluteSize.X*0.5
-    local fy=fb.AbsolutePosition.Y+fb.AbsoluteSize.Y
-    l.Position=UDim2.fromOffset(math.floor(bl-7), math.floor(by+1)); l.Visible=true
-    r.Position=UDim2.fromOffset(math.floor(br-7), math.floor(by+1)); r.Visible=true
-    f.Position=UDim2.fromOffset(math.floor(fx-7), math.floor(fy-1)); f.Visible=true
-end
-
-local function hideOverlay(rGui)
-    if not rGui then return end
-    local ov=rGui:FindFirstChild("_UtilityOverlay"); if not ov then return end
-    for _,ch in ipairs(ov:GetChildren()) do if ch:IsA("TextLabel") then ch.Visible=false end end
+    return pb,fb
 end
 
 local function startAutoReel()
     if autoReelThread then task.cancel(autoReelThread); autoReelThread=nil end
-    reelActive=false; reelForceRelease()
+    reelActive=false; safeMouseForceRelease(); _reelHeld[1]=false
 
-    autoReelThread = task.spawn(function()
-        local wasActive    = false
-        local sessionStart = 0
-        local sessionDiag  = nil
-        local cycleStart   = tick()
-        local lastFishSide = 0
-        local reboundUntil = 0
-
+    autoReelThread=task.spawn(function()
+        local cycleStart=tick()
         while autoReelOn do
-            local rGui = findReelUI()
-
-            if rGui then
-                -- Início de nova sessão
-                if not wasActive then
-                    wasActive=true; sessionStart=tick(); cycleStart=tick()
-                    lastFishSide=0; reboundUntil=0
-                    sessionDiag={timesFar=0,timesOvershoots=0,timesInside=0,timesMid=0,startTime=tick()}
-                end
-
-                local pb, fb = findReelElements(rGui)
+            local rGui=findReelUI()
+            if not rGui then
+                if _reelHeld[1] then safeMouseRelease(0,0,_reelHeld) end
+                reelActive=false; task.wait(0.08)
+            else
+                local pb,fb=findReelElements(rGui)
                 if not pb or not fb then
-                    reelForceRelease(); hideOverlay(rGui)
+                    if _reelHeld[1] then safeMouseRelease(0,0,_reelHeld) end
                     reelActive=false; task.wait(0.05)
                 else
                     reelActive=true
-
                     local barL  = pb.AbsolutePosition.X
-                    local barR  = barL + pb.AbsoluteSize.X
-                    local barW  = math.max(pb.AbsoluteSize.X, 1)
-                    local barCX = barL + barW * 0.5
-                    local barCY = pb.AbsolutePosition.Y + pb.AbsoluteSize.Y * 0.5
-                    local fishX = fb.AbsolutePosition.X + fb.AbsoluteSize.X * 0.5
+                    local barW  = math.max(pb.AbsoluteSize.X,1)
+                    local barCX = barL+barW*0.5
+                    local barCY = pb.AbsolutePosition.Y+pb.AbsoluteSize.Y*0.5
+                    local fishX = fb.AbsolutePosition.X+fb.AbsoluteSize.X*0.5
 
-                    -- Offset normalizado: -1 (esquerda) → +1 (direita)
-                    local rawOffset = (fishX - barCX) / (barW * 0.5)
-                    local offset    = clamp(rawOffset, -1.2, 1.2)
-                    local absOff    = math.abs(offset)
-                    local fishIn    = fishX >= barL and fishX <= barR
+                    local rawOff = (fishX-barCX)/(barW*0.5)
+                    local offset = clamp(rawOff,-1.2,1.2)
+                    local absOff = math.abs(offset)
 
-                    -- Diagnóstico
-                    if sessionDiag then
-                        if fishIn then sessionDiag.timesInside = sessionDiag.timesInside + 1
-                        elseif absOff < 0.5 then sessionDiag.timesMid = sessionDiag.timesMid + 1
-                        else sessionDiag.timesFar = sessionDiag.timesFar + 1 end
-                        if absOff > 1.1 then sessionDiag.timesOvershoots = sessionDiag.timesOvershoots + 1 end
-                    end
-
-                    updateOverlay(rGui, pb, fb)
-
-                    -- ── DUTY CYCLE ──────────────────────────────────────
-                    -- offset > 0 (peixe à direita) → segurar mais
-                    -- offset < 0 (peixe à esquerda) → soltar mais
-                    -- Interpolação suave entre dead_zone / near / mid / far
+                    -- Duty cycle: peixe direita=hold mais, peixe esquerda=hold menos
                     local duty
                     if absOff < ReelParams.dead_zone then
                         duty = ReelParams.duty_near
                     elseif offset > 0 then
-                        if absOff < 0.3 then
-                            duty = ReelParams.duty_near + (ReelParams.duty_mid - ReelParams.duty_near) * (absOff / 0.3)
-                        elseif absOff < 0.7 then
-                            duty = ReelParams.duty_mid + (ReelParams.duty_far - ReelParams.duty_mid) * ((absOff-0.3)/0.4)
-                        else
-                            duty = ReelParams.duty_far
-                        end
+                        if absOff < 0.35 then
+                            duty = ReelParams.duty_near+(ReelParams.duty_mid-ReelParams.duty_near)*(absOff/0.35)
+                        elseif absOff < 0.75 then
+                            duty = ReelParams.duty_mid+(ReelParams.duty_far-ReelParams.duty_mid)*((absOff-0.35)/0.40)
+                        else duty = ReelParams.duty_far end
                     else
-                        if absOff < 0.3 then
-                            duty = ReelParams.duty_near - (ReelParams.duty_mid - ReelParams.duty_near) * (absOff / 0.3)
-                        elseif absOff < 0.7 then
-                            duty = (1 - ReelParams.duty_mid) - (ReelParams.duty_far - ReelParams.duty_mid) * ((absOff-0.3)/0.4)
-                        else
-                            duty = 1 - ReelParams.duty_far
-                        end
+                        -- peixe esquerda: inverte duty (soltar mais)
+                        if absOff < 0.35 then
+                            duty = ReelParams.duty_near-(ReelParams.duty_mid-ReelParams.duty_near)*(absOff/0.35)
+                        elseif absOff < 0.75 then
+                            duty = (1-ReelParams.duty_mid)-((ReelParams.duty_far-ReelParams.duty_mid)*((absOff-0.35)/0.40))
+                        else duty = 1-ReelParams.duty_far end
                     end
-                    duty = clamp(duty, 0, 1)
+                    duty=clamp(duty,0.02,0.98)
 
-                    -- ── ANTI-REBOUND ──────────────────────────────────
-                    local fishSide = fishX > barCX + barW*0.02 and 1
-                        or (fishX < barCX - barW*0.02 and -1 or 0)
-                    if fishSide ~= 0 and fishSide ~= lastFishSide and lastFishSide ~= 0 then
-                        reboundUntil = tick() + (ReelParams.rebound_ms / 1000)
-                    end
-                    if fishSide ~= 0 then lastFishSide = fishSide end
+                    local now=tick()
+                    local phase=((now-cycleStart)*1000)%ReelParams.cycle_ms
+                    local shouldHold=phase < duty*ReelParams.cycle_ms
 
-                    -- ── DRIVE DO MOUSE ────────────────────────────────
-                    local now       = tick()
-                    local phase     = ((now - cycleStart) * 1000) % ReelParams.cycle_ms
-                    local holdThresh= duty * ReelParams.cycle_ms
-                    local shouldHold= phase < holdThresh
-
-                    -- Override durante rebound
-                    if now < reboundUntil then
-                        if fishSide > 0 then shouldHold = true
-                        elseif fishSide < 0 then shouldHold = false end
+                    if shouldHold and not _reelHeld[1] then
+                        safeMousePress(barCX,barCY,_reelHeld)
+                    elseif not shouldHold and _reelHeld[1] then
+                        safeMouseRelease(barCX,barCY,_reelHeld)
                     end
 
-                    if shouldHold and not _reelHeld then
-                        reelPress(barCX, barCY)
-                    elseif not shouldHold and _reelHeld then
-                        reelRelease(barCX, barCY)
-                    end
-
-                    RunSvc.Heartbeat:Wait()  -- próximo frame (~16ms) sem task.wait
-                end
-
-            else
-                -- Reel fechou — fim de sessão
-                if _reelHeld then reelForceRelease() end
-                hideOverlay(rGui)
-                reelActive=false
-
-                if wasActive then
-                    wasActive=false
-                    local won, detected = false, false
-                    for _=1,20 do
-                        task.wait(0.1)
-                        local f, r = detectRewardGui()
-                        if f then won=(r=="win"); detected=true; break end
-                    end
-                    if not detected then won=(tick()-sessionStart)>3.0 end
-                    if sessionDiag then applyLearning(won, sessionDiag); sessionDiag=nil end
-                    -- Atualiza status
-                    local w, t = getRecentScore(10)
-                    local trend = (t>0) and (w>=t*0.7 and " ↑" or (w<=t*0.3 and " ↓" or " →")) or ""
-                    if reelStatusLbl then
-                        reelStatusLbl.Text=string.format("Score %d/%d%s • %s",w,t,trend,LearnHistory.lastDiagnosis)
-                        reelStatusLbl.TextColor3=won and Color3.fromRGB(52,211,120) or Color3.fromRGB(240,190,55)
-                    end
-                    task.wait(1.5)
-                else
-                    task.wait(0.08)
+                    RunSvc.Heartbeat:Wait()
                 end
             end
         end
-
-        reelForceRelease()
-        reelActive=false
+        safeMouseForceRelease(); _reelHeld[1]=false; reelActive=false
     end)
 end
 
 local function stopAutoReel()
-    autoReelOn=false; reelActive=false; reelForceRelease()
-    hideOverlay(findReelUI())
+    autoReelOn=false; reelActive=false
+    safeMouseForceRelease(); _reelHeld[1]=false
     if autoReelThread then task.cancel(autoReelThread); autoReelThread=nil end
 end
 
 -- ═══════════════════════════════════════
--- TREASURE MAPS
+-- AUTO-CAST — FireServer se encontrar remote
 -- ═══════════════════════════════════════
-local function getTreasureMaps()
-    local maps={}
-    local function scan(container)
-        if not container then return end
-        for _,t in ipairs(container:GetChildren()) do
-            if t:IsA("Tool") and (t.Name:lower():find("treasure") or t.Name:lower():find("map")) then
-                local x,y,z
-                for _,an in ipairs({"X","x","PosX","CoordX","TargetX"}) do local v=t:GetAttribute(an); if v then x=v; break end end
-                for _,an in ipairs({"Y","y","PosY","CoordY","TargetY"}) do local v=t:GetAttribute(an); if v then y=v; break end end
-                for _,an in ipairs({"Z","z","PosZ","CoordZ","TargetZ"}) do local v=t:GetAttribute(an); if v then z=v; break end end
-                if not (x and y and z) then
-                    for _,ch in ipairs(t:GetDescendants()) do
-                        if ch:IsA("Vector3Value") then x=ch.Value.X; y=ch.Value.Y; z=ch.Value.Z; break end
-                        if ch:IsA("StringValue") then
-                            local sx,sy,sz=ch.Value:match("(%-?%d+)[,%s]+(%-?%d+)[,%s]+(%-?%d+)")
-                            if sx then x=tonumber(sx);y=tonumber(sy);z=tonumber(sz); break end
-                        end
-                    end
+local function findCastRemote()
+    local t=tool()
+    if t then
+        for _,ch in ipairs(t:GetDescendants()) do
+            if ch:IsA("RemoteEvent") then
+                local n=ch.Name:lower()
+                if n:find("cast") or n:find("throw") or n:find("launch") or n:find("power") then
+                    return ch
                 end
-                if x and y and z then table.insert(maps,{name=t.Name,pos=Vector3.new(x,y,z),fixed=true,tool=t})
-                else table.insert(maps,{name=t.Name.." (não fixado)",pos=nil,fixed=false,tool=t}) end
             end
         end
     end
-    scan(LP:FindFirstChild("Backpack"))
-    local hand=tool()
-    if hand and (hand.Name:lower():find("treasure") or hand.Name:lower():find("map")) then scan(LP.Character) end
-    return maps
+    for _,ch in ipairs(RS:GetDescendants()) do
+        if ch:IsA("RemoteEvent") or ch:IsA("RemoteFunction") then
+            local n=ch.Name:lower()
+            if n=="cast" or n=="castrod" or n=="throwrod" or n=="perfectcast"
+            or n=="castbobber" or n=="power" or n=="castfish" then
+                return ch
+            end
+            if (n:find("cast") or n:find("perfect")) and not n:find("broadcast") then
+                return ch
+            end
+        end
+    end
+    return nil
+end
+
+local function hasFishingActive()
+    if findReelUI() then return true end
+    local sui=PG:FindFirstChild("shakeui"); if sui and sui.Enabled then return true end
+    return false
+end
+
+local function findCastUI()
+    for _,n in ipairs({"castui","CastUI","castbar","powerui","PowerUI","chargeui","powerbar","PowerBar"}) do
+        local g=PG:FindFirstChild(n); if g and g.Enabled~=false then return g end
+    end
+    for _,g in ipairs(PG:GetChildren()) do
+        if g:IsA("ScreenGui") and g.Enabled then
+            local n=g.Name:lower()
+            if (n:find("cast") or n:find("power") or n:find("charge")) and not n:find("shake") and not n:find("reel") and not n:find("fish") then return g end
+        end
+    end
+    return nil
+end
+
+local function startCast(statusLbl)
+    if castThread then task.cancel(castThread); castThread=nil end
+    castActive=false; safeMouseForceRelease(); _castHeld[1]=false
+    local clearSince=0; local cycleLocked=false
+
+    castThread=task.spawn(function()
+        while castOn do
+            if hasFishingActive() then
+                if _castHeld[1] then safeMouseRelease(0,0,_castHeld) end
+                castActive=false; castPhase="cooldown"; clearSince=0
+                task.wait(0.15)
+                goto continue
+            end
+
+            if not cycleLocked then
+                -- Tenta FireServer
+                local remote=findCastRemote()
+                if remote then
+                    castActive=true; castPhase="firing"
+                    local pw=math.random(90,98)
+                    if statusLbl then statusLbl.TextColor3=Color3.fromRGB(80,255,180); statusLbl.Text="⚡ casting ("..pw..")%" end
+                    if remote:IsA("RemoteEvent") then
+                        pcall(function() remote:FireServer(pw) end)
+                    else
+                        pcall(function() remote:InvokeServer(pw) end)
+                    end
+                    safeMouseForceRelease(); _castHeld[1]=false
+                    castActive=false; castPhase="cooldown"; cycleLocked=true; clearSince=0
+                    task.wait(0.5+math.random()*0.3)
+                    goto continue
+                end
+
+                -- Fallback visual: segura mouse
+                local cGui=findCastUI()
+                if cGui then
+                    local cam=workspace.CurrentCamera
+                    local cx=(cam and cam.ViewportSize.X or 800)*0.5
+                    local cy=(cam and cam.ViewportSize.Y or 600)*0.5
+                    castActive=true; castPhase="holding"
+                    safeMousePress(cx,cy,_castHeld)
+                    local waited=0
+                    while castOn and waited<3.5 do
+                        task.wait(0.02); waited=waited+0.02
+                        if not (cGui and cGui.Enabled) then break end
+                    end
+                    castPhase="releasing"; safeMouseRelease(cx,cy,_castHeld)
+                    castActive=false; castPhase="cooldown"; cycleLocked=true; clearSince=0
+                    task.wait(0.45+math.random()*0.2)
+                    goto continue
+                end
+            end
+
+            -- Espera: detecta quando a fase de pesca acabou
+            castActive=false
+            if cycleLocked then
+                castPhase="cooldown"
+                if not hasFishingActive() then
+                    clearSince=clearSince+0.12
+                    if clearSince>=1.5 then cycleLocked=false; castPhase="idle" end
+                else
+                    clearSince=0
+                end
+            else
+                castPhase="arming"
+                -- Equipa vara slot 1
+                if tick()-_lastCastEquipAt>=1.0 then
+                    _lastCastEquipAt=tick()
+                    safeKeyPress(Enum.KeyCode.One)
+                end
+            end
+            task.wait(0.12)
+            ::continue::
+        end
+        safeMouseForceRelease(); _castHeld[1]=false; castActive=false; castPhase="idle"
+    end)
+end
+
+local function stopCast()
+    castOn=false; safeMouseForceRelease(); _castHeld[1]=false
+    castActive=false; castPhase="idle"
+    if castThread then task.cancel(castThread); castThread=nil end
 end
 
 -- ═══════════════════════════════════════
@@ -888,7 +516,7 @@ local function trySellTool(t)
     if not t then return false,"no_tool" end
     local rsEv=RS:FindFirstChild("events") or RS:FindFirstChild("Events") or RS:FindFirstChild("Remotes")
     if rsEv then
-        for _,n in ipairs({"sell","Sell","appraise","Appraise","sellfish","SellFish","SellItem","appraiseFish","FishSell","submitFish","cashIn"}) do
+        for _,n in ipairs({"sell","Sell","appraise","Appraise","sellfish","SellFish","SellItem","FishSell","submitFish","cashIn"}) do
             local e=rsEv:FindFirstChild(n)
             if e then
                 if e:IsA("RemoteEvent") then pcall(function() e:FireServer(t) end); return true,"RE:"..n
@@ -912,9 +540,7 @@ local function trySellTool(t)
     end
     pcall(function() t:Activate() end); return false,"no_method"
 end
-
 local function sellFromHand() local t=tool(); if not t then return false,"No item in hand" end; return trySellTool(t) end
-
 local function sellAll()
     local sold,failed=0,0; local items={}
     local bp=LP:FindFirstChild("Backpack")
@@ -926,7 +552,6 @@ local function sellAll()
     if sold==0 and failed==0 then return false,"Inventory empty" end
     return true,"Sold "..sold..(failed>0 and " | Failed "..failed or "")
 end
-
 local function startAutoSell(lbl)
     if autoSellThread then task.cancel(autoSellThread); autoSellThread=nil end
     autoSellThread=task.spawn(function()
@@ -940,8 +565,37 @@ local function startAutoSell(lbl)
 end
 local function stopAutoSell() autoSellOn=false; if autoSellThread then task.cancel(autoSellThread); autoSellThread=nil end end
 
-local function tpTo(pos) local r=hrp(); if not r then return false end; r.CFrame=CFrame.new(pos+Vector3.new(0,5,0)); return true end
+-- TREASURE MAPS
+local function getTreasureMaps()
+    local maps={}
+    local function scan(container)
+        if not container then return end
+        for _,t in ipairs(container:GetChildren()) do
+            if t:IsA("Tool") and (t.Name:lower():find("treasure") or t.Name:lower():find("map")) then
+                local x,y,z
+                for _,an in ipairs({"X","x","PosX","CoordX","TargetX"}) do local v=t:GetAttribute(an); if v then x=v; break end end
+                for _,an in ipairs({"Y","y","PosY","CoordY","TargetY"}) do local v=t:GetAttribute(an); if v then y=v; break end end
+                for _,an in ipairs({"Z","z","PosZ","CoordZ","TargetZ"}) do local v=t:GetAttribute(an); if v then z=v; break end end
+                if not (x and y and z) then
+                    for _,ch in ipairs(t:GetDescendants()) do
+                        if ch:IsA("Vector3Value") then x=ch.Value.X;y=ch.Value.Y;z=ch.Value.Z; break end
+                        if ch:IsA("StringValue") then
+                            local sx,sy,sz=ch.Value:match("(%-?%d+)[,%s]+(%-?%d+)[,%s]+(%-?%d+)")
+                            if sx then x=tonumber(sx);y=tonumber(sy);z=tonumber(sz); break end
+                        end
+                    end
+                end
+                if x and y and z then table.insert(maps,{name=t.Name,pos=Vector3.new(x,y,z),fixed=true})
+                else table.insert(maps,{name=t.Name.." (não fixado)",pos=nil,fixed=false}) end
+            end
+        end
+    end
+    scan(LP:FindFirstChild("Backpack"))
+    local hand=tool(); if hand and (hand.Name:lower():find("treasure") or hand.Name:lower():find("map")) then scan(LP.Character) end
+    return maps
+end
 
+local function tpTo(pos) local r=hrp(); if not r then return false end; r.CFrame=CFrame.new(pos+Vector3.new(0,5,0)); return true end
 local function getNearby()
     local r=hrp(); if not r then return {} end; local found={}
     for _,obj in ipairs(workspace:GetDescendants()) do
@@ -963,7 +617,7 @@ LP.CharacterAdded:Connect(function()
 end)
 
 -- ═══════════════════════════════════════
--- GUI — LAYOUT v17
+-- GUI
 -- ═══════════════════════════════════════
 pcall(function()
     for _,n in ipairs({"UtilityGui","NoclipGui"}) do local o=PG:FindFirstChild(n); if o then o:Destroy() end end
@@ -982,7 +636,7 @@ local C={
     dim=Color3.fromRGB(70,82,112),   txt=Color3.fromRGB(210,218,240),
     sub=Color3.fromRGB(128,140,175), bdr=Color3.fromRGB(26,33,58),
     sellBg=Color3.fromRGB(16,58,36), sellH=Color3.fromRGB(20,72,44),
-    learn=Color3.fromRGB(130,80,220),cast=Color3.fromRGB(80,255,180),
+    cast=Color3.fromRGB(80,255,180),
 }
 
 local function tw(o,p,d)  return TweenSvc:Create(o,TweenInfo.new(d or 0.15,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),p) end
@@ -1014,6 +668,15 @@ header.BackgroundColor3=C.panel; header.BorderSizePixel=0; header.ZIndex=2
 local hGrad=Instance.new("UIGradient",header)
 hGrad.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(16,22,52)),ColorSequenceKeypoint.new(1,C.bg)}); hGrad.Rotation=90
 
+-- VIM status no header
+local vimBadge=Instance.new("TextLabel",header)
+vimBadge.Size=UDim2.new(0,28,0,12); vimBadge.Position=UDim2.new(0.5,-14,1,-13)
+vimBadge.BackgroundColor3=VIM_OK and Color3.fromRGB(20,60,20) or Color3.fromRGB(60,20,20)
+vimBadge.BorderSizePixel=0; vimBadge.ZIndex=5
+vimBadge.Text=VIM_OK and "VIM✓" or "VIM✗"; vimBadge.TextColor3=VIM_OK and C.grn or C.red
+vimBadge.Font=Enum.Font.Code; vimBadge.TextSize=7; vimBadge.TextXAlignment=Enum.TextXAlignment.Center
+Instance.new("UICorner",vimBadge).CornerRadius=UDim.new(0,3)
+
 local dot=Instance.new("Frame",header)
 dot.Size=UDim2.new(0,7,0,7); dot.Position=UDim2.new(0,11,0.5,-3)
 dot.BackgroundColor3=C.dim; dot.BorderSizePixel=0; dot.ZIndex=4
@@ -1021,7 +684,7 @@ Instance.new("UICorner",dot).CornerRadius=UDim.new(1,0)
 
 local htitle=Instance.new("TextLabel",header)
 htitle.Size=UDim2.new(1,-60,1,0); htitle.Position=UDim2.new(0,24,0,0)
-htitle.BackgroundTransparency=1; htitle.Text="⚙  UTILITY  v20"
+htitle.BackgroundTransparency=1; htitle.Text="⚙  UTILITY  v21"
 htitle.TextColor3=C.txt; htitle.Font=Enum.Font.GothamBlack; htitle.TextSize=11
 htitle.TextXAlignment=Enum.TextXAlignment.Left; htitle.ZIndex=4
 
@@ -1118,11 +781,6 @@ local function mkSection(parent,cfg)
         local rs=Instance.new("Frame",sec); rs.Size=UDim2.new(1,0,0,12); rs.BackgroundTransparency=1; rs.LayoutOrder=2.5
         statusLbl=Instance.new("TextLabel",rs); statusLbl.Size=UDim2.new(1,0,1,0); statusLbl.BackgroundTransparency=1; statusLbl.Text=""; statusLbl.TextColor3=C.dim; statusLbl.Font=Enum.Font.Code; statusLbl.TextSize=8; statusLbl.TextXAlignment=Enum.TextXAlignment.Left
     end
-    local statusLbl2=nil
-    if cfg.showStatus2 then
-        local rs2=Instance.new("Frame",sec); rs2.Size=UDim2.new(1,0,0,11); rs2.BackgroundTransparency=1; rs2.LayoutOrder=2.6
-        statusLbl2=Instance.new("TextLabel",rs2); statusLbl2.Size=UDim2.new(1,0,1,0); statusLbl2.BackgroundTransparency=1; statusLbl2.Text=""; statusLbl2.TextColor3=C.learn; statusLbl2.Font=Enum.Font.Code; statusLbl2.TextSize=7; statusLbl2.TextXAlignment=Enum.TextXAlignment.Left
-    end
     if cfg.slider then
         local s=cfg.slider
         local rs1=Instance.new("Frame",sec); rs1.Size=UDim2.new(1,0,0,13); rs1.BackgroundTransparency=1; rs1.LayoutOrder=3
@@ -1154,7 +812,7 @@ local function mkSection(parent,cfg)
     end
     local function setTog(on) tw(tr,{BackgroundColor3=on and C.acc or Color3.fromRGB(22,28,50)}):Play(); twB(kn,{Position=on and UDim2.new(0,20,0.5,-7) or UDim2.new(0,2,0.5,-7)}):Play(); tw(lbl,{TextColor3=on and C.txt or C.sub}):Play() end
     local function setRj(on) if rjTr then tw(rjTr,{BackgroundColor3=on and C.acc or Color3.fromRGB(22,28,50)}):Play() end; if rjKn then twB(rjKn,{Position=on and UDim2.new(0,20,0.5,-7) or UDim2.new(0,2,0.5,-7)}):Play() end end
-    return {togHit=togHit,bindBtn=bindB,rjTogHit=rjTogHit,setTog=setTog,setRj=setRj,statusLbl=statusLbl,statusLbl2=statusLbl2,lbl=lbl,sec=sec}
+    return {togHit=togHit,bindBtn=bindB,rjTogHit=rjTogHit,setTog=setTog,setRj=setRj,statusLbl=statusLbl,lbl=lbl,sec=sec}
 end
 
 -- ═══════════════════════════════════════
@@ -1174,58 +832,8 @@ local castSec=mkSection(pg1,{order=8,icon="🎯",label="Auto Cast",keyName=castK
 mkDiv(pg1,9)
 local shSec=mkSection(pg1,{order=10,icon="🔄",label="Shake",keyName=shakeKey.Name,showStatus=true})
 mkDiv(pg1,11)
-local reSec=mkSection(pg1,{order=12,icon="🎣",label="Auto-Reel  🧠",keyName=reelKey.Name,showStatus=true,showStatus2=true})
-reelStatusLbl=reSec.statusLbl
-
--- Painel de aprendizado (dentro da seção Auto-Reel)
-local learnPad=Instance.new("Frame",reSec.sec)
-learnPad.Size=UDim2.new(1,0,0,0); learnPad.AutomaticSize=Enum.AutomaticSize.Y
-learnPad.BackgroundColor3=Color3.fromRGB(12,8,22); learnPad.BorderSizePixel=0; learnPad.LayoutOrder=6
-Instance.new("UICorner",learnPad).CornerRadius=UDim.new(0,6); Instance.new("UIStroke",learnPad).Color=Color3.fromRGB(60,40,100)
-local lpu=Instance.new("UIPadding",learnPad); lpu.PaddingLeft=UDim.new(0,8); lpu.PaddingRight=UDim.new(0,8); lpu.PaddingTop=UDim.new(0,5); lpu.PaddingBottom=UDim.new(0,6)
-local lpLy=Instance.new("UIListLayout",learnPad); lpLy.SortOrder=Enum.SortOrder.LayoutOrder; lpLy.Padding=UDim.new(0,3)
-
-local lpTitle=Instance.new("TextLabel",learnPad); lpTitle.Size=UDim2.new(1,0,0,11); lpTitle.BackgroundTransparency=1; lpTitle.LayoutOrder=1
-lpTitle.Text="🧠  Duty-cycle learning (salvo)"; lpTitle.TextColor3=C.learn; lpTitle.Font=Enum.Font.GothamBold; lpTitle.TextSize=8; lpTitle.TextXAlignment=Enum.TextXAlignment.Left
-local lpScore=Instance.new("TextLabel",learnPad); lpScore.Size=UDim2.new(1,0,0,10); lpScore.BackgroundTransparency=1; lpScore.LayoutOrder=2
-lpScore.Text="Score: —"; lpScore.TextColor3=C.txt; lpScore.Font=Enum.Font.Code; lpScore.TextSize=8; lpScore.TextXAlignment=Enum.TextXAlignment.Left
-local lpDiag=Instance.new("TextLabel",learnPad); lpDiag.Size=UDim2.new(1,0,0,10); lpDiag.BackgroundTransparency=1; lpDiag.LayoutOrder=3
-lpDiag.Text="Último: —"; lpDiag.TextColor3=C.sub; lpDiag.Font=Enum.Font.Code; lpDiag.TextSize=7; lpDiag.TextXAlignment=Enum.TextXAlignment.Left
-local lpParams=Instance.new("TextLabel",learnPad); lpParams.Size=UDim2.new(1,0,0,10); lpParams.BackgroundTransparency=1; lpParams.LayoutOrder=4
-lpParams.Text=""; lpParams.TextColor3=C.dim; lpParams.Font=Enum.Font.Code; lpParams.TextSize=7; lpParams.TextXAlignment=Enum.TextXAlignment.Left
-local lpDiv=Instance.new("Frame",learnPad); lpDiv.Size=UDim2.new(1,0,0,1); lpDiv.BackgroundColor3=Color3.fromRGB(60,40,100); lpDiv.BorderSizePixel=0; lpDiv.LayoutOrder=5
-
-local lpReset=Instance.new("TextButton",learnPad); lpReset.Size=UDim2.new(1,0,0,20); lpReset.LayoutOrder=6
-lpReset.BackgroundColor3=Color3.fromRGB(30,12,42); lpReset.BorderSizePixel=0
-lpReset.Text="🔄  Resetar aprendizado"; lpReset.TextColor3=C.learn; lpReset.Font=Enum.Font.GothamBold; lpReset.TextSize=8; lpReset.AutoButtonColor=false
-Instance.new("UICorner",lpReset).CornerRadius=UDim.new(0,5)
-lpReset.MouseEnter:Connect(function() tw(lpReset,{BackgroundColor3=Color3.fromRGB(44,18,60)}):Play() end)
-lpReset.MouseLeave:Connect(function() tw(lpReset,{BackgroundColor3=Color3.fromRGB(30,12,42)}):Play() end)
-lpReset.MouseButton1Click:Connect(function()
-    ripple(lpReset,C.learn)
-    ReelParams.duty_far=0.90; ReelParams.duty_mid=0.65; ReelParams.duty_near=0.50
-    ReelParams.cycle_ms=45; ReelParams.rebound_ms=80
-    LearnHistory.sessions={}; LearnHistory.totalWins=0; LearnHistory.totalLosses=0
-    LearnHistory.lastDiagnosis="—"; LearnHistory.adjustCount=0
-    saveLearnData()
-    lpScore.Text="Score: resetado"; lpScore.TextColor3=C.yel
-    lpDiag.Text="Último: —"
-    task.delay(2,function() lpScore.TextColor3=C.txt end)
-end)
-
+local reSec=mkSection(pg1,{order=12,icon="🎣",label="Auto-Reel",keyName=reelKey.Name,showStatus=true})
 mkDiv(pg1,13)
-
--- Atualiza painel a cada 0.5s
-task.spawn(function()
-    while true do task.wait(0.5)
-        local w,t=getRecentScore(10)
-        local trend=(t>0) and (w/t>=0.7 and " ↑" or (w/t<=0.3 and " ↓" or " →")) or ""
-        lpScore.Text=string.format("Score: %d/%d%s  |  ✅%d ❌%d  |  adj:%d",w,t,trend,LearnHistory.totalWins,LearnHistory.totalLosses,LearnHistory.adjustCount)
-        lpScore.TextColor3=(t>0 and w/t>=0.6) and C.grn or ((t>0 and w/t<=0.3) and C.red or C.yel)
-        lpDiag.Text="Último: "..LearnHistory.lastDiagnosis
-        lpParams.Text=string.format("⚙ far %.2f  mid %.2f  near %.2f | %dms",ReelParams.duty_far,ReelParams.duty_mid,ReelParams.duty_near,ReelParams.cycle_ms)
-    end
-end)
 
 -- SELL
 local sellF=Instance.new("Frame",pg1); sellF.Size=UDim2.new(1,0,0,0); sellF.AutomaticSize=Enum.AutomaticSize.Y; sellF.BackgroundColor3=C.card; sellF.BorderSizePixel=0; sellF.LayoutOrder=14
@@ -1243,7 +851,7 @@ local innerDiv=Instance.new("Frame",sellF); innerDiv.Size=UDim2.new(1,0,0,1); in
 local sellAllBtn=Instance.new("TextButton",sellF); sellAllBtn.Size=UDim2.new(1,0,0,28); sellAllBtn.LayoutOrder=6; sellAllBtn.BackgroundColor3=Color3.fromRGB(14,50,30); sellAllBtn.BorderSizePixel=0; sellAllBtn.Text="📦  Sell All (mantém mapas)"; sellAllBtn.TextColor3=C.grn; sellAllBtn.Font=Enum.Font.GothamBold; sellAllBtn.TextSize=9; sellAllBtn.AutoButtonColor=false; Instance.new("UICorner",sellAllBtn).CornerRadius=UDim.new(0,7); Instance.new("UIStroke",sellAllBtn).Color=Color3.fromRGB(18,70,40)
 sellAllBtn.MouseEnter:Connect(function() tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(18,64,38)}):Play() end); sellAllBtn.MouseLeave:Connect(function() tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(14,50,30)}):Play() end); sellAllBtn.MouseButton1Click:Connect(function() ripple(sellAllBtn,C.grn) end)
 local innerDiv2=Instance.new("Frame",sellF); innerDiv2.Size=UDim2.new(1,0,0,1); innerDiv2.BackgroundColor3=C.bdr; innerDiv2.BorderSizePixel=0; innerDiv2.LayoutOrder=7
-local autoRow=Instance.new("Frame",sellF); autoRow.Size=UDim2.new(1,0,0,20); autoRow.BackgroundTransparency=1; autoRow.LayoutOrder=8
+local autoRow=Instance.new("Frame",sellF); autoRow.Size=UDim2.new(1,0,0,20); autoRow.BackgroundTransparency=true; autoRow.LayoutOrder=8
 local autoLbl=Instance.new("TextLabel",autoRow); autoLbl.Size=UDim2.new(1,-52,1,0); autoLbl.BackgroundTransparency=1; autoLbl.Text="🔁  Auto-Sell"; autoLbl.TextColor3=C.sub; autoLbl.Font=Enum.Font.GothamBold; autoLbl.TextSize=10; autoLbl.TextXAlignment=Enum.TextXAlignment.Left
 local autoTr=Instance.new("Frame",autoRow); autoTr.Size=UDim2.new(0,36,0,18); autoTr.Position=UDim2.new(1,-36,0.5,-9); autoTr.BackgroundColor3=Color3.fromRGB(22,28,50); autoTr.BorderSizePixel=0; Instance.new("UICorner",autoTr).CornerRadius=UDim.new(0,9); Instance.new("UIStroke",autoTr).Color=C.bdr
 local autoKn=Instance.new("Frame",autoTr); autoKn.Size=UDim2.new(0,14,0,14); autoKn.Position=UDim2.new(0,2,0.5,-7); autoKn.BackgroundColor3=Color3.fromRGB(195,205,235); autoKn.BorderSizePixel=0; Instance.new("UICorner",autoKn).CornerRadius=UDim.new(0,7)
@@ -1268,9 +876,7 @@ end)
 local autoStLbl=Instance.new("TextLabel",sellF); autoStLbl.Size=UDim2.new(1,0,0,10); autoStLbl.BackgroundTransparency=1; autoStLbl.Text=""; autoStLbl.TextColor3=C.dim; autoStLbl.Font=Enum.Font.Code; autoStLbl.TextSize=8; autoStLbl.TextXAlignment=Enum.TextXAlignment.Left; autoStLbl.LayoutOrder=11
 mkDiv(pg1,15)
 
--- ═══════════════════════════════════════
 -- PAGE TP
--- ═══════════════════════════════════════
 local pg2=tabPages["TP"]
 local tpScroll=Instance.new("ScrollingFrame",pg2); tpScroll.Size=UDim2.new(1,0,0,300); tpScroll.BackgroundTransparency=1; tpScroll.BorderSizePixel=0; tpScroll.ScrollBarThickness=3; tpScroll.ScrollBarImageColor3=C.acc; tpScroll.CanvasSize=UDim2.new(0,0,0,0); tpScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; tpScroll.LayoutOrder=1
 local tpLy=Instance.new("UIListLayout",tpScroll); tpLy.SortOrder=Enum.SortOrder.LayoutOrder; tpLy.Padding=UDim.new(0,2); pad(tpScroll,8,8,6,6)
@@ -1292,9 +898,7 @@ for i,isl in ipairs(ISLANDS) do
     end)
 end
 
--- ═══════════════════════════════════════
 -- PAGE RODS
--- ═══════════════════════════════════════
 local pg4=tabPages["Rods"]
 local rodScroll=Instance.new("ScrollingFrame",pg4); rodScroll.Size=UDim2.new(1,0,0,300); rodScroll.BackgroundTransparency=1; rodScroll.BorderSizePixel=0; rodScroll.ScrollBarThickness=3; rodScroll.ScrollBarImageColor3=C.acc; rodScroll.CanvasSize=UDim2.new(0,0,0,0); rodScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; rodScroll.LayoutOrder=1
 local rodLy=Instance.new("UIListLayout",rodScroll); rodLy.SortOrder=Enum.SortOrder.LayoutOrder; rodLy.Padding=UDim.new(0,2); pad(rodScroll,8,8,6,6)
@@ -1312,18 +916,17 @@ for i,rod in ipairs(RODS) do
     end)
 end
 
--- ═══════════════════════════════════════
 -- PAGE MAPS
--- ═══════════════════════════════════════
 local pg5=tabPages["Maps"]
 local mapF=Instance.new("Frame",pg5); mapF.Size=UDim2.new(1,0,0,0); mapF.AutomaticSize=Enum.AutomaticSize.Y; mapF.BackgroundColor3=C.card; mapF.BorderSizePixel=0; mapF.LayoutOrder=1; pad(mapF,10,10,8,8)
 local mapLy=Instance.new("UIListLayout",mapF); mapLy.SortOrder=Enum.SortOrder.LayoutOrder; mapLy.Padding=UDim.new(0,6)
 local mapTitle=Instance.new("TextLabel",mapF); mapTitle.Size=UDim2.new(1,0,0,14); mapTitle.BackgroundTransparency=1; mapTitle.Text="📜  Treasure Maps no inventário"; mapTitle.TextColor3=C.gold; mapTitle.Font=Enum.Font.GothamBold; mapTitle.TextSize=10; mapTitle.TextXAlignment=Enum.TextXAlignment.Left; mapTitle.LayoutOrder=1
 local mapInfo=Instance.new("TextLabel",mapF); mapInfo.Size=UDim2.new(1,0,0,11); mapInfo.BackgroundTransparency=1; mapInfo.Text="Leva o mapa no Jack Marrow pra fixar as coords"; mapInfo.TextColor3=C.dim; mapInfo.Font=Enum.Font.Gotham; mapInfo.TextSize=8; mapInfo.TextXAlignment=Enum.TextXAlignment.Left; mapInfo.LayoutOrder=2
 local mapRefresh=Instance.new("TextButton",mapF); mapRefresh.Size=UDim2.new(1,0,0,26); mapRefresh.LayoutOrder=3; mapRefresh.BackgroundColor3=Color3.fromRGB(40,30,12); mapRefresh.BorderSizePixel=0; mapRefresh.Text="🔍  Escanear mapas"; mapRefresh.TextColor3=C.gold; mapRefresh.Font=Enum.Font.GothamBold; mapRefresh.TextSize=9; mapRefresh.AutoButtonColor=false; Instance.new("UICorner",mapRefresh).CornerRadius=UDim.new(0,6); Instance.new("UIStroke",mapRefresh).Color=Color3.fromRGB(100,70,20)
-mapRefresh.MouseEnter:Connect(function() tw(mapRefresh,{BackgroundColor3=Color3.fromRGB(55,40,18)}):Play() end); mapRefresh.MouseLeave:Connect(function() tw(mapRefresh,{BackgroundColor3=Color3.fromRGB(40,30,12)}):Play() end); mapRefresh.MouseButton1Click:Connect(function() ripple(mapRefresh,C.gold) end)
-local quickJack=Instance.new("TextButton",mapF); quickJack.Size=UDim2.new(1,0,0,24); quickJack.LayoutOrder=4; quickJack.BackgroundColor3=Color3.fromRGB(18,30,48); quickJack.BorderSizePixel=0; quickJack.Text="🏴  TP Jack Marrow (fixar mapas)"; quickJack.TextColor3=C.acc; quickJack.Font=Enum.Font.GothamBold; quickJack.TextSize=9; quickJack.AutoButtonColor=false; Instance.new("UICorner",quickJack).CornerRadius=UDim.new(0,6)
-quickJack.MouseEnter:Connect(function() tw(quickJack,{BackgroundColor3=Color3.fromRGB(24,40,64)}):Play() end); quickJack.MouseLeave:Connect(function() tw(quickJack,{BackgroundColor3=Color3.fromRGB(18,30,48)}):Play() end); quickJack.MouseButton1Click:Connect(function() ripple(quickJack,C.acc); tpTo(Vector3.new(-2825,215,1515)) end)
+mapRefresh.MouseEnter:Connect(function() tw(mapRefresh,{BackgroundColor3=Color3.fromRGB(55,40,18)}):Play() end); mapRefresh.MouseLeave:Connect(function() tw(mapRefresh,{BackgroundColor3=Color3.fromRGB(40,30,12)}):Play() end)
+local quickJack=Instance.new("TextButton",mapF); quickJack.Size=UDim2.new(1,0,0,24); quickJack.LayoutOrder=4; quickJack.BackgroundColor3=Color3.fromRGB(18,30,48); quickJack.BorderSizePixel=0; quickJack.Text="🏴  TP Jack Marrow"; quickJack.TextColor3=C.acc; quickJack.Font=Enum.Font.GothamBold; quickJack.TextSize=9; quickJack.AutoButtonColor=false; Instance.new("UICorner",quickJack).CornerRadius=UDim.new(0,6)
+quickJack.MouseEnter:Connect(function() tw(quickJack,{BackgroundColor3=Color3.fromRGB(24,40,64)}):Play() end); quickJack.MouseLeave:Connect(function() tw(quickJack,{BackgroundColor3=Color3.fromRGB(18,30,48)}):Play() end)
+quickJack.MouseButton1Click:Connect(function() ripple(quickJack,C.acc); tpTo(Vector3.new(-2825,215,1515)) end)
 local mapListHolder=Instance.new("Frame",mapF); mapListHolder.Size=UDim2.new(1,0,0,0); mapListHolder.AutomaticSize=Enum.AutomaticSize.Y; mapListHolder.BackgroundTransparency=1; mapListHolder.BorderSizePixel=0; mapListHolder.LayoutOrder=5
 local mapListLy=Instance.new("UIListLayout",mapListHolder); mapListLy.SortOrder=Enum.SortOrder.LayoutOrder; mapListLy.Padding=UDim.new(0,3)
 local function refreshMaps()
@@ -1347,9 +950,7 @@ local function refreshMaps()
 end
 mapRefresh.MouseButton1Click:Connect(function() mapRefresh.Text="⏳  Escaneando..."; task.wait(0.2); refreshMaps(); mapRefresh.Text="🔍  Escanear mapas" end)
 
--- ═══════════════════════════════════════
 -- PAGE NPCs
--- ═══════════════════════════════════════
 local pg3=tabPages["NPCs"]
 local rngF=Instance.new("Frame",pg3); rngF.Size=UDim2.new(1,0,0,0); rngF.AutomaticSize=Enum.AutomaticSize.Y; rngF.BackgroundColor3=C.card; rngF.BorderSizePixel=0; rngF.LayoutOrder=1; pad(rngF,10,10,7,7)
 local rngLy2=Instance.new("UIListLayout",rngF); rngLy2.SortOrder=Enum.SortOrder.LayoutOrder; rngLy2.Padding=UDim.new(0,4)
@@ -1371,7 +972,7 @@ UIS.InputChanged:Connect(function(i)
 end)
 mkDiv(pg3,2)
 local scanBtn=Instance.new("TextButton",pg3); scanBtn.Size=UDim2.new(1,0,0,30); scanBtn.LayoutOrder=3; scanBtn.BackgroundColor3=Color3.fromRGB(16,28,60); scanBtn.BorderSizePixel=0; scanBtn.Text="🔍  Scan Nearby NPCs"; scanBtn.TextColor3=C.acc; scanBtn.Font=Enum.Font.GothamBold; scanBtn.TextSize=9; scanBtn.AutoButtonColor=false; Instance.new("UICorner",scanBtn).CornerRadius=UDim.new(0,7); Instance.new("UIStroke",scanBtn).Color=C.accD
-scanBtn.MouseEnter:Connect(function() tw(scanBtn,{BackgroundColor3=Color3.fromRGB(20,36,78)}):Play() end); scanBtn.MouseLeave:Connect(function() tw(scanBtn,{BackgroundColor3=Color3.fromRGB(16,28,60)}):Play() end); scanBtn.MouseButton1Click:Connect(function() ripple(scanBtn,C.acc) end)
+scanBtn.MouseEnter:Connect(function() tw(scanBtn,{BackgroundColor3=Color3.fromRGB(20,36,78)}):Play() end); scanBtn.MouseLeave:Connect(function() tw(scanBtn,{BackgroundColor3=Color3.fromRGB(16,28,60)}):Play() end)
 mkDiv(pg3,4)
 local npcScroll=Instance.new("ScrollingFrame",pg3); npcScroll.Size=UDim2.new(1,0,0,220); npcScroll.BackgroundTransparency=1; npcScroll.BorderSizePixel=0; npcScroll.ScrollBarThickness=3; npcScroll.ScrollBarImageColor3=C.acc; npcScroll.CanvasSize=UDim2.new(0,0,0,0); npcScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; npcScroll.LayoutOrder=5
 local npcLy=Instance.new("UIListLayout",npcScroll); npcLy.SortOrder=Enum.SortOrder.LayoutOrder; npcLy.Padding=UDim.new(0,2); pad(npcScroll,8,8,4,4)
@@ -1397,36 +998,34 @@ local function updateDot()
     tw(dot,{BackgroundColor3=anyOn and C.grn or C.dim}):Play()
 end
 
-ncSec.togHit.MouseButton1Click:Connect(function() noclipOn=not noclipOn; setNoclip(noclipOn); ncSec.setTog(noclipOn); tw(fBdr,{Color=noclipOn and C.grn or C.bdr}):Play(); updateDot() end)
-spSec.togHit.MouseButton1Click:Connect(function() speedOn=not speedOn; spSec.setTog(speedOn); if speedOn then applySpeedOnce(); startSpeedLoop() else stopSpeedLoop() end; updateDot() end)
+ncSec.togHit.MouseButton1Click:Connect(function() noclipOn=not noclipOn;setNoclip(noclipOn);ncSec.setTog(noclipOn);tw(fBdr,{Color=noclipOn and C.grn or C.bdr}):Play();updateDot() end)
+spSec.togHit.MouseButton1Click:Connect(function() speedOn=not speedOn;spSec.setTog(speedOn);if speedOn then applySpeedOnce();startSpeedLoop() else stopSpeedLoop() end;updateDot() end)
 hjSec.togHit.MouseButton1Click:Connect(function()
-    jumpOn=not jumpOn; hjSec.setTog(jumpOn)
-    if jumpOn then startJumpLoop() else stopJumpLoop(); reJumpOn=false; hjSec.setRj(false); stopReJump() end; updateDot()
+    jumpOn=not jumpOn;hjSec.setTog(jumpOn)
+    if jumpOn then startJumpLoop() else stopJumpLoop();reJumpOn=false;hjSec.setRj(false);stopReJump() end;updateDot()
 end)
 if hjSec.rjTogHit then hjSec.rjTogHit.MouseButton1Click:Connect(function()
-    if not jumpOn then return end; reJumpOn=not reJumpOn; hjSec.setRj(reJumpOn); if reJumpOn then startReJump() else stopReJump() end
+    if not jumpOn then return end;reJumpOn=not reJumpOn;hjSec.setRj(reJumpOn);if reJumpOn then startReJump() else stopReJump() end
 end) end
-
 castSec.togHit.MouseButton1Click:Connect(function()
-    castOn=not castOn; castSec.setTog(castOn)
-    if castOn then startCast(castSec.statusLbl) else stopCast(); if castSec.statusLbl then castSec.statusLbl.Text="" end end
-    updateDot()
+    castOn=not castOn;castSec.setTog(castOn)
+    if castOn then startCast(castSec.statusLbl) else stopCast();if castSec.statusLbl then castSec.statusLbl.Text="" end end;updateDot()
 end)
-shSec.togHit.MouseButton1Click:Connect(function() shakeOn=not shakeOn; shSec.setTog(shakeOn); if shakeOn then startShake() else stopShake() end; updateDot() end)
-reSec.togHit.MouseButton1Click:Connect(function() autoReelOn=not autoReelOn; reSec.setTog(autoReelOn); if autoReelOn then startAutoReel() else stopAutoReel() end; updateDot() end)
+shSec.togHit.MouseButton1Click:Connect(function() shakeOn=not shakeOn;shSec.setTog(shakeOn);if shakeOn then startShake() else stopShake() end;updateDot() end)
+reSec.togHit.MouseButton1Click:Connect(function() autoReelOn=not autoReelOn;reSec.setTog(autoReelOn);if autoReelOn then startAutoReel() else stopAutoReel() end;updateDot() end)
 
 sellBtn.MouseButton1Click:Connect(function()
     task.spawn(function()
-        tw(sellBtn,{BackgroundColor3=Color3.fromRGB(10,44,26)}):Play(); task.wait(0.1); tw(sellBtn,{BackgroundColor3=C.sellBg}):Play()
-        local ok,msg=sellFromHand(); sellSt.TextColor3=ok and C.grn or C.red; sellSt.Text=(ok and "✅ " or "❌ ")..msg
-        task.wait(3); tw(sellSt,{TextColor3=C.dim}):Play(); sellSt.Text="Waiting..."
+        tw(sellBtn,{BackgroundColor3=Color3.fromRGB(10,44,26)}):Play();task.wait(0.1);tw(sellBtn,{BackgroundColor3=C.sellBg}):Play()
+        local ok,msg=sellFromHand();sellSt.TextColor3=ok and C.grn or C.red;sellSt.Text=(ok and "✅ " or "❌ ")..msg
+        task.wait(3);tw(sellSt,{TextColor3=C.dim}):Play();sellSt.Text="Waiting..."
     end)
 end)
 sellAllBtn.MouseButton1Click:Connect(function()
     task.spawn(function()
-        tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(10,38,22)}):Play(); task.wait(0.1); tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(14,50,30)}):Play()
-        local ok,msg=sellAll(); sellSt.TextColor3=ok and C.grn or C.red; sellSt.Text=(ok and "✅ " or "❌ ")..msg
-        task.wait(3); tw(sellSt,{TextColor3=C.dim}):Play(); sellSt.Text="Waiting..."
+        tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(10,38,22)}):Play();task.wait(0.1);tw(sellAllBtn,{BackgroundColor3=Color3.fromRGB(14,50,30)}):Play()
+        local ok,msg=sellAll();sellSt.TextColor3=ok and C.grn or C.red;sellSt.Text=(ok and "✅ " or "❌ ")..msg
+        task.wait(3);tw(sellSt,{TextColor3=C.dim}):Play();sellSt.Text="Waiting..."
     end)
 end)
 autoTogHit.MouseButton1Click:Connect(function()
@@ -1434,67 +1033,46 @@ autoTogHit.MouseButton1Click:Connect(function()
     tw(autoTr,{BackgroundColor3=autoSellOn and C.grn or Color3.fromRGB(22,28,50)}):Play()
     twB(autoKn,{Position=autoSellOn and UDim2.new(0,20,0.5,-7) or UDim2.new(0,2,0.5,-7)}):Play()
     tw(autoLbl,{TextColor3=autoSellOn and C.txt or C.sub}):Play()
-    if autoSellOn then startAutoSell(autoStLbl) else stopAutoSell(); autoStLbl.Text="Auto-sell off"; task.delay(2,function() autoStLbl.Text="" end) end
+    if autoSellOn then startAutoSell(autoStLbl) else stopAutoSell();autoStLbl.Text="Auto-sell off";task.delay(2,function() autoStLbl.Text="" end) end
     updateDot()
 end)
 
--- ═══════════════════════════════════════
--- STATUS LOOPS — sem flickering (só escreve se mudou)
--- ═══════════════════════════════════════
+-- Status loops
 task.spawn(function()
     local d={"",".",".","..."}; local i=1
     while true do task.wait(0.2); i=i%4+1
         if shSec.statusLbl then
-            if shakeOn then
-                local t=shakeActive and ("● Enter pressing"..d[i]) or ("○ waiting shake"..d[i])
-                setS(shSec.statusLbl,t,shakeActive and C.grn or C.yel)
+            if shakeOn then setS(shSec.statusLbl,(shakeActive and "● clicando shake" or "○ aguardando shake")..d[i],shakeActive and C.grn or C.yel)
             else setS(shSec.statusLbl,"",C.dim) end
         end
-    end
-end)
-
-task.spawn(function()
-    local d={"",".",".","..."}; local i=1
-    while true do task.wait(0.2); i=i%4+1
         if castSec.statusLbl then
             if castOn then
-                local t, col
-                if castActive then
-                    if castPhase=="holding" then t="▲ carregando"..d[i]; col=C.cast
-                    elseif castPhase=="firing" then t="⚡ FireServer"..d[i]; col=C.cast
-                    else t="↓ soltando"..d[i]; col=C.grn end
-                elseif castPhase=="cooldown" then t="○ aguardando pesca"..d[i]; col=C.yel
-                elseif castPhase=="arming" then t="○ puxando vara [1]"..d[i]; col=C.yel
-                else t="○ aguardando cast"..d[i]; col=C.yel end
+                local t,col
+                if castPhase=="firing" then t="⚡ FireServer"..d[i];col=C.cast
+                elseif castPhase=="holding" then t="▲ carregando"..d[i];col=C.cast
+                elseif castPhase=="releasing" then t="↓ soltando"..d[i];col=C.grn
+                elseif castPhase=="cooldown" then t="○ aguardando"..d[i];col=C.yel
+                elseif castPhase=="arming" then t="○ armando vara"..d[i];col=C.yel
+                else t="○ pronto"..d[i];col=C.dim end
                 setS(castSec.statusLbl,t,col)
             else setS(castSec.statusLbl,"",C.dim) end
         end
-    end
-end)
-
-task.spawn(function()
-    local d={"",".",".","..."}; local i=1
-    while true do task.wait(0.25); i=i%4+1
         if reSec.statusLbl then
-            if autoReelOn then
-                local t = reelActive and ("● pescando"..d[i]) or ("○ aguardando UI"..d[i])
-                setS(reSec.statusLbl, t, reelActive and C.grn or C.yel)
+            if autoReelOn then setS(reSec.statusLbl,(reelActive and "● pescando" or "○ aguardando UI")..d[i],reelActive and C.grn or C.yel)
             else setS(reSec.statusLbl,"",C.dim) end
         end
     end
 end)
 
--- ═══════════════════════════════════════
 -- REBIND
--- ═══════════════════════════════════════
 local function setupBind(bindBtn,id,getKey,setKey)
     bindBtn.MouseButton1Click:Connect(function()
-        if listening then return end; listening=id; bindBtn.Text="..."; tw(bindBtn,{TextColor3=C.yel}):Play()
-        local conn; conn=UIS.InputBegan:Connect(function(inp)
+        if listening then return end;listening=id;bindBtn.Text="...";tw(bindBtn,{TextColor3=C.yel}):Play()
+        local conn;conn=UIS.InputBegan:Connect(function(inp)
             if inp.UserInputType~=Enum.UserInputType.Keyboard then return end
-            if inp.KeyCode==Enum.KeyCode.Escape then bindBtn.Text=getKey().Name; tw(bindBtn,{TextColor3=C.acc}):Play(); listening=nil; conn:Disconnect(); return end
-            if BLOCKED[inp.KeyCode] then bindBtn.Text="invalid!"; tw(bindBtn,{TextColor3=C.red}):Play(); task.wait(0.8); bindBtn.Text=getKey().Name; tw(bindBtn,{TextColor3=C.acc}):Play(); listening=nil; conn:Disconnect(); return end
-            setKey(inp.KeyCode); bindBtn.Text=inp.KeyCode.Name; tw(bindBtn,{TextColor3=C.acc}):Play(); listening=nil; conn:Disconnect()
+            if inp.KeyCode==Enum.KeyCode.Escape then bindBtn.Text=getKey().Name;tw(bindBtn,{TextColor3=C.acc}):Play();listening=nil;conn:Disconnect();return end
+            if BLOCKED[inp.KeyCode] then bindBtn.Text="invalid!";tw(bindBtn,{TextColor3=C.red}):Play();task.wait(0.8);bindBtn.Text=getKey().Name;tw(bindBtn,{TextColor3=C.acc}):Play();listening=nil;conn:Disconnect();return end
+            setKey(inp.KeyCode);bindBtn.Text=inp.KeyCode.Name;tw(bindBtn,{TextColor3=C.acc}):Play();listening=nil;conn:Disconnect()
         end)
     end)
 end
@@ -1510,19 +1088,19 @@ setupBind(sellBind,"sell",      function() return sellKey  end,function(k) sellK
 do
     local dragging,dragStart,startPos=false,nil,nil
     header.InputBegan:Connect(function(i)
-        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dragging=true; dragStart=i.Position; startPos=frame.Position end
+        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dragging=true;dragStart=i.Position;startPos=frame.Position end
     end)
     UIS.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dragging=false end end)
     UIS.InputChanged:Connect(function(i)
         if not dragging then return end
         if i.UserInputType~=Enum.UserInputType.MouseMovement and i.UserInputType~=Enum.UserInputType.Touch then return end
-        local d=i.Position-dragStart; frame.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y)
+        local d=i.Position-dragStart;frame.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y)
     end)
 end
 
 -- HOTKEYS
 UIS.InputBegan:Connect(function(inp,gpe)
-    if gpe or listening then return end; local k=inp.KeyCode
+    if gpe or listening then return end;local k=inp.KeyCode
     if k==Enum.KeyCode.V then setVisible(not guiVisible)
     elseif k==ncKey    then noclipOn=not noclipOn;setNoclip(noclipOn);ncSec.setTog(noclipOn);tw(fBdr,{Color=noclipOn and C.grn or C.bdr}):Play();updateDot()
     elseif k==spKey    then speedOn=not speedOn;spSec.setTog(speedOn);if speedOn then applySpeedOnce();startSpeedLoop() else stopSpeedLoop() end;updateDot()
@@ -1530,13 +1108,13 @@ UIS.InputBegan:Connect(function(inp,gpe)
     elseif k==castKey  then castOn=not castOn;castSec.setTog(castOn);if castOn then startCast(castSec.statusLbl) else stopCast();if castSec.statusLbl then castSec.statusLbl.Text="" end end;updateDot()
     elseif k==shakeKey then shakeOn=not shakeOn;shSec.setTog(shakeOn);if shakeOn then startShake() else stopShake() end;updateDot()
     elseif k==reelKey  then autoReelOn=not autoReelOn;reSec.setTog(autoReelOn);if autoReelOn then startAutoReel() else stopAutoReel() end;updateDot()
-    elseif k==sellKey  then task.spawn(function() local ok,msg=sellFromHand(); sellSt.TextColor3=ok and C.grn or C.red;sellSt.Text=(ok and "✅ " or "❌ ")..msg; task.wait(3);tw(sellSt,{TextColor3=C.dim}):Play();sellSt.Text="Waiting..." end)
+    elseif k==sellKey  then task.spawn(function() local ok,msg=sellFromHand();sellSt.TextColor3=ok and C.grn or C.red;sellSt.Text=(ok and "✅ " or "❌ ")..msg;task.wait(3);tw(sellSt,{TextColor3=C.dim}):Play();sellSt.Text="Waiting..." end)
     end
 end)
 
 -- INIT
 switchTab("Cheats")
-task.wait(0.1); refreshSize(); task.wait(0.05)
+task.wait(0.1);refreshSize();task.wait(0.05)
 TweenSvc:Create(frame,TweenInfo.new(0.45,Enum.EasingStyle.Back,Enum.EasingDirection.Out),{
     Position=UDim2.new(0,18,0.5,-180),
     BackgroundTransparency=0,
