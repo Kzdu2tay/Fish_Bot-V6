@@ -943,6 +943,90 @@ local function reelForceRelease()
     State.runtime.reelMouseHeld = false
 end
 
+local function getOrCreateReelOverlay(reelGui)
+    local overlay = reelGui:FindFirstChild("UtilityReelOverlay")
+    if overlay then
+        return overlay
+    end
+
+    overlay = create("Frame", {
+        Parent = reelGui,
+        Name = "UtilityReelOverlay",
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 19,
+    })
+
+    local function makeMarker(name, text, color)
+        return create("TextLabel", {
+            Parent = overlay,
+            Name = name,
+            Size = UDim2.new(0, 14, 0, 14),
+            BackgroundTransparency = 1,
+            Text = text,
+            TextColor3 = color,
+            Font = Enum.Font.Code,
+            TextSize = 14,
+            TextStrokeTransparency = 0.4,
+            TextXAlignment = Enum.TextXAlignment.Center,
+            TextYAlignment = Enum.TextYAlignment.Center,
+            Visible = false,
+            ZIndex = 20,
+        })
+    end
+
+    makeMarker("Left", "<", Theme.warning)
+    makeMarker("Right", ">", Theme.warning)
+    makeMarker("Fish", ",", Theme.cast)
+
+    return overlay
+end
+
+local function hideReelOverlay(reelGui)
+    if not reelGui then
+        return
+    end
+
+    local overlay = reelGui:FindFirstChild("UtilityReelOverlay")
+    if not overlay then
+        return
+    end
+
+    for _, child in ipairs(overlay:GetChildren()) do
+        if child:IsA("TextLabel") then
+            child.Visible = false
+        end
+    end
+end
+
+local function updateReelOverlay(reelGui, playerBar, fishBar)
+    local overlay = getOrCreateReelOverlay(reelGui)
+    local leftMarker = overlay:FindFirstChild("Left")
+    local rightMarker = overlay:FindFirstChild("Right")
+    local fishMarker = overlay:FindFirstChild("Fish")
+
+    if not (leftMarker and rightMarker and fishMarker and playerBar and fishBar) then
+        hideReelOverlay(reelGui)
+        return
+    end
+
+    local barLeft = playerBar.AbsolutePosition.X
+    local barRight = playerBar.AbsolutePosition.X + playerBar.AbsoluteSize.X
+    local barBottom = playerBar.AbsolutePosition.Y + playerBar.AbsoluteSize.Y
+    local fishCenterX = fishBar.AbsolutePosition.X + fishBar.AbsoluteSize.X * 0.5
+    local fishBottom = fishBar.AbsolutePosition.Y + fishBar.AbsoluteSize.Y
+
+    leftMarker.Position = UDim2.fromOffset(math.floor(barLeft - 7), math.floor(barBottom + 1))
+    leftMarker.Visible = true
+
+    rightMarker.Position = UDim2.fromOffset(math.floor(barRight - 7), math.floor(barBottom + 1))
+    rightMarker.Visible = true
+
+    fishMarker.Position = UDim2.fromOffset(math.floor(fishCenterX - 7), math.floor(fishBottom - 1))
+    fishMarker.Visible = true
+end
+
 local function startAutoReel()
     reelForceRelease()
     State.runtime.reelActive = false
@@ -951,6 +1035,7 @@ local function startAutoReel()
         local wasActive = false
         local sessionStart = 0
         local sessionDiagnosis
+        local lastFishX = nil
 
         while State.flags.autoReel do
             local reelGui = findReelUI()
@@ -971,13 +1056,12 @@ local function startAutoReel()
                 local playerBar, fishBar = findReelElements(reelGui)
                 if not playerBar or not fishBar then
                     reelForceRelease()
+                    hideReelOverlay(reelGui)
                     State.runtime.reelActive = false
                     task.wait(0.08)
                 else
                     State.runtime.reelActive = true
 
-                    local centerX = playerBar.AbsolutePosition.X + playerBar.AbsoluteSize.X * 0.5
-                    local centerY = playerBar.AbsolutePosition.Y + playerBar.AbsoluteSize.Y * 0.5
                     local barLeft = playerBar.AbsolutePosition.X
                     local barRight = playerBar.AbsolutePosition.X + playerBar.AbsoluteSize.X
                     local barWidth = math.max(playerBar.AbsoluteSize.X, 1)
@@ -1001,21 +1085,46 @@ local function startAutoReel()
                         end
                     end
 
-                    if fishInside then
-                        reelMousePress(centerX, centerY)
-                        task.wait(ReelParams.hold_inside + rnd(-0.008, 0.018))
-                        reelMouseRelease(centerX, centerY)
-                        task.wait(ReelParams.release_inside + rnd(-0.010, 0.025))
-                    elseif ratio < 0.30 then
-                        reelMousePress(centerX, centerY)
-                        task.wait(ReelParams.hold_mid + rnd(-0.015, 0.025))
-                        reelMouseRelease(centerX, centerY)
-                        task.wait(ReelParams.release_mid + rnd(-0.008, 0.018))
+                    updateReelOverlay(reelGui, playerBar, fishBar)
+
+                    local fishVelocity = 0
+                    if lastFishX then
+                        fishVelocity = fishCenterX - lastFishX
+                    end
+                    lastFishX = fishCenterX
+
+                    local innerMargin = math.max(barWidth * 0.18, 8)
+                    local desiredHold = State.runtime.reelMouseHeld
+
+                    if fishCenterX > (barRight - innerMargin) then
+                        desiredHold = true
+                    elseif fishCenterX < (barLeft + innerMargin) then
+                        desiredHold = false
                     else
-                        reelMousePress(centerX, centerY)
-                        task.wait(ReelParams.hold_far + rnd(-0.020, 0.050))
-                        reelMouseRelease(centerX, centerY)
-                        task.wait(ReelParams.release_far + rnd(0, 0.015))
+                        local centerOffset = (fishCenterX - barCenter) / barWidth
+                        if centerOffset > 0.10 then
+                            desiredHold = true
+                        elseif centerOffset < -0.10 then
+                            desiredHold = false
+                        elseif fishVelocity > 1.2 then
+                            desiredHold = true
+                        elseif fishVelocity < -1.2 then
+                            desiredHold = false
+                        end
+                    end
+
+                    if desiredHold then
+                        reelMousePress(barCenter, playerBar.AbsolutePosition.Y + playerBar.AbsoluteSize.Y * 0.5)
+                    else
+                        reelMouseRelease(barCenter, playerBar.AbsolutePosition.Y + playerBar.AbsoluteSize.Y * 0.5)
+                    end
+
+                    if fishInside then
+                        task.wait(0.035)
+                    elseif ratio < 0.30 then
+                        task.wait(0.028)
+                    else
+                        task.wait(0.022)
                     end
                 end
             else
@@ -1023,9 +1132,11 @@ local function startAutoReel()
                     reelForceRelease()
                 end
                 State.runtime.reelActive = false
+                lastFishX = nil
 
                 if wasActive then
                     wasActive = false
+                    hideReelOverlay(reelGui)
                     local won = false
                     local detected = false
                     for _ = 1, 20 do
@@ -1073,6 +1184,7 @@ local function startAutoReel()
 
         reelForceRelease()
         State.runtime.reelActive = false
+        lastFishX = nil
     end)
 end
 
@@ -1080,6 +1192,7 @@ local function stopAutoReel()
     State.flags.autoReel = false
     State.runtime.reelActive = false
     reelForceRelease()
+    hideReelOverlay(findReelUI())
     stopTask("autoReel")
 end
 
