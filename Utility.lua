@@ -13,49 +13,32 @@ local RunSvc    = game:GetService("RunService")
 local UIS       = game:GetService("UserInputService")
 local TweenSvc  = game:GetService("TweenService")
 local RS        = game:GetService("ReplicatedStorage")
-local compatUnpack = table.unpack or unpack
+local task = task or {}
 
-local rawTask = task
-local rawWait = wait
-local task = rawTask or {}
-
-if not task.wait then
-    task.wait = function(sec)
-        sec = sec or 0
-        if rawWait then
-            return rawWait(sec)
-        end
-        local started = os.clock()
-        repeat RunSvc.Heartbeat:Wait() until (os.clock() - started) >= sec
-    end
+task.wait = task.wait or function(t)
+    t = t or 0
+    local s = os.clock()
+    repeat RunSvc.Heartbeat:Wait() until os.clock() - s >= t
 end
 
-if not task.spawn then
-    task.spawn = function(fn, ...)
-        local args = {...}
-        local co = coroutine.create(function()
-            fn(compatUnpack(args))
-        end)
-        local ok, err = coroutine.resume(co)
-        if not ok then warn(err) end
-        return co
-    end
+task.spawn = task.spawn or function(fn,...)
+    local co = coroutine.create(fn)
+    local ok, err = coroutine.resume(co,...)
+    if not ok then warn(err) end
+    return co
 end
 
-if not task.delay then
-    task.delay = function(sec, fn, ...)
-        local args = {...}
-        return task.spawn(function()
-            task.wait(sec)
-            fn(compatUnpack(args))
-        end)
-    end
+task.delay = task.delay or function(t,fn,...)
+    task.spawn(function(...)
+        task.wait(t)
+        fn(...)
+    end,...)
 end
 
-if not task.cancel then
-    task.cancel = function(_thread)
-        return nil
-    end
+task.cancel = task.cancel or function() end
+
+local compatUnpack = table.unpack or unpack or function(t)
+    return t
 end
 
 local LP = Players.LocalPlayer
